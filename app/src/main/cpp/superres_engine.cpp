@@ -157,16 +157,18 @@ ncnn::Mat make_input_tile(
     int tileX,
     int tileY,
     int tileW,
-    int tileH
+    int tileH,
+    int inputW,
+    int inputH
 ) {
-    ncnn::Mat tile(tileW, tileH, 3, sizeof(float));
+    ncnn::Mat tile(inputW, inputH, 3, sizeof(float));
     for (int c = 0; c < 3; ++c) {
         ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < tileH; ++y) {
+        for (int y = 0; y < inputH; ++y) {
             float* row = channel.row(y);
-            const int sourceY = tileY + y;
-            for (int x = 0; x < tileW; ++x) {
-                const int sourceX = tileX + x;
+            const int sourceY = tileY + std::min(y, tileH - 1);
+            for (int x = 0; x < inputW; ++x) {
+                const int sourceX = tileX + std::min(x, tileW - 1);
                 const size_t offset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3 + c;
                 row[x] = static_cast<float>(image.rgb[offset]) / 255.0f;
             }
@@ -271,7 +273,10 @@ SuperResNativeCode run_ncnn(
             const int tileY = ty * tileSize;
             const int tileW = std::min(tileSize, image.width - tileX);
             const int tileH = std::min(tileSize, image.height - tileY);
-            ncnn::Mat input = make_input_tile(image, tileX, tileY, tileW, tileH);
+            // Border tiles are edge-padded so small images and narrow remainders survive model crop layers.
+            const int inputW = tileW < tileSize ? tileSize : tileW;
+            const int inputH = tileH < tileSize ? tileSize : tileH;
+            ncnn::Mat input = make_input_tile(image, tileX, tileY, tileW, tileH, inputW, inputH);
             ncnn::Mat result;
 
             ncnn::Extractor extractor = net.create_extractor();

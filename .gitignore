@@ -8,5 +8,6 @@ local.properties
 *.iml
 .idea/
 captures/
+artifacts/
 *.apk
 *.aab
