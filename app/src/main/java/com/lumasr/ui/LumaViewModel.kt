@@ -51,6 +51,7 @@ class LumaViewModel(
             it.copy(
                 selectedImage = imageCacheRepository.readImageInfo(uri).toSelectedImageInfo(),
                 screen = LumaScreen.HOME,
+                selectedTab = LumaTab.PROCESS,
                 progress = null,
                 resultMessage = null
             )
@@ -88,6 +89,10 @@ class LumaViewModel(
         }
     }
 
+    fun selectTab(tab: LumaTab) {
+        _uiState.update { it.copy(selectedTab = tab) }
+    }
+
     fun startProcessing() {
         val state = _uiState.value
         val image = state.selectedImage ?: return
@@ -122,15 +127,53 @@ class LumaViewModel(
 
         // Processing state is centralized here so UI callbacks remain stateless and predictable.
         currentJob = viewModelScope.launch {
-            _uiState.update { it.copy(screen = LumaScreen.PROCESSING, activeParams = params) }
+            _uiState.update {
+                it.copy(
+                    screen = LumaScreen.PROCESSING,
+                    selectedTab = LumaTab.PROCESS,
+                    activeParams = params,
+                    recentTasks = it.recentTasks.upsert(
+                        RenderTaskSummary.fromParams(
+                            params = params,
+                            fileName = image.displayName,
+                            status = RenderTaskStatus.RUNNING,
+                            progress = 0f
+                        )
+                    )
+                )
+            }
             val result = processor.process(params) { progress ->
-                _uiState.update { it.copy(progress = progress) }
+                _uiState.update {
+                    it.copy(
+                        progress = progress,
+                        recentTasks = it.recentTasks.upsert(
+                            RenderTaskSummary.fromParams(
+                                params = params,
+                                fileName = image.displayName,
+                                status = progress.toTaskStatus(),
+                                progress = progress.progress
+                            )
+                        )
+                    )
+                }
             }
             _uiState.update {
                 it.copy(
                     screen = if (result.success) LumaScreen.COMPARE else LumaScreen.HOME,
                     resultMessage = result.message,
-                    progress = it.progress ?: doneProgress(taskId)
+                    progress = it.progress ?: doneProgress(taskId),
+                    recentTasks = it.recentTasks.upsert(
+                        RenderTaskSummary.fromParams(
+                            params = params,
+                            fileName = image.displayName,
+                            status = when {
+                                result.success -> RenderTaskStatus.DONE
+                                result.stage == UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
+                                else -> RenderTaskStatus.FAILED
+                            },
+                            progress = if (result.success) 1f else it.progress?.progress ?: 0f
+                        )
+                    )
                 )
             }
         }
@@ -141,7 +184,7 @@ class LumaViewModel(
     }
 
     fun backHome() {
-        _uiState.update { it.copy(screen = LumaScreen.HOME) }
+        _uiState.update { it.copy(screen = LumaScreen.HOME, selectedTab = LumaTab.HOME) }
     }
 
     fun saveResultToGallery() {
@@ -217,8 +260,10 @@ data class LumaUiState(
     val accelerationMode: AccelerationMode = AccelerationMode.AUTO,
     val tta: Boolean = false,
     val screen: LumaScreen = LumaScreen.HOME,
+    val selectedTab: LumaTab = LumaTab.HOME,
     val progress: UpscaleProgress? = null,
     val activeParams: UpscaleParams? = null,
+    val recentTasks: List<RenderTaskSummary> = emptyList(),
     val savedOutputUri: String? = null,
     val resultMessage: String? = null
 ) {
@@ -239,6 +284,60 @@ enum class LumaScreen {
     HOME,
     PROCESSING,
     COMPARE
+}
+
+enum class LumaTab {
+    HOME,
+    PROCESS,
+    HISTORY,
+    SETTINGS
+}
+
+enum class RenderTaskStatus {
+    RUNNING,
+    DONE,
+    FAILED,
+    CANCELLED
+}
+
+data class RenderTaskSummary(
+    val taskId: String,
+    val fileName: String,
+    val modelName: String,
+    val scale: Int,
+    val tileSize: Int,
+    val status: RenderTaskStatus,
+    val progress: Float
+) {
+    companion object {
+        fun fromParams(
+            params: UpscaleParams,
+            fileName: String,
+            status: RenderTaskStatus,
+            progress: Float
+        ) = RenderTaskSummary(
+            taskId = params.taskId,
+            fileName = fileName,
+            modelName = params.modelName,
+            scale = params.scale,
+            tileSize = params.tileSize,
+            status = status,
+            progress = progress.coerceIn(0f, 1f)
+        )
+    }
+}
+
+private fun List<RenderTaskSummary>.upsert(item: RenderTaskSummary): List<RenderTaskSummary> {
+    return (listOf(item) + filterNot { it.taskId == item.taskId }).take(8)
+}
+
+private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {
+    return when (stage) {
+        UpscaleStage.DONE -> RenderTaskStatus.DONE
+        UpscaleStage.FAILED -> RenderTaskStatus.FAILED
+        UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
+        else -> RenderTaskStatus.RUNNING
+    }
 }
 
 private fun com.lumasr.data.CachedImageInfo.toSelectedImageInfo() = SelectedImageInfo(
