@@ -1,5 +1,6 @@
 .gradle/
 .deps/
+.codex-remote-attachments/
 build/
 app/build/
 app/.cxx/
