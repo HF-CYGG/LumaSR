@@ -1,5 +1,7 @@
 package com.lumasr.ui
 
+import com.lumasr.domain.UpscaleProgress
+import com.lumasr.domain.UpscaleStage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -43,4 +45,71 @@ class RenderTileLayoutTest {
         assertTrue(rects.all { it.left >= viewport.left && it.top >= viewport.top })
         assertTrue(rects.all { it.right <= viewport.right + 0.01f && it.bottom <= viewport.bottom + 0.01f })
     }
+
+    @Test
+    fun visualStateUsesTileCompletionInsteadOfWholeTaskProgress() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.PROCESSING_TILE,
+                wholeTaskProgress = 0.45f,
+                currentTile = 3,
+                totalTiles = 8,
+                completedTileIndexes = setOf(1, 2, 3)
+            )
+        )
+
+        assertEquals(3, state.completedCount)
+        assertEquals(4, state.activeIndex)
+        assertEquals(3f / 8f, state.completedRatio, 0.001f)
+    }
+
+    @Test
+    fun visualStateDoesNotRevealTilesDuringModelLoadingProgress() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.LOADING_MODEL,
+                wholeTaskProgress = 0.12f,
+                currentTile = 0,
+                totalTiles = 8
+            )
+        )
+
+        assertEquals(0, state.completedCount)
+        assertEquals(null, state.activeIndex)
+        assertEquals(0f, state.completedRatio, 0.001f)
+    }
+
+    @Test
+    fun visualStateCompletesAllTilesDuringStitchingAndSaving() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.SAVING,
+                wholeTaskProgress = 0.96f,
+                currentTile = 8,
+                totalTiles = 8,
+                completedTileIndexes = (1..8).toSet()
+            )
+        )
+
+        assertEquals(8, state.completedCount)
+        assertEquals(null, state.activeIndex)
+        assertEquals(1f, state.completedRatio, 0.001f)
+    }
+
+    private fun progress(
+        stage: UpscaleStage,
+        wholeTaskProgress: Float,
+        currentTile: Int,
+        totalTiles: Int,
+        completedTileIndexes: Set<Int> = emptySet()
+    ) = UpscaleProgress(
+        taskId = "task",
+        stage = stage,
+        progress = wholeTaskProgress,
+        currentTile = currentTile,
+        totalTiles = totalTiles,
+        completedTileIndexes = completedTileIndexes,
+        message = "",
+        estimatedRemainingMs = null
+    )
 }

@@ -10,4 +10,11 @@ class UpscaleErrorMapperTest {
 
         assertEquals("GPU acceleration failed. Switched to CPU retry.", message)
     }
+
+    @Test
+    fun mapsTileOutputMismatchToArtifactPreventionMessage() {
+        val message = UpscaleErrorMapper.userMessage(UpscaleErrorCode.TILE_OUTPUT_MISMATCH)
+
+        assertEquals("Model output size was inconsistent. Processing stopped to avoid striped exports.", message)
+    }
 }

@@ -123,6 +123,20 @@ class NativeSuperResProcessorTest {
     }
 
     @Test
+    fun mapsTileOutputMismatchNativeCodeToArtifactPreventionMessage() = runBlocking {
+        val processor = NativeSuperResProcessor(
+            bridge = FakeNativeBridge(NativeProcessCode.TILE_OUTPUT_MISMATCH),
+            isAvailable = { true }
+        )
+
+        val result = processor.process(defaultParams()) {}
+
+        assertFalse(result.success)
+        assertEquals(UpscaleStage.FAILED, result.stage)
+        assertEquals("Model output size was inconsistent. Processing stopped to avoid striped exports.", result.message)
+    }
+
+    @Test
     fun runsNativeBridgeOnInjectedInferenceDispatcher() = runBlocking {
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "native-inference-test")

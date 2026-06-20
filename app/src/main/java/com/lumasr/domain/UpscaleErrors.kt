@@ -10,6 +10,7 @@ enum class UpscaleErrorCode {
     VULKAN_RUNTIME_FAILED,
     OUT_OF_MEMORY,
     OUTPUT_WRITE_FAILED,
+    TILE_OUTPUT_MISMATCH,
     NATIVE_UNAVAILABLE,
     CANCELLED,
     UNKNOWN
@@ -27,6 +28,7 @@ object UpscaleErrorMapper {
             UpscaleErrorCode.VULKAN_RUNTIME_FAILED -> "GPU acceleration failed. Switched to CPU retry."
             UpscaleErrorCode.OUT_OF_MEMORY -> "Memory is insufficient. Try a smaller image or lower scale."
             UpscaleErrorCode.OUTPUT_WRITE_FAILED -> "Output failed. Check storage space and retry."
+            UpscaleErrorCode.TILE_OUTPUT_MISMATCH -> "Model output size was inconsistent. Processing stopped to avoid striped exports."
             UpscaleErrorCode.NATIVE_UNAVAILABLE -> "Native inference is not installed. Install the native runtime and built-in models."
             UpscaleErrorCode.CANCELLED -> "Processing was cancelled."
             UpscaleErrorCode.UNKNOWN -> "Processing failed for an unknown reason."

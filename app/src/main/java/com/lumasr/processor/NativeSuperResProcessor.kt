@@ -21,7 +21,8 @@ enum class NativeProcessCode(val rawCode: Int) {
     MODEL_MISSING(5),
     INVALID_PARAMS(6),
     OUT_OF_MEMORY(7),
-    VULKAN_FAILED(8);
+    VULKAN_FAILED(8),
+    TILE_OUTPUT_MISMATCH(9);
 
     companion object {
         fun fromRawCode(rawCode: Int): NativeProcessCode {
@@ -236,6 +237,7 @@ class NativeSuperResProcessor(
             NativeProcessCode.INVALID_PARAMS -> UpscaleErrorCode.UNKNOWN
             NativeProcessCode.OUT_OF_MEMORY -> UpscaleErrorCode.OUT_OF_MEMORY
             NativeProcessCode.VULKAN_FAILED -> UpscaleErrorCode.VULKAN_RUNTIME_FAILED
+            NativeProcessCode.TILE_OUTPUT_MISMATCH -> UpscaleErrorCode.TILE_OUTPUT_MISMATCH
         }
     }
 

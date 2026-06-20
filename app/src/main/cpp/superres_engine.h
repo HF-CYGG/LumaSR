@@ -12,7 +12,8 @@ enum class SuperResNativeCode {
     ModelMissing = 5,
     InvalidParams = 6,
     OutOfMemory = 7,
-    VulkanFailed = 8
+    VulkanFailed = 8,
+    TileOutputMismatch = 9
 };
 
 enum class SuperResNativeStage {

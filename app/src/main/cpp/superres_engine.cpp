@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -47,6 +48,19 @@ struct LoadedImage {
 struct NetCacheEntry {
     std::string key;
     std::shared_ptr<ncnn::Net> net;
+};
+
+struct TileInputRegion {
+    int inputX;
+    int inputY;
+    int inputW;
+    int inputH;
+    int cropX;
+    int cropY;
+    int dstX;
+    int dstY;
+    int copyW;
+    int copyH;
 };
 
 NetCacheEntry net_cache;
@@ -278,12 +292,108 @@ unsigned char to_u8(float normalized) {
     return static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, normalized * 255.0f + 0.5f)));
 }
 
-ncnn::Mat make_input_tile(
-    const LoadedImage& image,
+int align_delta(int value, int alignment) {
+    if (alignment <= 1) {
+        return 0;
+    }
+    return ((value + alignment - 1) / alignment) * alignment - value;
+}
+
+int waifu2x_prepadding(const SuperResNativeParams& params) {
+    if (params.engineType != kEngineWaifu2x) {
+        return 0;
+    }
+    if (params.modelDir.find("models-cunet") != std::string::npos) {
+        if (params.noise < 0) {
+            return 18;
+        }
+        if (params.scale == 1) {
+            return 28;
+        }
+        if (params.scale == 2) {
+            return 18;
+        }
+        return 18;
+    }
+    if (params.modelDir.find("models-upconv_7_anime_style_art_rgb") != std::string::npos ||
+        params.modelDir.find("models-upconv_7_photo") != std::string::npos) {
+        return 7;
+    }
+    return 0;
+}
+
+int waifu2x_alignment(int scale) {
+    if (scale == 1) {
+        return 4;
+    }
+    if (scale == 2) {
+        return 2;
+    }
+    return 1;
+}
+
+TileInputRegion make_waifu2x_tile_region(
+    const SuperResNativeParams& params,
+    int imageW,
+    int imageH,
+    int tileX,
+    int tileY,
+    int tileW,
+    int tileH
+) {
+    const int prepadding = waifu2x_prepadding(params);
+    const int alignment = waifu2x_alignment(params.scale);
+    const int rightPadding = prepadding + align_delta(imageW, alignment);
+    const int bottomPadding = prepadding + align_delta(imageH, alignment);
+    return TileInputRegion{
+        tileX - prepadding,
+        tileY - prepadding,
+        tileW + prepadding + rightPadding,
+        tileH + prepadding + bottomPadding,
+        prepadding * params.scale,
+        prepadding * params.scale,
+        tileX * params.scale,
+        tileY * params.scale,
+        tileW * params.scale,
+        tileH * params.scale
+    };
+}
+
+TileInputRegion make_overlapped_tile_region(
+    int imageW,
+    int imageH,
     int tileX,
     int tileY,
     int tileW,
     int tileH,
+    int tileSize,
+    int tileOverlap,
+    int scale
+) {
+    const int sampleX = std::max(0, tileX - tileOverlap);
+    const int sampleY = std::max(0, tileY - tileOverlap);
+    const int sampleRight = std::min(imageW, tileX + tileW + tileOverlap);
+    const int sampleBottom = std::min(imageH, tileY + tileH + tileOverlap);
+    const int sampleW = sampleRight - sampleX;
+    const int sampleH = sampleBottom - sampleY;
+    return TileInputRegion{
+        sampleX,
+        sampleY,
+        std::max(tileSize, sampleW),
+        std::max(tileSize, sampleH),
+        (tileX - sampleX) * scale,
+        (tileY - sampleY) * scale,
+        tileX * scale,
+        tileY * scale,
+        tileW * scale,
+        tileH * scale
+    };
+}
+
+ncnn::Mat make_input_tile(
+    const LoadedImage& image,
+    int tileX,
+    int tileY,
     int inputW,
     int inputH
 ) {
@@ -292,9 +402,9 @@ ncnn::Mat make_input_tile(
         ncnn::Mat channel = tile.channel(c);
         for (int y = 0; y < inputH; ++y) {
             float* row = channel.row(y);
-            const int sourceY = tileY + std::min(y, tileH - 1);
+            const int sourceY = std::min(image.height - 1, std::max(0, tileY + y));
             for (int x = 0; x < inputW; ++x) {
-                const int sourceX = tileX + std::min(x, tileW - 1);
+                const int sourceX = std::min(image.width - 1, std::max(0, tileX + x));
                 const size_t offset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3 + c;
                 row[x] = static_cast<float>(image.rgb[offset]) / 255.0f;
             }
@@ -306,6 +416,7 @@ ncnn::Mat make_input_tile(
 bool copy_output_tile(
     const ncnn::Mat& tile,
     std::vector<unsigned char>& output,
+    std::vector<unsigned char>& coverage,
     int outputW,
     int outputH,
     int srcX,
@@ -319,48 +430,38 @@ bool copy_output_tile(
         return false;
     }
 
-    const int copyW = std::min({requestedCopyW, tile.w - srcX, outputW - dstX});
-    const int copyH = std::min({requestedCopyH, tile.h - srcY, outputH - dstY});
-    if (copyW <= 0 || copyH <= 0) {
+    if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0 ||
+        requestedCopyW <= 0 || requestedCopyH <= 0 ||
+        srcX + requestedCopyW > tile.w ||
+        srcY + requestedCopyH > tile.h ||
+        dstX + requestedCopyW > outputW ||
+        dstY + requestedCopyH > outputH) {
         return false;
     }
 
     for (int c = 0; c < 3; ++c) {
         const ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < copyH; ++y) {
+        for (int y = 0; y < requestedCopyH; ++y) {
             const float* row = channel.row(srcY + y);
-            for (int x = 0; x < copyW; ++x) {
+            for (int x = 0; x < requestedCopyW; ++x) {
                 const size_t offset = (static_cast<size_t>(dstY + y) * outputW + dstX + x) * 3 + c;
                 output[offset] = to_u8(clamp01(row[srcX + x]));
             }
         }
     }
+    for (int y = 0; y < requestedCopyH; ++y) {
+        const size_t rowOffset = static_cast<size_t>(dstY + y) * outputW + dstX;
+        for (int x = 0; x < requestedCopyW; ++x) {
+            coverage[rowOffset + x] = 1;
+        }
+    }
     return true;
 }
 
-void fill_reference_upscale(
-    const LoadedImage& image,
-    std::vector<unsigned char>& output,
-    int outputW,
-    int outputH,
-    int scale
-) {
-    if (image.rgb.empty() || output.empty() || scale <= 0) {
-        return;
-    }
-
-    // Some ncnn models crop a few pixels from each tile. Pre-filling with a scaled source prevents uncovered stitch seams from becoming black grid lines.
-    for (int y = 0; y < outputH; ++y) {
-        const int sourceY = std::min(image.height - 1, y / scale);
-        for (int x = 0; x < outputW; ++x) {
-            const int sourceX = std::min(image.width - 1, x / scale);
-            const size_t sourceOffset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3;
-            const size_t targetOffset = (static_cast<size_t>(y) * outputW + x) * 3;
-            output[targetOffset] = image.rgb[sourceOffset];
-            output[targetOffset + 1] = image.rgb[sourceOffset + 1];
-            output[targetOffset + 2] = image.rgb[sourceOffset + 2];
-        }
-    }
+bool all_output_pixels_covered(const std::vector<unsigned char>& coverage) {
+    return std::all_of(coverage.begin(), coverage.end(), [](unsigned char value) {
+        return value != 0;
+    });
 }
 
 SuperResNativeCode run_ncnn(
@@ -408,10 +509,10 @@ SuperResNativeCode run_ncnn(
     const int outputH = image.height * params.scale;
 
     std::vector<unsigned char> output(static_cast<size_t>(outputW) * outputH * 3);
+    std::vector<unsigned char> coverage(static_cast<size_t>(outputW) * outputH);
     if (output.empty()) {
         return SuperResNativeCode::OutOfMemory;
     }
-    fill_reference_upscale(image, output, outputW, outputH, params.scale);
 
     int completed = 0;
     for (int ty = 0; ty < tilesY; ++ty) {
@@ -424,16 +525,20 @@ SuperResNativeCode run_ncnn(
             const int tileY = ty * tileSize;
             const int tileW = std::min(tileSize, image.width - tileX);
             const int tileH = std::min(tileSize, image.height - tileY);
-            const int sampleX = std::max(0, tileX - tileOverlap);
-            const int sampleY = std::max(0, tileY - tileOverlap);
-            const int sampleRight = std::min(image.width, tileX + tileW + tileOverlap);
-            const int sampleBottom = std::min(image.height, tileY + tileH + tileOverlap);
-            const int sampleW = sampleRight - sampleX;
-            const int sampleH = sampleBottom - sampleY;
-            // Tiles intentionally overlap; only the center region is stitched back to avoid visible model boundary artifacts.
-            const int inputW = std::max(tileSize, sampleW);
-            const int inputH = std::max(tileSize, sampleH);
-            ncnn::Mat input = make_input_tile(image, sampleX, sampleY, sampleW, sampleH, inputW, inputH);
+            const TileInputRegion region = params.engineType == kEngineWaifu2x
+                ? make_waifu2x_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                : make_overlapped_tile_region(
+                    image.width,
+                    image.height,
+                    tileX,
+                    tileY,
+                    tileW,
+                    tileH,
+                    tileSize,
+                    tileOverlap,
+                    params.scale
+                );
+            ncnn::Mat input = make_input_tile(image, region.inputX, region.inputY, region.inputW, region.inputH);
             ncnn::Mat result;
             const auto tileStart = std::chrono::steady_clock::now();
 
@@ -443,14 +548,20 @@ SuperResNativeCode run_ncnn(
                 return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
             }
 
-            const int cropX = (tileX - sampleX) * params.scale;
-            const int cropY = (tileY - sampleY) * params.scale;
-            const int dstX = tileX * params.scale;
-            const int dstY = tileY * params.scale;
-            const int copyW = tileW * params.scale;
-            const int copyH = tileH * params.scale;
-            if (!copy_output_tile(result, output, outputW, outputH, cropX, cropY, dstX, dstY, copyW, copyH)) {
-                return SuperResNativeCode::Unsupported;
+            if (!copy_output_tile(
+                    result,
+                    output,
+                    coverage,
+                    outputW,
+                    outputH,
+                    region.cropX,
+                    region.cropY,
+                    region.dstX,
+                    region.dstY,
+                    region.copyW,
+                    region.copyH
+                )) {
+                return SuperResNativeCode::TileOutputMismatch;
             }
 
             if (useVulkan) {
@@ -477,6 +588,9 @@ SuperResNativeCode run_ncnn(
     }
 
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
+    if (!all_output_pixels_covered(coverage)) {
+        return SuperResNativeCode::TileOutputMismatch;
+    }
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.96f, "Saving output");
     // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
     if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {

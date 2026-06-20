@@ -29,8 +29,10 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -264,14 +266,21 @@ private fun ParameterSheet(
     modifier: Modifier = Modifier
 ) {
     val sheetScrollState = remember { ScrollState(0) }
+    val darkTheme = isSystemInDarkTheme()
+    val sheetShape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp)
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .height(sheetHeight),
-        shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
-        color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 6.dp,
-        shadowElevation = 10.dp
+            .height(sheetHeight)
+            .border(
+                width = 0.6.dp,
+                color = MaterialTheme.colorScheme.outline.copy(alpha = if (darkTheme) 0.18f else 0.08f),
+                shape = sheetShape
+            ),
+        shape = sheetShape,
+        color = parameterSheetColor(),
+        tonalElevation = if (darkTheme) 0.dp else 6.dp,
+        shadowElevation = if (darkTheme) 0.dp else 10.dp
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Column(
@@ -303,7 +312,7 @@ private fun ParameterSheet(
                                 .size(48.dp)
                                 .clickable(onClick = onClearImage),
                             shape = CircleShape,
-                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            color = iconButtonContainerColor(),
                             tonalElevation = 2.dp
                         ) {
                             Box(contentAlignment = Alignment.Center) {
@@ -616,6 +625,7 @@ private fun ModelCapsules(
     val cardHeight = 66.dp
     val cardGap = 8.dp
     val indicatorEasing = CubicBezierEasing(0.22f, 0.86f, 0.28f, 1f)
+    val darkTheme = isSystemInDarkTheme()
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val cardWidth = (maxWidth - cardGap) / 2f
@@ -631,7 +641,11 @@ private fun ModelCapsules(
             animationSpec = tween(durationMillis = 260, easing = indicatorEasing),
             label = "modelIndicatorY"
         )
-        val indicatorColor = MaterialTheme.colorScheme.onSurface
+        val indicatorColor = if (darkTheme) {
+            Color.White.copy(alpha = 0.74f)
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        }
 
         Column(verticalArrangement = Arrangement.spacedBy(cardGap)) {
             groups.chunked(2).forEach { rowModels ->
@@ -681,21 +695,18 @@ private fun ModelChoiceCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val container = if (selected) {
-        MaterialTheme.colorScheme.surface
-    } else {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
-    }
+    val darkTheme = isSystemInDarkTheme()
+    val container = modelCardContainerColor(selected = selected, darkTheme = darkTheme)
     val content = MaterialTheme.colorScheme.onSurface
-    val supporting = MaterialTheme.colorScheme.onSurfaceVariant
+    val supporting = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (darkTheme) 0.86f else 1f)
 
     Surface(
         modifier = modifier,
         onClick = onClick,
         shape = RoundedCornerShape(20.dp),
         color = container,
-        tonalElevation = if (selected) 2.dp else 0.dp,
-        shadowElevation = if (selected) 2.dp else 0.dp
+        tonalElevation = if (!darkTheme && selected) 2.dp else 0.dp,
+        shadowElevation = if (!darkTheme && selected) 2.dp else 0.dp
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
@@ -972,8 +983,8 @@ private fun PreviewImageCarousel(
             modifier = Modifier
                 .fillMaxSize()
                 .then(dragModifier),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            tonalElevation = 1.dp
+            color = previewSurfaceColor(),
+            tonalElevation = if (isSystemInDarkTheme()) 0.dp else 1.dp
         ) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 if (images.isEmpty()) {
@@ -1031,7 +1042,7 @@ private fun PreviewImagePage(
                 contentDescription = "待处理图片",
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.04f)),
+                    .background(previewImageBackgroundColor()),
                 contentScale = ContentScale.Fit
             )
         }
@@ -1047,7 +1058,7 @@ private fun PhotoIndexBadge(
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(999.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+        color = floatingChipColor(),
         tonalElevation = 3.dp,
         shadowElevation = 4.dp
     ) {
@@ -1078,8 +1089,8 @@ private fun PreviewImageSurface(
 
     Surface(
         modifier = modifier.then(clickModifier),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        tonalElevation = 1.dp
+        color = previewSurfaceColor(),
+        tonalElevation = if (isSystemInDarkTheme()) 0.dp else 1.dp
     ) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             if (image == null) {
@@ -1090,7 +1101,7 @@ private fun PreviewImageSurface(
                     contentDescription = "待处理图片",
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color.Black.copy(alpha = 0.04f)),
+                        .background(previewImageBackgroundColor()),
                     contentScale = ContentScale.Fit
                 )
             }
@@ -1102,7 +1113,7 @@ private fun PreviewImageSurface(
 @Composable
 private fun CleanImagePlaceholder() {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f)) {
+        Surface(shape = RoundedCornerShape(999.dp), color = placeholderPillColor()) {
             Text(
                 "选择图片",
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
@@ -1121,13 +1132,47 @@ private fun CleanImagePlaceholder() {
 }
 
 @Composable
+private fun parameterSheetColor(): Color =
+    if (isSystemInDarkTheme()) Color(0xFF1C1C1E) else MaterialTheme.colorScheme.surface
+
+@Composable
+private fun iconButtonContainerColor(): Color =
+    if (isSystemInDarkTheme()) Color.White.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant
+
+private fun modelCardContainerColor(selected: Boolean, darkTheme: Boolean): Color =
+    if (darkTheme) {
+        if (selected) Color(0xFF2A2A2C) else Color(0xFF242426)
+    } else {
+        if (selected) Color.White else Color(0xFFF5F5F5).copy(alpha = 0.72f)
+    }
+
+@Composable
+private fun previewSurfaceColor(): Color =
+    if (isSystemInDarkTheme()) Color(0xFF1A1A1C) else MaterialTheme.colorScheme.surfaceVariant
+
+@Composable
+private fun previewImageBackgroundColor(): Color =
+    if (isSystemInDarkTheme()) Color.Black.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.04f)
+
+@Composable
+private fun floatingChipColor(): Color =
+    if (isSystemInDarkTheme()) Color(0xFF2B2B2D).copy(alpha = 0.92f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.88f)
+
+@Composable
+private fun placeholderPillColor(): Color =
+    if (isSystemInDarkTheme()) Color.Black.copy(alpha = 0.34f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.82f)
+
+@Composable
 private fun RenderTileOverlay(
     progress: UpscaleProgress,
     previewImage: ImageBitmap,
     modifier: Modifier = Modifier
 ) {
+    val visualState = remember(progress.stage, progress.currentTile, progress.totalTiles, progress.completedTileIndexes) {
+        calculateRenderTileVisualState(progress)
+    }
     val animatedProgress by animateFloatAsState(
-        targetValue = progress.progress.coerceIn(0f, 1f),
+        targetValue = visualState.completedRatio,
         animationSpec = tween(220),
         label = "tileProgress"
     )
@@ -1154,7 +1199,7 @@ private fun RenderTileOverlay(
         val grid = calculateRenderTileGrid(totalTiles, viewport.width, viewport.height)
         val dstOffset = IntOffset(viewport.left.roundToInt(), viewport.top.roundToInt())
         val dstSize = IntSize(viewport.width.roundToInt(), viewport.height.roundToInt())
-        val completedCutoff = (animatedProgress * totalTiles).toInt()
+        val completedCutoff = (animatedProgress * totalTiles).roundToInt().coerceIn(0, totalTiles)
 
         // Pending tiles use one soft layer over the same image; completed tiles reveal the original preview.
         drawRect(
@@ -1194,8 +1239,13 @@ private fun RenderTileOverlay(
             )
         }
 
-        if (progress.stage == UpscaleStage.PROCESSING_TILE && progress.currentTile in 1..totalTiles) {
-            tileRects.firstOrNull { it.index == progress.currentTile }?.let { active ->
+        val activeIndex = if (progress.stage == UpscaleStage.PROCESSING_TILE && completedCutoff < totalTiles) {
+            completedCutoff + 1
+        } else {
+            visualState.activeIndex
+        }
+        if (activeIndex != null) {
+            tileRects.firstOrNull { it.index == activeIndex }?.let { active ->
                 drawRoundRect(
                     color = strokeColor.copy(alpha = 0.24f + pulse * 0.36f),
                     topLeft = Offset(active.left + 1.5.dp.toPx(), active.top + 1.5.dp.toPx()),

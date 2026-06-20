@@ -1,5 +1,7 @@
 package com.lumasr.ui
 
+import com.lumasr.domain.UpscaleProgress
+import com.lumasr.domain.UpscaleStage
 import kotlin.math.ceil
 import kotlin.math.sqrt
 
@@ -28,6 +30,12 @@ internal data class RenderTileRect(
     val right: Float = left + width
     val bottom: Float = top + height
 }
+
+internal data class RenderTileVisualState(
+    val completedCount: Int,
+    val activeIndex: Int?,
+    val completedRatio: Float
+)
 
 internal fun calculateRenderImageViewport(
     canvasWidth: Float,
@@ -89,4 +97,35 @@ internal fun buildRenderTileRects(
             height = minOf(tileHeight, viewport.bottom - top)
         )
     }
+}
+
+internal fun calculateRenderTileVisualState(progress: UpscaleProgress): RenderTileVisualState {
+    val totalTiles = progress.totalTiles.coerceAtLeast(1)
+    val reportedCompleted = maxOf(
+        progress.completedTileIndexes.count { it in 1..totalTiles },
+        progress.currentTile.takeIf { it in 1..totalTiles } ?: 0
+    ).coerceIn(0, totalTiles)
+    val completedCount = when (progress.stage) {
+        UpscaleStage.PREPARING,
+        UpscaleStage.ANALYZING,
+        UpscaleStage.LOADING_MODEL -> 0
+
+        UpscaleStage.PROCESSING_TILE,
+        UpscaleStage.FAILED,
+        UpscaleStage.CANCELLED -> reportedCompleted
+
+        UpscaleStage.STITCHING,
+        UpscaleStage.SAVING,
+        UpscaleStage.DONE -> totalTiles
+    }
+    val activeIndex = if (progress.stage == UpscaleStage.PROCESSING_TILE && completedCount < totalTiles) {
+        completedCount + 1
+    } else {
+        null
+    }
+    return RenderTileVisualState(
+        completedCount = completedCount,
+        activeIndex = activeIndex,
+        completedRatio = completedCount.toFloat() / totalTiles
+    )
 }
