@@ -33,6 +33,7 @@ struct SuperResNativeParams {
     std::string outputPath;
     int engineType;
     std::string modelDir;
+    std::string modelFileBase;
     int scale;
     int noise;
     int tileSize;

@@ -1,6 +1,6 @@
 # Built-in Model Setup
 
-LumaSR bundles Waifu2x and RealCUGAN model files from `app/src/main/assets/models`.
+LumaSR bundles Waifu2x, RealCUGAN, and Real-ESRGAN model files from `app/src/main/assets/models`.
 Do not add placeholder `.param` or `.bin` files. The APK should only include
 real model files from trusted mirrors.
 
@@ -13,6 +13,7 @@ Prepare domestic mirror URLs for these archives:
 - Waifu2x Photo: `models-upconv_7_photo`
 - RealCUGAN Standard: `models-se`
 - RealCUGAN Pro: `models-pro`
+- Real-ESRGAN models archive: `realesrgan-x4plus`, `realesrgan-x4plus-anime`, `realesr-animevideov3-x2/x3/x4`
 - ncnn Android Vulkan SDK
 - Android NDK zip
 - CMake zip
@@ -31,7 +32,8 @@ Model-only install when Android SDK, NDK, and CMake are already present:
   -Waifu2xAnimeZipUrl "<domestic-waifu2x-repo-zip>" `
   -Waifu2xPhotoZipUrl "<domestic-waifu2x-repo-zip>" `
   -RealCuganStandardZipUrl "<domestic-realcugan-assets-zip>" `
-  -RealCuganProZipUrl "<domestic-realcugan-assets-zip>"
+  -RealCuganProZipUrl "<domestic-realcugan-assets-zip>" `
+  -RealEsrganModelsZipUrl "<domestic-realesrgan-models-zip>"
 ```
 
 Full dependency install:
@@ -45,12 +47,21 @@ Full dependency install:
   -Waifu2xAnimeZipUrl "<domestic-waifu2x-anime-zip>" `
   -Waifu2xPhotoZipUrl "<domestic-waifu2x-photo-zip>" `
   -RealCuganStandardZipUrl "<domestic-realcugan-standard-zip>" `
-  -RealCuganProZipUrl "<domestic-realcugan-pro-zip>"
+  -RealCuganProZipUrl "<domestic-realcugan-pro-zip>" `
+  -RealEsrganModelsZipUrl "<domestic-realesrgan-models-zip>"
 ```
 
 Each model archive may contain only the model directory or a larger repository
 tree. The installer filters files by model directory name and writes only the
 files listed in `model_manifest.json`.
+
+## Built-in Model Matrix
+
+- Waifu2x CUnet / Anime / Photo: 1x denoise-only and 2x upscale workflows.
+- RealCUGAN Standard: 2x / 3x / 4x, matching the bundled `models-se` files.
+- RealCUGAN Pro: 2x / 3x only; 4x is not exposed because the current `models-pro` assets do not include 4x files.
+- Real-ESRGAN x4plus / x4plus anime: 4x only, using explicit `modelFileBase` names in `model_manifest.json`.
+- Real-ESRGAN AnimeVideo v3: separate 2x / 3x / 4x model files, each exposed as a single-scale built-in model.
 
 ## Validate
 

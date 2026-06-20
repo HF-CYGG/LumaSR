@@ -64,4 +64,31 @@ class NativeModelFileSelectorTest {
         assertEquals("cache/models/realcugan-pro/up3x-denoise3x.param", files.paramPath)
         assertEquals("cache/models/realcugan-pro/up3x-denoise3x.bin", files.binPath)
     }
+
+    @Test
+    fun mapsUnavailableRealCuganLowDenoiseForLargeScaleToDenoise3() {
+        val files = NativeModelFileSelector.select(
+            engine = SuperResEngine.REAL_CUGAN,
+            modelDir = "cache/models/realcugan-standard",
+            scale = 3,
+            noise = 1
+        )
+
+        assertEquals("cache/models/realcugan-standard/up3x-denoise3x.param", files.paramPath)
+        assertEquals("cache/models/realcugan-standard/up3x-denoise3x.bin", files.binPath)
+    }
+
+    @Test
+    fun selectsRealEsrganExplicitModelBaseName() {
+        val files = NativeModelFileSelector.select(
+            engine = SuperResEngine.REAL_ESRGAN,
+            modelDir = "cache/models/realesrgan-general-x4",
+            scale = 4,
+            noise = 0,
+            modelFileBase = "realesrgan-x4plus"
+        )
+
+        assertEquals("cache/models/realesrgan-general-x4/realesrgan-x4plus.param", files.paramPath)
+        assertEquals("cache/models/realesrgan-general-x4/realesrgan-x4plus.bin", files.binPath)
+    }
 }

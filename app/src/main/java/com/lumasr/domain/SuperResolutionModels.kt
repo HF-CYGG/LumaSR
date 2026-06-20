@@ -2,7 +2,8 @@ package com.lumasr.domain
 
 enum class SuperResEngine {
     WAIFU2X,
-    REAL_CUGAN
+    REAL_CUGAN,
+    REAL_ESRGAN
 }
 
 enum class AccelerationMode {
@@ -28,6 +29,7 @@ data class ModelPack(
     val engine: SuperResEngine,
     val modelDir: String,
     val assetPath: String,
+    val modelFileBase: String? = null,
     val isBuiltIn: Boolean,
     val requiredFiles: List<String>,
     val assetBytes: Long?,
@@ -49,6 +51,8 @@ data class UpscaleParams(
     val engine: SuperResEngine,
     val modelDir: String,
     val modelName: String,
+    val modelFileBase: String? = null,
+    val modelScales: List<Int> = emptyList(),
     val scale: Int,
     val noise: Int,
     val tileSize: Int,

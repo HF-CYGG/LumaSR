@@ -7,6 +7,8 @@ param(
     [string]$Waifu2xPhotoZipUrl,
     [string]$RealCuganStandardZipUrl,
     [string]$RealCuganProZipUrl,
+    [string]$RealEsrganZipUrl,
+    [string]$RealEsrganModelsZipUrl,
     [string]$RealCuganSourceZipUrl,
     [string]$Waifu2xRepoDir,
     [string]$RealCuganAssetsZip,
@@ -19,6 +21,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($RealEsrganZipUrl) -and ![string]::IsNullOrWhiteSpace($RealEsrganModelsZipUrl)) {
+    $RealEsrganZipUrl = $RealEsrganModelsZipUrl
+}
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $modelRoot = Join-Path $projectRoot "app\src\main\assets\models"
@@ -103,6 +109,56 @@ $modelPacks = @(
             "up3x-conservative.bin", "up3x-conservative.param",
             "up3x-denoise3x.bin", "up3x-denoise3x.param",
             "up3x-no-denoise.bin", "up3x-no-denoise.param"
+        )
+    },
+    [PSCustomObject]@{
+        Id = "realesrgan-general-x4"
+        EngineDir = "realesrgan"
+        ModelDir = ""
+        ZipUrl = $RealEsrganZipUrl
+        Upstream = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/tree/master/models"
+        Files = @(
+            "realesrgan-x4plus.bin", "realesrgan-x4plus.param"
+        )
+    },
+    [PSCustomObject]@{
+        Id = "realesrgan-anime-x4"
+        EngineDir = "realesrgan"
+        ModelDir = ""
+        ZipUrl = $RealEsrganZipUrl
+        Upstream = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/tree/master/models"
+        Files = @(
+            "realesrgan-x4plus-anime.bin", "realesrgan-x4plus-anime.param"
+        )
+    },
+    [PSCustomObject]@{
+        Id = "realesrgan-animevideo-x2"
+        EngineDir = "realesrgan"
+        ModelDir = ""
+        ZipUrl = $RealEsrganZipUrl
+        Upstream = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/tree/master/models"
+        Files = @(
+            "realesr-animevideov3-x2.bin", "realesr-animevideov3-x2.param"
+        )
+    },
+    [PSCustomObject]@{
+        Id = "realesrgan-animevideo-x3"
+        EngineDir = "realesrgan"
+        ModelDir = ""
+        ZipUrl = $RealEsrganZipUrl
+        Upstream = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/tree/master/models"
+        Files = @(
+            "realesr-animevideov3-x3.bin", "realesr-animevideov3-x3.param"
+        )
+    },
+    [PSCustomObject]@{
+        Id = "realesrgan-animevideo-x4"
+        EngineDir = "realesrgan"
+        ModelDir = ""
+        ZipUrl = $RealEsrganZipUrl
+        Upstream = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/tree/master/models"
+        Files = @(
+            "realesr-animevideov3-x4.bin", "realesr-animevideov3-x4.param"
         )
     }
 )

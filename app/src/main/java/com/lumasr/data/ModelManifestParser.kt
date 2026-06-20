@@ -24,6 +24,7 @@ object ModelManifestParser {
                 engine = SuperResEngine.valueOf(item.string("engine")),
                 modelDir = item.string("modelDir"),
                 assetPath = item.optionalString("assetPath") ?: item.string("modelDir"),
+                modelFileBase = item.optionalString("modelFileBase"),
                 isBuiltIn = item.optionalBoolean("isBuiltIn") ?: false,
                 requiredFiles = item.optionalStringList("requiredFiles").orEmpty(),
                 assetBytes = item.optionalLong("assetBytes"),

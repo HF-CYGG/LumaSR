@@ -1,3 +1,7 @@
+/**
+ * 本文件定义了 LumaViewModel，负责管理 UI 状态与业务逻辑。
+ * 包括图片选择、参数配置、模型加载以及超分辨率任务的执行和取消。
+ */
 package com.lumasr.ui
 
 import android.app.Application
@@ -19,12 +23,16 @@ import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import com.lumasr.processor.HybridSuperResProcessor
 import com.lumasr.domain.SuperResProcessor
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 
@@ -34,7 +42,8 @@ class LumaViewModel(
     private val imageCacheRepository: ImageCacheRepository = ImageCacheRepository(application),
     private val modelAssetRepository: ModelAssetRepository = ModelAssetRepository.fromContext(application),
     private val galleryRepository: GalleryRepository = GalleryRepository(application),
-    private val processor: SuperResProcessor = HybridSuperResProcessor()
+    private val processor: SuperResProcessor = HybridSuperResProcessor(),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(LumaUiState())
     val uiState: StateFlow<LumaUiState> = _uiState.asStateFlow()
@@ -47,15 +56,61 @@ class LumaViewModel(
     }
 
     fun onImageSelected(uri: Uri) {
-        _uiState.update {
-            it.copy(
-                selectedImage = imageCacheRepository.readImageInfo(uri).toSelectedImageInfo(),
-                screen = LumaScreen.HOME,
-                selectedTab = LumaTab.PROCESS,
-                progress = null,
-                resultMessage = null
-            )
+        viewModelScope.launch {
+            runCatching {
+                withContext(ioDispatcher) {
+                    imageCacheRepository.readImageInfo(uri).toSelectedImageInfo()
+                }
+            }.onSuccess { imageInfo ->
+                _uiState.update {
+                    it.copy(
+                        selectedImage = imageInfo,
+                        selectedImages = listOf(imageInfo),
+                        screen = LumaScreen.EDITING,
+                        selectedTab = LumaTab.PROCESS,
+                        progress = null,
+                        completedResults = emptyList(),
+                        savedOutputUris = emptyList(),
+                        resultMessage = null
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update { it.copy(resultMessage = "Cannot read selected image: ${error.message}") }
+            }
         }
+    }
+
+    fun onImagesSelected(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            runCatching {
+                withContext(ioDispatcher) {
+                    uris.map { uri -> imageCacheRepository.readImageInfo(uri).toSelectedImageInfo() }
+                }
+            }.onSuccess { images ->
+                _uiState.update {
+                    it.copy(
+                        selectedImage = images.firstOrNull(),
+                        selectedImages = images,
+                        screen = LumaScreen.EDITING,
+                        selectedTab = LumaTab.PROCESS,
+                        progress = null,
+                        activeBatchIndex = 0,
+                        activeBatchSize = images.size,
+                        completedResults = emptyList(),
+                        savedOutputUris = emptyList(),
+                        resultMessage = null
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update { it.copy(resultMessage = "Cannot read selected images: ${error.message}") }
+            }
+        }
+    }
+
+    fun clearSelectedImage() {
+        currentTaskId = null
+        _uiState.update { it.clearImageSelection() }
     }
 
     fun selectModel(modelId: String) {
@@ -95,86 +150,148 @@ class LumaViewModel(
 
     fun startProcessing() {
         val state = _uiState.value
-        val image = state.selectedImage ?: return
+        val images = state.selectedImages.ifEmpty { state.selectedImage?.let(::listOf).orEmpty() }
+        if (images.isEmpty()) return
         val model = state.selectedModel ?: return
-        val taskId = UUID.randomUUID().toString()
-        val paths = runCatching {
-            imageCacheRepository.copyToTaskCache(Uri.parse(image.sourceUri), taskId, image.mimeType)
-        }.getOrElse { error ->
-            _uiState.update { it.copy(resultMessage = "Cannot cache selected image: ${error.message}") }
-            return
-        }
-        val modelDir = runCatching {
-            modelAssetRepository.prepareModel(model).absolutePath
-        }.getOrElse { error ->
-            _uiState.update { it.copy(resultMessage = "Model asset unavailable: ${error.message}") }
-            return
-        }
-        val params = UpscaleParamsFactory.create(
-            taskId = taskId,
-            inputPath = paths.inputFile.absolutePath,
-            outputPath = paths.outputFile.absolutePath,
-            model = model,
-            resolvedModelDir = modelDir,
-            scale = state.scale,
-            noise = state.noise,
-            accelerationMode = state.accelerationMode,
-            tta = state.tta,
-            outputFormat = OutputFormat.PNG
-        )
-        currentTaskId = taskId
         currentJob?.cancel()
 
-        // Processing state is centralized here so UI callbacks remain stateless and predictable.
+        // Batch state stays in the ViewModel so Compose can render the queue without owning task logic.
         currentJob = viewModelScope.launch {
-            _uiState.update {
-                it.copy(
-                    screen = LumaScreen.PROCESSING,
-                    selectedTab = LumaTab.PROCESS,
-                    activeParams = params,
-                    recentTasks = it.recentTasks.upsert(
-                        RenderTaskSummary.fromParams(
-                            params = params,
-                            fileName = image.displayName,
-                            status = RenderTaskStatus.RUNNING,
-                            progress = 0f
-                        )
-                    )
-                )
-            }
-            val result = processor.process(params) { progress ->
+            var lastParams: UpscaleParams? = null
+            var lastResultMessage: String? = null
+            var lastStage: UpscaleStage = UpscaleStage.CANCELLED
+            var lastSuccess = false
+            val completedResults = mutableListOf<RenderResultInfo>()
+
+            for ((index, image) in images.withIndex()) {
+                if (!isActive) break
+
+                val taskId = UUID.randomUUID().toString()
+                currentTaskId = taskId
                 _uiState.update {
                     it.copy(
-                        progress = progress,
+                        selectedImage = image,
+                        screen = LumaScreen.PROCESSING,
+                        selectedTab = LumaTab.PROCESS,
+                        progress = preparingProgress(taskId),
+                        activeBatchIndex = index + 1,
+                        activeBatchSize = images.size,
+                        completedResults = emptyList(),
+                        savedOutputUris = emptyList(),
+                        resultMessage = null
+                    )
+                }
+
+                val params = runCatching {
+                    withContext(ioDispatcher) {
+                        val paths = imageCacheRepository.copyToTaskCache(Uri.parse(image.sourceUri), taskId, image.mimeType)
+                        val modelDir = modelAssetRepository.prepareModel(model).absolutePath
+                        UpscaleParamsFactory.create(
+                            taskId = taskId,
+                            inputPath = paths.inputFile.absolutePath,
+                            outputPath = paths.outputFile.absolutePath,
+                            model = model,
+                            resolvedModelDir = modelDir,
+                            scale = state.scale,
+                            noise = state.noise,
+                            accelerationMode = state.accelerationMode,
+                            tta = state.tta,
+                            outputFormat = OutputFormat.PNG
+                        )
+                    }
+                }.getOrElse { error ->
+                    currentTaskId = null
+                    _uiState.update {
+                        it.copy(
+                            screen = LumaScreen.EDITING,
+                            progress = null,
+                            resultMessage = "Cannot prepare ${image.displayName}: ${error.message}"
+                        )
+                    }
+                    return@launch
+                }
+
+                _uiState.update {
+                    it.copy(
+                        activeParams = params,
                         recentTasks = it.recentTasks.upsert(
                             RenderTaskSummary.fromParams(
                                 params = params,
                                 fileName = image.displayName,
-                                status = progress.toTaskStatus(),
-                                progress = progress.progress
+                                status = RenderTaskStatus.RUNNING,
+                                progress = 0f
                             )
                         )
                     )
                 }
-            }
-            _uiState.update {
-                it.copy(
-                    screen = if (result.success) LumaScreen.COMPARE else LumaScreen.HOME,
-                    resultMessage = result.message,
-                    progress = it.progress ?: doneProgress(taskId),
-                    recentTasks = it.recentTasks.upsert(
-                        RenderTaskSummary.fromParams(
-                            params = params,
-                            fileName = image.displayName,
-                            status = when {
-                                result.success -> RenderTaskStatus.DONE
-                                result.stage == UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
-                                else -> RenderTaskStatus.FAILED
-                            },
-                            progress = if (result.success) 1f else it.progress?.progress ?: 0f
+
+                val result = processor.process(params) { progress ->
+                    _uiState.update {
+                        it.copy(
+                            progress = progress,
+                            recentTasks = it.recentTasks.upsert(
+                                RenderTaskSummary.fromParams(
+                                    params = params,
+                                    fileName = image.displayName,
+                                    status = progress.toTaskStatus(),
+                                    progress = progress.progress
+                                )
+                            )
+                        )
+                    }
+                }
+
+                lastParams = params
+                lastResultMessage = result.message
+                lastStage = result.stage
+                lastSuccess = result.success
+
+                if (result.success) {
+                    completedResults += RenderResultInfo(
+                        taskId = params.taskId,
+                        fileName = image.displayName,
+                        inputPath = params.inputPath,
+                        outputPath = result.outputPath ?: params.outputPath,
+                        modelName = params.modelName,
+                        scale = params.scale,
+                        noise = params.noise,
+                        outputFormat = params.outputFormat
+                    )
+                }
+
+                _uiState.update {
+                    it.copy(
+                        recentTasks = it.recentTasks.upsert(
+                            RenderTaskSummary.fromParams(
+                                params = params,
+                                fileName = image.displayName,
+                                status = when {
+                                    result.success -> RenderTaskStatus.DONE
+                                    result.stage == UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
+                                    else -> RenderTaskStatus.FAILED
+                                },
+                                progress = if (result.success) 1f else it.progress?.progress ?: 0f
+                            )
                         )
                     )
+                }
+
+                if (!result.success) break
+            }
+
+            val finalTaskId = lastParams?.taskId ?: currentTaskId
+            _uiState.update {
+                it.copy(
+                    screen = if (lastSuccess) LumaScreen.COMPARE else LumaScreen.EDITING,
+                    resultMessage = lastResultMessage,
+                    progress = it.progress ?: finalTaskId?.let(::doneProgress),
+                    activeBatchIndex = 0,
+                    activeBatchSize = images.size,
+                    completedResults = completedResults.toList()
                 )
+            }
+            if (lastStage != UpscaleStage.PROCESSING_TILE) {
+                currentTaskId = null
             }
         }
     }
@@ -184,25 +301,52 @@ class LumaViewModel(
     }
 
     fun backHome() {
-        _uiState.update { it.copy(screen = LumaScreen.HOME, selectedTab = LumaTab.HOME) }
+        _uiState.update { it.copy(screen = LumaScreen.EDITING, selectedTab = LumaTab.PROCESS) }
     }
 
     fun saveResultToGallery() {
         val state = _uiState.value
-        val params = state.activeParams ?: return
+        val results = state.completedResults.ifEmpty {
+            state.activeParams?.let {
+                listOf(
+                    RenderResultInfo(
+                        taskId = it.taskId,
+                        fileName = File(it.inputPath).name,
+                        inputPath = it.inputPath,
+                        outputPath = it.outputPath,
+                        modelName = it.modelName,
+                        scale = it.scale,
+                        noise = it.noise,
+                        outputFormat = it.outputFormat
+                    )
+                )
+            }.orEmpty()
+        }
+        if (results.isEmpty()) return
         viewModelScope.launch {
             runCatching {
-                galleryRepository.saveImage(
-                    sourceFile = File(params.outputPath),
-                    modelName = params.modelName,
-                    scale = params.scale,
-                    format = params.outputFormat
-                )
-            }.onSuccess { uri ->
+                withContext(ioDispatcher) {
+                    val timestamp = System.currentTimeMillis()
+                    results.mapIndexed { index, result ->
+                        galleryRepository.saveImage(
+                            sourceFile = File(result.outputPath),
+                            modelName = result.modelName,
+                            scale = result.scale,
+                            format = result.outputFormat,
+                            timestampMillis = timestamp + index * 1000L
+                        )
+                    }
+                }
+            }.onSuccess { uris ->
                 _uiState.update {
                     it.copy(
-                        savedOutputUri = uri.toString(),
-                        resultMessage = "Saved to Pictures/LocalSR"
+                        savedOutputUri = uris.lastOrNull()?.toString(),
+                        savedOutputUris = uris.map { uri -> uri.toString() },
+                        resultMessage = if (uris.size > 1) {
+                            "Saved ${uris.size} images to Pictures/LocalSR"
+                        } else {
+                            "Saved to Pictures/LocalSR"
+                        }
                     )
                 }
             }.onFailure { error ->
@@ -227,8 +371,19 @@ class LumaViewModel(
             }
             .onFailure { error ->
                 _uiState.update { it.copy(resultMessage = "Model manifest failed: ${error.message}") }
-            }
+        }
     }
+
+    private fun preparingProgress(taskId: String) = UpscaleProgress(
+        taskId = taskId,
+        stage = UpscaleStage.PREPARING,
+        progress = 0f,
+        currentTile = 0,
+        totalTiles = 1,
+        completedTileIndexes = emptySet(),
+        message = "Preparing processing files",
+        estimatedRemainingMs = null
+    )
 
     private fun doneProgress(taskId: String) = UpscaleProgress(
         taskId = taskId,
@@ -255,20 +410,38 @@ data class LumaUiState(
     val models: List<ModelPack> = emptyList(),
     val selectedModelId: String? = null,
     val selectedImage: SelectedImageInfo? = null,
+    val selectedImages: List<SelectedImageInfo> = emptyList(),
     val scale: Int = 2,
     val noise: Int = 1,
     val accelerationMode: AccelerationMode = AccelerationMode.AUTO,
     val tta: Boolean = false,
-    val screen: LumaScreen = LumaScreen.HOME,
-    val selectedTab: LumaTab = LumaTab.HOME,
+    val screen: LumaScreen = LumaScreen.EDITING,
+    val selectedTab: LumaTab = LumaTab.PROCESS,
     val progress: UpscaleProgress? = null,
     val activeParams: UpscaleParams? = null,
+    val activeBatchIndex: Int = 0,
+    val activeBatchSize: Int = 0,
     val recentTasks: List<RenderTaskSummary> = emptyList(),
+    val completedResults: List<RenderResultInfo> = emptyList(),
     val savedOutputUri: String? = null,
+    val savedOutputUris: List<String> = emptyList(),
     val resultMessage: String? = null
 ) {
     val selectedModel: ModelPack?
         get() = models.firstOrNull { it.id == selectedModelId }
+
+    val selectedImageCount: Int
+        get() = selectedImages.ifEmpty { selectedImage?.let(::listOf).orEmpty() }.size
+
+    val canStartProcessing: Boolean
+        get() = selectedImageCount > 0 && selectedModelId != null
+
+    val startButtonLabel: String
+        get() = if (selectedImageCount > 1) {
+            "开始批量处理 $selectedImageCount 张"
+        } else {
+            "开始处理"
+        }
 }
 
 data class SelectedImageInfo(
@@ -280,16 +453,25 @@ data class SelectedImageInfo(
     val mimeType: String?
 )
 
+data class RenderResultInfo(
+    val taskId: String,
+    val fileName: String,
+    val inputPath: String,
+    val outputPath: String,
+    val modelName: String,
+    val scale: Int,
+    val noise: Int,
+    val outputFormat: OutputFormat
+)
+
 enum class LumaScreen {
-    HOME,
+    EDITING,
     PROCESSING,
     COMPARE
 }
 
 enum class LumaTab {
-    HOME,
     PROCESS,
-    HISTORY,
     SETTINGS
 }
 
@@ -329,6 +511,23 @@ data class RenderTaskSummary(
 
 private fun List<RenderTaskSummary>.upsert(item: RenderTaskSummary): List<RenderTaskSummary> {
     return (listOf(item) + filterNot { it.taskId == item.taskId }).take(8)
+}
+
+fun LumaUiState.clearImageSelection(): LumaUiState {
+    return copy(
+        selectedImage = null,
+        selectedImages = emptyList(),
+        screen = LumaScreen.EDITING,
+        selectedTab = LumaTab.PROCESS,
+        progress = null,
+        activeParams = null,
+        activeBatchIndex = 0,
+        activeBatchSize = 0,
+        completedResults = emptyList(),
+        savedOutputUri = null,
+        savedOutputUris = emptyList(),
+        resultMessage = null
+    )
 }
 
 private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {

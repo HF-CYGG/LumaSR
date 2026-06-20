@@ -3,10 +3,14 @@ package com.lumasr.processor
 import com.lumasr.domain.UpscaleErrorCode
 import com.lumasr.domain.UpscaleErrorMapper
 import com.lumasr.domain.SuperResProcessor
+import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleResult
 import com.lumasr.domain.UpscaleStage
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 enum class NativeProcessCode(val rawCode: Int) {
     OK(0),
@@ -32,6 +36,7 @@ data class NativeProcessRequest(
     val outputPath: String,
     val engineType: Int,
     val modelDir: String,
+    val modelFileBase: String?,
     val scale: Int,
     val noise: Int,
     val tileSize: Int,
@@ -68,6 +73,7 @@ object JniNativeProcessBridge : NativeProcessBridge {
                 outputPath = request.outputPath,
                 engineType = request.engineType,
                 modelDir = request.modelDir,
+                modelFileBase = request.modelFileBase.orEmpty(),
                 scale = request.scale,
                 noise = request.noise,
                 tileSize = request.tileSize,
@@ -88,6 +94,7 @@ object JniNativeProcessBridge : NativeProcessBridge {
         outputPath: String,
         engineType: Int,
         modelDir: String,
+        modelFileBase: String,
         scale: Int,
         noise: Int,
         tileSize: Int,
@@ -125,7 +132,8 @@ class NativeProgressSink(
 
 class NativeSuperResProcessor(
     private val bridge: NativeProcessBridge = JniNativeProcessBridge,
-    isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() }
+    isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
+    private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : SuperResProcessor {
     private val isNativeAvailable = isAvailable
 
@@ -145,23 +153,28 @@ class NativeSuperResProcessor(
 
         onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native inference", 0f))
         onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
-        val code = bridge.process(
-            request = NativeProcessRequest(
-                taskId = params.taskId,
-                inputPath = params.inputPath,
-                outputPath = params.outputPath,
-                engineType = params.engine.ordinal,
-                modelDir = params.modelDir,
-                scale = params.scale,
-                noise = params.noise,
-                tileSize = params.tileSize,
-                accelerationMode = params.accelerationMode.ordinal,
-                tta = params.tta
-            ),
-            onProgress = { event ->
-                onProgress(params.progress(event))
-            }
+        val request = NativeProcessRequest(
+            taskId = params.taskId,
+            inputPath = params.inputPath,
+            outputPath = params.outputPath,
+            engineType = params.engine.nativeCode,
+            modelDir = params.modelDir,
+            modelFileBase = params.modelFileBase,
+            scale = params.scale,
+            noise = params.noise,
+            tileSize = params.tileSize,
+            accelerationMode = params.accelerationMode.ordinal,
+            tta = params.tta
         )
+        // Native ncnn/Vulkan execution can monopolize a thread, so it must never run on Main.
+        val code = withContext(inferenceDispatcher) {
+            bridge.process(
+                request = request,
+                onProgress = { event ->
+                    onProgress(params.progress(event))
+                }
+            )
+        }
         return code.toResult(params, onProgress)
     }
 
@@ -230,3 +243,10 @@ class NativeSuperResProcessor(
         fun isAvailable(): Boolean = loaded
     }
 }
+
+internal val SuperResEngine.nativeCode: Int
+    get() = when (this) {
+        SuperResEngine.WAIFU2X -> 0
+        SuperResEngine.REAL_CUGAN -> 1
+        SuperResEngine.REAL_ESRGAN -> 2
+    }

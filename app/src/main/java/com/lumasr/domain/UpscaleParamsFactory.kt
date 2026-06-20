@@ -14,6 +14,10 @@ object UpscaleParamsFactory {
         tta: Boolean = false,
         outputFormat: OutputFormat = OutputFormat.PNG
     ): UpscaleParams {
+        val resolvedNoise = model.availableDenoiseForScale(scale)
+            .ifEmpty { listOf(model.defaultNoise) }
+            .minBy { kotlin.math.abs(it - noise) }
+
         return UpscaleParams(
             taskId = taskId,
             inputPath = inputPath,
@@ -21,8 +25,10 @@ object UpscaleParamsFactory {
             engine = model.engine,
             modelDir = resolvedModelDir,
             modelName = model.displayName,
+            modelFileBase = model.modelFileBase,
+            modelScales = model.scales,
             scale = scale,
-            noise = noise,
+            noise = resolvedNoise,
             tileSize = tileSize,
             accelerationMode = accelerationMode,
             tta = tta && model.supportsTta,

@@ -11,3 +11,4 @@ captures/
 artifacts/
 *.apk
 *.aab
+.trae/

@@ -19,6 +19,7 @@
 namespace {
 constexpr int kEngineWaifu2x = 0;
 constexpr int kEngineRealCugan = 1;
+constexpr int kEngineRealEsrgan = 2;
 constexpr int kAccelerationAuto = 0;
 constexpr int kAccelerationVulkan = 1;
 
@@ -95,16 +96,67 @@ std::string realcugan_base_name(int scale, int noise) {
     return "up" + std::to_string(scale) + "x-denoise" + std::to_string(noise) + "x";
 }
 
+std::vector<std::string> realcugan_base_name_candidates(int scale, int noise) {
+    std::vector<std::string> candidates;
+    candidates.push_back(realcugan_base_name(scale, noise));
+    if (noise > 0 && noise != 3) {
+        candidates.push_back(realcugan_base_name(scale, 3));
+    }
+    if (noise != 0) {
+        candidates.push_back(realcugan_base_name(scale, 0));
+    }
+    if (noise >= 0) {
+        candidates.push_back(realcugan_base_name(scale, -1));
+    }
+
+    std::vector<std::string> unique;
+    for (const std::string& candidate : candidates) {
+        if (std::find(unique.begin(), unique.end(), candidate) == unique.end()) {
+            unique.push_back(candidate);
+        }
+    }
+    return unique;
+}
+
 ModelFiles select_model_files(const SuperResNativeParams& params) {
+    if (params.engineType == kEngineRealEsrgan) {
+        return ModelFiles{
+            join_path(params.modelDir, params.modelFileBase + ".param"),
+            join_path(params.modelDir, params.modelFileBase + ".bin"),
+            "data",
+            "output"
+        };
+    }
+
     const bool realcugan = params.engineType == kEngineRealCugan;
-    const std::string baseName = realcugan
-        ? realcugan_base_name(params.scale, params.noise)
-        : waifu2x_base_name(params.scale, params.noise);
+    if (realcugan) {
+        const std::vector<std::string> candidates = realcugan_base_name_candidates(params.scale, params.noise);
+        for (const std::string& candidate : candidates) {
+            ModelFiles files{
+                join_path(params.modelDir, candidate + ".param"),
+                join_path(params.modelDir, candidate + ".bin"),
+                "in0",
+                "out0"
+            };
+            if (is_regular_file(files.paramPath) && is_regular_file(files.binPath)) {
+                return files;
+            }
+        }
+        const std::string fallback = candidates.empty() ? realcugan_base_name(params.scale, params.noise) : candidates.front();
+        return ModelFiles{
+            join_path(params.modelDir, fallback + ".param"),
+            join_path(params.modelDir, fallback + ".bin"),
+            "in0",
+            "out0"
+        };
+    }
+
+    const std::string baseName = waifu2x_base_name(params.scale, params.noise);
     return ModelFiles{
         join_path(params.modelDir, baseName + ".param"),
         join_path(params.modelDir, baseName + ".bin"),
-        realcugan ? "in0" : "Input1",
-        realcugan ? "out0" : "Eltwise4"
+        "Input1",
+        "Eltwise4"
     };
 }
 
@@ -182,15 +234,19 @@ bool copy_output_tile(
     std::vector<unsigned char>& output,
     int outputW,
     int outputH,
+    int srcX,
+    int srcY,
     int dstX,
-    int dstY
+    int dstY,
+    int requestedCopyW,
+    int requestedCopyH
 ) {
     if (tile.empty() || tile.c < 3) {
         return false;
     }
 
-    const int copyW = std::min(tile.w, outputW - dstX);
-    const int copyH = std::min(tile.h, outputH - dstY);
+    const int copyW = std::min({requestedCopyW, tile.w - srcX, outputW - dstX});
+    const int copyH = std::min({requestedCopyH, tile.h - srcY, outputH - dstY});
     if (copyW <= 0 || copyH <= 0) {
         return false;
     }
@@ -198,14 +254,39 @@ bool copy_output_tile(
     for (int c = 0; c < 3; ++c) {
         const ncnn::Mat channel = tile.channel(c);
         for (int y = 0; y < copyH; ++y) {
-            const float* row = channel.row(y);
+            const float* row = channel.row(srcY + y);
             for (int x = 0; x < copyW; ++x) {
                 const size_t offset = (static_cast<size_t>(dstY + y) * outputW + dstX + x) * 3 + c;
-                output[offset] = to_u8(clamp01(row[x]));
+                output[offset] = to_u8(clamp01(row[srcX + x]));
             }
         }
     }
     return true;
+}
+
+void fill_reference_upscale(
+    const LoadedImage& image,
+    std::vector<unsigned char>& output,
+    int outputW,
+    int outputH,
+    int scale
+) {
+    if (image.rgb.empty() || output.empty() || scale <= 0) {
+        return;
+    }
+
+    // Some ncnn models crop a few pixels from each tile. Pre-filling with a scaled source prevents uncovered stitch seams from becoming black grid lines.
+    for (int y = 0; y < outputH; ++y) {
+        const int sourceY = std::min(image.height - 1, y / scale);
+        for (int x = 0; x < outputW; ++x) {
+            const int sourceX = std::min(image.width - 1, x / scale);
+            const size_t sourceOffset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3;
+            const size_t targetOffset = (static_cast<size_t>(y) * outputW + x) * 3;
+            output[targetOffset] = image.rgb[sourceOffset];
+            output[targetOffset + 1] = image.rgb[sourceOffset + 1];
+            output[targetOffset + 2] = image.rgb[sourceOffset + 2];
+        }
+    }
 }
 
 SuperResNativeCode run_ncnn(
@@ -251,6 +332,7 @@ SuperResNativeCode run_ncnn(
     }
 
     const int tileSize = std::max(32, params.tileSize);
+    const int tileOverlap = std::min(32, std::max(8, tileSize / 4));
     const int tilesX = (image.width + tileSize - 1) / tileSize;
     const int tilesY = (image.height + tileSize - 1) / tileSize;
     const int totalTiles = tilesX * tilesY;
@@ -261,6 +343,7 @@ SuperResNativeCode run_ncnn(
     if (output.empty()) {
         return SuperResNativeCode::OutOfMemory;
     }
+    fill_reference_upscale(image, output, outputW, outputH, params.scale);
 
     int completed = 0;
     for (int ty = 0; ty < tilesY; ++ty) {
@@ -273,10 +356,16 @@ SuperResNativeCode run_ncnn(
             const int tileY = ty * tileSize;
             const int tileW = std::min(tileSize, image.width - tileX);
             const int tileH = std::min(tileSize, image.height - tileY);
-            // Border tiles are edge-padded so small images and narrow remainders survive model crop layers.
-            const int inputW = tileW < tileSize ? tileSize : tileW;
-            const int inputH = tileH < tileSize ? tileSize : tileH;
-            ncnn::Mat input = make_input_tile(image, tileX, tileY, tileW, tileH, inputW, inputH);
+            const int sampleX = std::max(0, tileX - tileOverlap);
+            const int sampleY = std::max(0, tileY - tileOverlap);
+            const int sampleRight = std::min(image.width, tileX + tileW + tileOverlap);
+            const int sampleBottom = std::min(image.height, tileY + tileH + tileOverlap);
+            const int sampleW = sampleRight - sampleX;
+            const int sampleH = sampleBottom - sampleY;
+            // Tiles intentionally overlap; only the center region is stitched back to avoid visible model boundary artifacts.
+            const int inputW = std::max(tileSize, sampleW);
+            const int inputH = std::max(tileSize, sampleH);
+            ncnn::Mat input = make_input_tile(image, sampleX, sampleY, sampleW, sampleH, inputW, inputH);
             ncnn::Mat result;
 
             ncnn::Extractor extractor = net.create_extractor();
@@ -285,7 +374,13 @@ SuperResNativeCode run_ncnn(
                 return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
             }
 
-            if (!copy_output_tile(result, output, outputW, outputH, tileX * params.scale, tileY * params.scale)) {
+            const int cropX = (tileX - sampleX) * params.scale;
+            const int cropY = (tileY - sampleY) * params.scale;
+            const int dstX = tileX * params.scale;
+            const int dstY = tileY * params.scale;
+            const int copyW = tileW * params.scale;
+            const int copyH = tileH * params.scale;
+            if (!copy_output_tile(result, output, outputW, outputH, cropX, cropY, dstX, dstY, copyW, copyH)) {
                 return SuperResNativeCode::Unsupported;
             }
 
@@ -327,7 +422,13 @@ SuperResNativeCode process_superres(
         return SuperResNativeCode::InvalidParams;
     }
 
-    if (params.engineType != kEngineWaifu2x && params.engineType != kEngineRealCugan) {
+    if (params.engineType != kEngineWaifu2x &&
+        params.engineType != kEngineRealCugan &&
+        params.engineType != kEngineRealEsrgan) {
+        return SuperResNativeCode::Unsupported;
+    }
+
+    if (params.engineType == kEngineRealEsrgan && params.modelFileBase.empty()) {
         return SuperResNativeCode::Unsupported;
     }
 

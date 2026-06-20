@@ -43,4 +43,40 @@ class UpscaleParamsFactoryTest {
         assertEquals(OutputFormat.PNG, params.outputFormat)
         assertFalse(params.tta)
     }
+
+    @Test
+    fun clampsUnsupportedNoiseToNearestModelValue() {
+        val model = ModelPack(
+            id = "realesrgan-general-x4",
+            displayName = "x4plus",
+            engine = SuperResEngine.REAL_ESRGAN,
+            modelDir = "models",
+            assetPath = "models/realesrgan",
+            modelFileBase = "realesrgan-x4plus",
+            isBuiltIn = true,
+            requiredFiles = listOf("realesrgan-x4plus.param", "realesrgan-x4plus.bin"),
+            assetBytes = null,
+            description = "General Real-ESRGAN model.",
+            scenes = listOf("photo"),
+            scales = listOf(4),
+            denoise = listOf(0),
+            supportsTta = true,
+            defaultScale = 4,
+            defaultNoise = 0,
+            speedLevel = "slow",
+            qualityLevel = "high"
+        )
+
+        val params = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = model,
+            resolvedModelDir = "cache/models/realesrgan",
+            scale = 4,
+            noise = 3
+        )
+
+        assertEquals(0, params.noise)
+    }
 }

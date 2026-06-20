@@ -52,6 +52,45 @@ class HybridSuperResProcessorTest {
         assertEquals("Mock preview complete. Native inference is unavailable.", result.message)
     }
 
+    @Test
+    fun nativeProcessorChainsHigherScaleFromRealSinglePassScale() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        val result = processor.process(
+            defaultParams().copy(
+                scale = 8,
+                modelScales = listOf(2)
+            )
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(listOf(2, 2, 2), nativeProcessor.calls.map { it.scale })
+        assertEquals("cache/input.png", nativeProcessor.calls.first().inputPath)
+        assertEquals("cache/output.png", nativeProcessor.calls.last().outputPath)
+    }
+
+    @Test
+    fun nativeProcessorKeepsWaifuDenoiseOnlyScaleAsSinglePass() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        processor.process(
+            defaultParams().copy(
+                scale = 1,
+                modelScales = listOf(1, 2)
+            )
+        ) {}
+
+        assertEquals(listOf(1), nativeProcessor.calls.map { it.scale })
+    }
+
     private fun defaultParams() = UpscaleParams(
         taskId = "task-1",
         inputPath = "cache/input.png",
@@ -75,6 +114,20 @@ private class StaticProcessor(
         params: UpscaleParams,
         onProgress: (UpscaleProgress) -> Unit
     ): UpscaleResult = result
+
+    override fun cancel(taskId: String) = Unit
+}
+
+private class RecordingProcessor : SuperResProcessor {
+    val calls = mutableListOf<UpscaleParams>()
+
+    override suspend fun process(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        calls += params
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
+    }
 
     override fun cancel(taskId: String) = Unit
 }

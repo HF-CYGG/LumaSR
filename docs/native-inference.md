@@ -1,6 +1,6 @@
 # Native ncnn Inference
 
-LumaSR now uses the bundled ncnn Android Vulkan SDK for real Waifu2x and RealCUGAN inference. The native layer decodes an input image, splits it into tiles, runs the selected `.param/.bin` model with ncnn, stitches tiles, and writes a PNG result.
+LumaSR now uses the bundled ncnn Android Vulkan SDK for real Waifu2x, RealCUGAN, and Real-ESRGAN inference. The native layer decodes an input image, splits it into tiles, runs the selected `.param/.bin` model with ncnn, stitches tiles, and writes a PNG result.
 
 ## Required Native Toolchain
 
@@ -16,9 +16,12 @@ Example dependency command:
   -CmakeZipUrl "<domestic-cmake-3.22.1-windows.zip-url>" `
   -NcnnAndroidVulkanZipUrl "https://ghproxy.net/https://github.com/Tencent/ncnn/releases/download/20260526/ncnn-20260526-android-vulkan.zip" `
   -RealCuganSourceZipUrl "https://ghproxy.net/https://github.com/nihui/realcugan-ncnn-vulkan/archive/refs/tags/20220728.zip" `
+  -RealEsrganModelsZipUrl "<domestic-realesrgan-models-zip>" `
   -Waifu2xRepoDir "F:\LumaSR\.deps\sources\waifu2x-ncnn-vulkan" `
   -RealCuganAssetsZip "F:\LumaSR\.deps\downloads\realcugan-assets.zip"
 ```
+
+Real-ESRGAN models are selected by explicit `modelFileBase` values from the manifest. The first supported set includes `realesrgan-x4plus`, `realesrgan-x4plus-anime`, and `realesr-animevideov3-x2/x3/x4`.
 
 After the compatible NDK is installed:
 

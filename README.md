@@ -7,14 +7,14 @@
 ![Vulkan](https://img.shields.io/badge/Vulkan%2FCPU-Ready-A41E22?logo=vulkan&logoColor=white)
 ![Offline](https://img.shields.io/badge/Offline-Inference-2EA44F)
 
-LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与 Vulkan/CPU 加速实现离线推理，支持 Waifu2x、RealCUGAN 等模型，提供极简参数控制、实时分块处理预览与前后画质对比体验。
+LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与 Vulkan/CPU 加速实现离线推理，支持 Waifu2x、RealCUGAN、Real-ESRGAN 等模型，提供极简参数控制、实时分块处理预览与前后画质对比体验。
 
 项目目标是把常见超分模型做成可直接在手机端运行的轻量工具：不上传图片、不依赖云端服务，并尽量保留清晰、可维护的 Android 与 Native 分层。
 
 ## 功能特性
 
 - 本地离线推理：图片与模型均在设备端处理。
-- 内置模型包：随 APK 打包 Waifu2x CUnet、Waifu2x Anime、Waifu2x Photo、RealCUGAN Standard、RealCUGAN Pro。
+- 内置模型包：随 APK 打包 Waifu2x、RealCUGAN、Real-ESRGAN 系列权重。
 - ncnn Native 引擎：通过 JNI 调用 C++ 推理层，支持 `.param/.bin` 模型加载。
 - Vulkan/CPU 模式：支持自动模式，GPU 不可用时可回退 CPU。
 - 分块处理进度：按 tile 推进并向 Compose UI 回传阶段、百分比与 tile 状态。
@@ -52,6 +52,9 @@ scripts/download-deps.ps1       国内镜像依赖与模型安装脚本
 | Waifu2x | Photo | 普通照片柔和增强 |
 | RealCUGAN | Standard | 干净插画与通用动漫图 |
 | RealCUGAN | Pro | 压缩瑕疵修复与高质量增强 |
+| Real-ESRGAN | x4plus | 真实照片与退化图片 4x 修复 |
+| Real-ESRGAN | x4plus anime | 动漫、插画 4x 增强 |
+| Real-ESRGAN | AnimeVideo v3 x2/x3/x4 | 动画帧和视频截图 2x/3x/4x 增强 |
 
 模型文件来自上游开源项目或其 Android 资产包，仓库仅按清单打包运行所需文件。具体下载、校验和来源约束见 [docs/builtin-models.md](docs/builtin-models.md)。
 
@@ -105,3 +108,17 @@ app/build/outputs/apk/debug/app-debug.apk
 ## 许可与来源
 
 项目代码遵循 [LICENSE](LICENSE)。ncnn、Waifu2x、RealCUGAN 及模型权重遵循各自上游项目许可；分发或二次打包前请确认对应模型来源、授权和署名要求。
+## Model Update: Real-ESRGAN
+
+LumaSR now exposes additional built-in Real-ESRGAN models through `model_manifest.json`:
+
+- `Real-ESRGAN x4plus`: general real-world photo restoration.
+- `Real-ESRGAN x4plus anime`: anime and illustration enhancement.
+- `Real-ESRGAN AnimeVideo v3 x2/x3/x4`: animation frame enhancement with 2x, 3x, and 4x variants.
+
+The built-in scale list is also corrected for existing RealCUGAN assets:
+
+- `RealCUGAN Standard`: `2x / 3x / 4x`
+- `RealCUGAN Pro`: `2x / 3x`
+
+Use `scripts/download-deps.ps1 -RealEsrganModelsZipUrl "<domestic-mirror-zip>"` to install the Real-ESRGAN `.param/.bin` files. `-RealEsrganZipUrl` is still accepted for compatibility. Direct GitHub download URLs remain blocked by the script; use a domestic mirror or proxy URL.

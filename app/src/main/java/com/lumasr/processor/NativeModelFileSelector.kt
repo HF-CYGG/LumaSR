@@ -12,11 +12,15 @@ object NativeModelFileSelector {
         engine: SuperResEngine,
         modelDir: String,
         scale: Int,
-        noise: Int
+        noise: Int,
+        modelFileBase: String? = null
     ): NativeModelFiles {
         val baseName = when (engine) {
             SuperResEngine.WAIFU2X -> selectWaifu2xBaseName(scale, noise)
             SuperResEngine.REAL_CUGAN -> selectRealCuganBaseName(scale, noise)
+            SuperResEngine.REAL_ESRGAN -> requireNotNull(modelFileBase?.takeIf { it.isNotBlank() }) {
+                "Real-ESRGAN models require modelFileBase."
+            }
         }
         val cleanDir = modelDir.trimEnd('/', '\\')
         return NativeModelFiles(
@@ -37,6 +41,7 @@ object NativeModelFileSelector {
         return when {
             noise < 0 -> "up${scale}x-conservative"
             noise == 0 -> "up${scale}x-no-denoise"
+            noise in 1..2 && scale > 2 -> "up${scale}x-denoise3x"
             else -> "up${scale}x-denoise${noise}x"
         }
     }
