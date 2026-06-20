@@ -8,6 +8,7 @@ import java.io.InputStream
 interface ModelAssetSource {
     fun open(path: String): InputStream
     fun exists(path: String): Boolean
+    fun size(path: String): Long? = null
 }
 
 class AndroidModelAssetSource(
@@ -17,6 +18,10 @@ class AndroidModelAssetSource(
 
     override fun exists(path: String): Boolean {
         return runCatching { context.assets.open(path).close() }.isSuccess
+    }
+
+    override fun size(path: String): Long? {
+        return runCatching { context.assets.openFd(path).use { it.length } }.getOrNull()
     }
 }
 
@@ -41,6 +46,10 @@ class ModelAssetRepository(
             }
             val targetFile = File(targetDir, safeFileName).canonicalFile
             ensureInsideCache(targetFile)
+            val expectedSize = assetSource.size(assetFile)
+            if (expectedSize != null && targetFile.isFile && targetFile.length() == expectedSize) {
+                return@forEach
+            }
             // Native ncnn expects normal file paths, so APK assets are copied into app cache first.
             assetSource.open(assetFile).use { input ->
                 targetFile.outputStream().use { output -> input.copyTo(output) }

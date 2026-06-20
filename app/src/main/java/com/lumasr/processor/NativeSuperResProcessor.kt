@@ -40,6 +40,7 @@ data class NativeProcessRequest(
     val scale: Int,
     val noise: Int,
     val tileSize: Int,
+    val gpuHeadroomPercent: Int,
     val accelerationMode: Int,
     val tta: Boolean
 )
@@ -77,6 +78,7 @@ object JniNativeProcessBridge : NativeProcessBridge {
                 scale = request.scale,
                 noise = request.noise,
                 tileSize = request.tileSize,
+                gpuHeadroomPercent = request.gpuHeadroomPercent,
                 accelerationMode = request.accelerationMode,
                 tta = request.tta,
                 progressSink = NativeProgressSink(onProgress)
@@ -98,6 +100,7 @@ object JniNativeProcessBridge : NativeProcessBridge {
         scale: Int,
         noise: Int,
         tileSize: Int,
+        gpuHeadroomPercent: Int,
         accelerationMode: Int,
         tta: Boolean,
         progressSink: NativeProgressSink
@@ -163,6 +166,7 @@ class NativeSuperResProcessor(
             scale = params.scale,
             noise = params.noise,
             tileSize = params.tileSize,
+            gpuHeadroomPercent = params.gpuHeadroomPercent,
             accelerationMode = params.accelerationMode.ordinal,
             tta = params.tta
         )

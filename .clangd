@@ -1,0 +1,7 @@
+# 这个文件用于为 clangd/IDE 提供原生 C++ 索引参数，减少仅编辑器侧的误报。
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -If:/LumaSR/app/src/main/cpp
+    - -If:/LumaSR/.deps/native/ncnn/arm64-v8a/include/ncnn
+    - -If:/LumaSR/.deps/sources/waifu2x-ncnn-vulkan/src

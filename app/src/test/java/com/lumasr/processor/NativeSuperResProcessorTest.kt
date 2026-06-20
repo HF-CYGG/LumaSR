@@ -60,6 +60,8 @@ class NativeSuperResProcessorTest {
         assertEquals(UpscaleStage.DONE, result.stage)
         assertEquals("cache/models/waifu2x-cunet", bridge.lastRequest?.modelDir)
         assertEquals(0, bridge.lastRequest?.engineType)
+        assertEquals(128, bridge.lastRequest?.tileSize)
+        assertEquals(8, bridge.lastRequest?.gpuHeadroomPercent)
         assertEquals(listOf(UpscaleStage.PREPARING, UpscaleStage.LOADING_MODEL, UpscaleStage.DONE), stages)
     }
 
@@ -153,6 +155,7 @@ class NativeSuperResProcessorTest {
         scale = 2,
         noise = 1,
         tileSize = 128,
+        gpuHeadroomPercent = 8,
         accelerationMode = AccelerationMode.AUTO,
         tta = false,
         outputFormat = OutputFormat.PNG

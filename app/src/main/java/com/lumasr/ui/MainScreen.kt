@@ -152,6 +152,7 @@ private fun LumaNavHost(
                 onScaleChanged = viewModel::setScale,
                 onNoiseChanged = viewModel::setNoise,
                 onAccelerationChanged = viewModel::setAccelerationMode,
+                onTileSizeChanged = viewModel::setTileSize,
                 onTtaChanged = viewModel::setTta,
                 onStart = viewModel::startProcessing,
                 onClearImage = viewModel::clearSelectedImage,
@@ -161,7 +162,8 @@ private fun LumaNavHost(
         composable(BottomNavItem.Settings.route) {
             SettingsScreenV2(
                 state = state,
-                onAccelerationChanged = viewModel::setAccelerationMode
+                onAccelerationChanged = viewModel::setAccelerationMode,
+                onTileSizeChanged = viewModel::setTileSize
             )
         }
     }

@@ -26,6 +26,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -47,7 +48,8 @@ import com.lumasr.domain.SuperResEngine
 @Composable
 fun SettingsScreenV2(
     state: LumaUiState,
-    onAccelerationChanged: (AccelerationMode) -> Unit
+    onAccelerationChanged: (AccelerationMode) -> Unit,
+    onTileSizeChanged: (Int) -> Unit
 ) {
     var notifications by remember { mutableStateOf(true) }
     var exif by remember { mutableStateOf(true) }
@@ -77,7 +79,11 @@ fun SettingsScreenV2(
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
                 title = "分块大小",
-                subtitle = "${state.activeParams?.tileSize ?: 512} px"
+                subtitle = "${state.tileSize} px"
+            )
+            SettingsTileSizeSelector(
+                selectedTileSize = state.tileSize,
+                onTileSizeChanged = onTileSizeChanged
             )
             SettingsSwitchRowV2(
                 icon = Icons.Rounded.Memory,
@@ -112,6 +118,45 @@ fun SettingsScreenV2(
                 onCheckedChange = { exif = it }
             )
             Spacer(modifier = Modifier.height(28.dp))
+        }
+    }
+}
+
+@Composable
+private fun SettingsTileSizeSelector(
+    selectedTileSize: Int,
+    onTileSizeChanged: (Int) -> Unit
+) {
+    val selected = sanitizeTileSize(selectedTileSize)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        TileSizeOptions.forEach { tileSize ->
+            val active = tileSize == selected
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(38.dp)
+                    .clickable { onTileSizeChanged(tileSize) },
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
+                color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = tileSize.toString(),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
+                }
+            }
         }
     }
 }

@@ -37,6 +37,7 @@ struct SuperResNativeParams {
     int scale;
     int noise;
     int tileSize;
+    int gpuHeadroomPercent;
     int accelerationMode;
     bool tta;
 };

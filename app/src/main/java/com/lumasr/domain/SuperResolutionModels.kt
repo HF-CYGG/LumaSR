@@ -56,6 +56,7 @@ data class UpscaleParams(
     val scale: Int,
     val noise: Int,
     val tileSize: Int,
+    val gpuHeadroomPercent: Int = 8,
     val accelerationMode: AccelerationMode,
     val tta: Boolean,
     val outputFormat: OutputFormat

@@ -102,4 +102,20 @@ class LumaUiStateSelectionTest {
 
         assertFalse(state.canStartProcessing)
     }
+
+    @Test
+    fun defaultTileSizeUsesBalancedPerformancePreset() {
+        val state = LumaUiState()
+
+        assertEquals(512, state.tileSize)
+    }
+
+    @Test
+    fun tileSizeSanitizerKeepsOnlySupportedPresets() {
+        assertEquals(128, sanitizeTileSize(128))
+        assertEquals(256, sanitizeTileSize(256))
+        assertEquals(512, sanitizeTileSize(333))
+        assertEquals(768, sanitizeTileSize(768))
+        assertEquals(1024, sanitizeTileSize(1024))
+    }
 }

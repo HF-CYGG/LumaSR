@@ -68,6 +68,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
     jint scale,
     jint noise,
     jint tile_size,
+    jint gpu_headroom_percent,
     jint acceleration_mode,
     jboolean tta,
     jobject progress_sink
@@ -82,6 +83,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
         static_cast<int>(scale),
         static_cast<int>(noise),
         static_cast<int>(tile_size),
+        static_cast<int>(gpu_headroom_percent),
         static_cast<int>(acceleration_mode),
         tta == JNI_TRUE
     };

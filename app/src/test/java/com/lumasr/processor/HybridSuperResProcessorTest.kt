@@ -101,6 +101,7 @@ class HybridSuperResProcessorTest {
         scale = 2,
         noise = 1,
         tileSize = 128,
+        gpuHeadroomPercent = 8,
         accelerationMode = AccelerationMode.AUTO,
         tta = false,
         outputFormat = OutputFormat.PNG

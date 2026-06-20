@@ -125,6 +125,7 @@ fun ProcessTabV2(
     onScaleChanged: (Int) -> Unit,
     onNoiseChanged: (Int) -> Unit,
     onAccelerationChanged: (AccelerationMode) -> Unit,
+    onTileSizeChanged: (Int) -> Unit,
     onTtaChanged: (Boolean) -> Unit,
     onStart: () -> Unit,
     onClearImage: () -> Unit,
@@ -218,6 +219,7 @@ fun ProcessTabV2(
                 onScaleChanged = onScaleChanged,
                 onNoiseChanged = onNoiseChanged,
                 onAccelerationChanged = onAccelerationChanged,
+                onTileSizeChanged = onTileSizeChanged,
                 onTtaChanged = onTtaChanged,
                 onClearImage = onClearImage,
                 onStart = onStart,
@@ -254,6 +256,7 @@ private fun ParameterSheet(
     onScaleChanged: (Int) -> Unit,
     onNoiseChanged: (Int) -> Unit,
     onAccelerationChanged: (AccelerationMode) -> Unit,
+    onTileSizeChanged: (Int) -> Unit,
     onTtaChanged: (Boolean) -> Unit,
     onClearImage: () -> Unit,
     onStart: () -> Unit,
@@ -422,6 +425,14 @@ private fun ParameterSheet(
                 selected = state.accelerationMode,
                 itemLabel = { it.accelerationLabel() },
                 onSelected = onAccelerationChanged
+            )
+
+            SectionLabel("分块大小")
+            AnimatedSegmentedSelector(
+                items = TileSizeOptions,
+                selected = sanitizeTileSize(state.tileSize),
+                itemLabel = { it.toString() },
+                onSelected = onTileSizeChanged
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {

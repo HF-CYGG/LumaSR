@@ -137,6 +137,10 @@ class LumaViewModel(
         _uiState.update { it.copy(accelerationMode = mode) }
     }
 
+    fun setTileSize(tileSize: Int) {
+        _uiState.update { it.copy(tileSize = sanitizeTileSize(tileSize)) }
+    }
+
     fun setTta(enabled: Boolean) {
         _uiState.update { state ->
             val model = state.selectedModel
@@ -162,6 +166,21 @@ class LumaViewModel(
             var lastStage: UpscaleStage = UpscaleStage.CANCELLED
             var lastSuccess = false
             val completedResults = mutableListOf<RenderResultInfo>()
+            val modelDir = runCatching {
+                withContext(ioDispatcher) {
+                    modelAssetRepository.prepareModel(model).absolutePath
+                }
+            }.getOrElse { error ->
+                _uiState.update {
+                    it.copy(
+                        screen = LumaScreen.EDITING,
+                        progress = null,
+                        resultMessage = "Cannot prepare ${model.displayName}: ${error.message}"
+                    )
+                }
+                currentTaskId = null
+                return@launch
+            }
 
             for ((index, image) in images.withIndex()) {
                 if (!isActive) break
@@ -185,7 +204,6 @@ class LumaViewModel(
                 val params = runCatching {
                     withContext(ioDispatcher) {
                         val paths = imageCacheRepository.copyToTaskCache(Uri.parse(image.sourceUri), taskId, image.mimeType)
-                        val modelDir = modelAssetRepository.prepareModel(model).absolutePath
                         UpscaleParamsFactory.create(
                             taskId = taskId,
                             inputPath = paths.inputFile.absolutePath,
@@ -194,6 +212,8 @@ class LumaViewModel(
                             resolvedModelDir = modelDir,
                             scale = state.scale,
                             noise = state.noise,
+                            tileSize = state.tileSize,
+                            gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                             accelerationMode = state.accelerationMode,
                             tta = state.tta,
                             outputFormat = OutputFormat.PNG
@@ -413,6 +433,7 @@ data class LumaUiState(
     val selectedImages: List<SelectedImageInfo> = emptyList(),
     val scale: Int = 2,
     val noise: Int = 1,
+    val tileSize: Int = DEFAULT_TILE_SIZE,
     val accelerationMode: AccelerationMode = AccelerationMode.AUTO,
     val tta: Boolean = false,
     val screen: LumaScreen = LumaScreen.EDITING,
@@ -443,6 +464,13 @@ data class LumaUiState(
             "开始处理"
         }
 }
+
+val TileSizeOptions: List<Int> = UpscaleParamsFactory.supportedTileSizes.sorted()
+
+fun sanitizeTileSize(tileSize: Int): Int = UpscaleParamsFactory.sanitizeTileSize(tileSize)
+
+private const val DEFAULT_TILE_SIZE = UpscaleParamsFactory.DEFAULT_TILE_SIZE
+private const val DEFAULT_GPU_HEADROOM_PERCENT = UpscaleParamsFactory.DEFAULT_GPU_HEADROOM_PERCENT
 
 data class SelectedImageInfo(
     val sourceUri: String,

@@ -1,10 +1,12 @@
+// 这个文件负责在原生层执行基于 ncnn 的超分推理，包括模型选择、图像分块、推理拼接与结果输出。
 #include "superres_engine.h"
 
 #include <algorithm>
-#include <cmath>
+#include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <string>
-#include <sys/stat.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -25,7 +27,9 @@ constexpr int kAccelerationVulkan = 1;
 
 std::mutex cancel_mutex;
 std::mutex gpu_mutex;
+std::mutex net_cache_mutex;
 std::unordered_set<std::string> cancelled_tasks;
+bool gpu_instance_created = false;
 
 struct ModelFiles {
     std::string paramPath;
@@ -40,19 +44,89 @@ struct LoadedImage {
     std::vector<unsigned char> rgb;
 };
 
-struct GpuInstanceGuard {
-    bool created = false;
-
-    ~GpuInstanceGuard() {
-        if (created) {
-            ncnn::destroy_gpu_instance();
-        }
-    }
+struct NetCacheEntry {
+    std::string key;
+    std::shared_ptr<ncnn::Net> net;
 };
 
+NetCacheEntry net_cache;
+
 bool is_regular_file(const std::string& path) {
-    struct stat info {};
-    return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
+    std::error_code error;
+    return std::filesystem::is_regular_file(std::filesystem::path(path), error) && !error;
+}
+
+int clamp_gpu_headroom_percent(int value) {
+    return std::min(10, std::max(5, value));
+}
+
+int inference_threads(bool useVulkan) {
+    if (useVulkan) {
+        return 1;
+    }
+    const unsigned int hardware = std::thread::hardware_concurrency();
+    const int available = hardware == 0 ? 2 : static_cast<int>(hardware);
+    return std::min(4, std::max(1, available - 1));
+}
+
+bool ensure_gpu_instance() {
+    if (gpu_instance_created) {
+        return ncnn::get_gpu_count() > 0;
+    }
+    if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0) {
+        return false;
+    }
+    gpu_instance_created = true;
+    return true;
+}
+
+std::string make_net_cache_key(const ModelFiles& files, bool useVulkan, int threadCount) {
+    return files.paramPath + "|" + files.binPath + "|" + (useVulkan ? "vulkan" : "cpu") + "|" + std::to_string(threadCount);
+}
+
+std::shared_ptr<ncnn::Net> load_cached_net(
+    const ModelFiles& files,
+    bool useVulkan,
+    int threadCount
+) {
+    const std::string key = make_net_cache_key(files, useVulkan, threadCount);
+    {
+        std::lock_guard<std::mutex> lock(net_cache_mutex);
+        if (net_cache.key == key && net_cache.net) {
+            return net_cache.net;
+        }
+    }
+
+    auto net = std::make_shared<ncnn::Net>();
+    net->opt.num_threads = threadCount;
+    net->opt.use_packing_layout = true;
+    net->opt.use_vulkan_compute = useVulkan;
+    if (useVulkan) {
+        net->opt.use_fp16_packed = true;
+        net->opt.use_fp16_storage = true;
+        net->opt.use_fp16_arithmetic = true;
+        net->set_vulkan_device(ncnn::get_default_gpu_index());
+    }
+    if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(net_cache_mutex);
+    net_cache = NetCacheEntry{key, net};
+    return net_cache.net;
+}
+
+void sleep_for_gpu_headroom(
+    int gpuHeadroomPercent,
+    const std::chrono::steady_clock::duration& elapsed
+) {
+    const int headroom = clamp_gpu_headroom_percent(gpuHeadroomPercent);
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (elapsedMs <= 0) {
+        return;
+    }
+    const long long sleepMs = std::min<long long>(20, std::max<long long>(1, elapsedMs * headroom / (100 - headroom)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
 }
 
 bool is_cancelled(const std::string& taskId) {
@@ -309,25 +383,19 @@ SuperResNativeCode run_ncnn(
         return SuperResNativeCode::Cancelled;
     }
 
-    GpuInstanceGuard gpuGuard;
     std::unique_lock<std::mutex> gpuLock(gpu_mutex, std::defer_lock);
     if (useVulkan) {
         gpuLock.lock();
-        // ncnn owns a process-wide Vulkan instance, so creation/destruction is serialized.
-        if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0) {
+        // ncnn owns a process-wide Vulkan instance, so GPU inference is serialized and the instance is reused.
+        if (!ensure_gpu_instance()) {
             return SuperResNativeCode::VulkanFailed;
         }
-        gpuGuard.created = true;
     }
 
     emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
-    ncnn::Net net;
-    net.opt.num_threads = 2;
-    net.opt.use_vulkan_compute = useVulkan;
-    if (useVulkan) {
-        net.set_vulkan_device(ncnn::get_default_gpu_index());
-    }
-    if (net.load_param(files.paramPath.c_str()) != 0 || net.load_model(files.binPath.c_str()) != 0) {
+    const int threadCount = inference_threads(useVulkan);
+    std::shared_ptr<ncnn::Net> net = load_cached_net(files, useVulkan, threadCount);
+    if (!net) {
         return SuperResNativeCode::ModelMissing;
     }
 
@@ -367,8 +435,9 @@ SuperResNativeCode run_ncnn(
             const int inputH = std::max(tileSize, sampleH);
             ncnn::Mat input = make_input_tile(image, sampleX, sampleY, sampleW, sampleH, inputW, inputH);
             ncnn::Mat result;
+            const auto tileStart = std::chrono::steady_clock::now();
 
-            ncnn::Extractor extractor = net.create_extractor();
+            ncnn::Extractor extractor = net->create_extractor();
             if (extractor.input(files.inputBlob, input) != 0 ||
                 extractor.extract(files.outputBlob, result) != 0) {
                 return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
@@ -382,6 +451,16 @@ SuperResNativeCode run_ncnn(
             const int copyH = tileH * params.scale;
             if (!copy_output_tile(result, output, outputW, outputH, cropX, cropY, dstX, dstY, copyW, copyH)) {
                 return SuperResNativeCode::Unsupported;
+            }
+
+            if (useVulkan) {
+                sleep_for_gpu_headroom(
+                    params.gpuHeadroomPercent,
+                    std::chrono::steady_clock::now() - tileStart
+                );
+                if (is_cancelled(params.taskId)) {
+                    return SuperResNativeCode::Cancelled;
+                }
             }
 
             completed += 1;

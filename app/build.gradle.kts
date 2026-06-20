@@ -5,14 +5,13 @@ plugins {
 
 android {
     namespace = "com.lumasr"
-    compileSdk = 34
-    buildToolsVersion = "34.0.0"
+    compileSdk = 35
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.lumasr"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
 
@@ -40,6 +39,28 @@ android {
         jvmTarget = "17"
     }
 
+    val uploadStoreFile = providers.environmentVariable("LUMASR_UPLOAD_STORE_FILE")
+    val uploadStorePassword = providers.environmentVariable("LUMASR_UPLOAD_STORE_PASSWORD")
+    val uploadKeyAlias = providers.environmentVariable("LUMASR_UPLOAD_KEY_ALIAS")
+    val uploadKeyPassword = providers.environmentVariable("LUMASR_UPLOAD_KEY_PASSWORD")
+    val hasUploadSigningConfig = listOf(
+        uploadStoreFile,
+        uploadStorePassword,
+        uploadKeyAlias,
+        uploadKeyPassword
+    ).all { it.isPresent }
+
+    signingConfigs {
+        if (hasUploadSigningConfig) {
+            create("upload") {
+                storeFile = file(uploadStoreFile.get())
+                storePassword = uploadStorePassword.get()
+                keyAlias = uploadKeyAlias.get()
+                keyPassword = uploadKeyPassword.get()
+            }
+        }
+    }
+
     buildTypes {
         debug {
             ndk {
@@ -47,6 +68,15 @@ android {
             }
         }
         release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            if (hasUploadSigningConfig) {
+                signingConfig = signingConfigs.getByName("upload")
+            }
             ndk {
                 abiFilters += "arm64-v8a"
             }
