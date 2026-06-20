@@ -1,5 +1,6 @@
 // 这个文件负责在原生层执行基于 ncnn 的超分推理，包括模型选择、图像分块、推理拼接与结果输出。
 #include "superres_engine.h"
+#include "superres_tile_geometry.h"
 
 #include <algorithm>
 #include <chrono>
@@ -48,19 +49,6 @@ struct LoadedImage {
 struct NetCacheEntry {
     std::string key;
     std::shared_ptr<ncnn::Net> net;
-};
-
-struct TileInputRegion {
-    int inputX;
-    int inputY;
-    int inputW;
-    int inputH;
-    int cropX;
-    int cropY;
-    int dstX;
-    int dstY;
-    int copyW;
-    int copyH;
 };
 
 NetCacheEntry net_cache;
@@ -292,13 +280,6 @@ unsigned char to_u8(float normalized) {
     return static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, normalized * 255.0f + 0.5f)));
 }
 
-int align_delta(int value, int alignment) {
-    if (alignment <= 1) {
-        return 0;
-    }
-    return ((value + alignment - 1) / alignment) * alignment - value;
-}
-
 int waifu2x_prepadding(const SuperResNativeParams& params) {
     if (params.engineType != kEngineWaifu2x) {
         return 0;
@@ -322,16 +303,6 @@ int waifu2x_prepadding(const SuperResNativeParams& params) {
     return 0;
 }
 
-int waifu2x_alignment(int scale) {
-    if (scale == 1) {
-        return 4;
-    }
-    if (scale == 2) {
-        return 2;
-    }
-    return 1;
-}
-
 TileInputRegion make_waifu2x_tile_region(
     const SuperResNativeParams& params,
     int imageW,
@@ -341,22 +312,16 @@ TileInputRegion make_waifu2x_tile_region(
     int tileW,
     int tileH
 ) {
-    const int prepadding = waifu2x_prepadding(params);
-    const int alignment = waifu2x_alignment(params.scale);
-    const int rightPadding = prepadding + align_delta(imageW, alignment);
-    const int bottomPadding = prepadding + align_delta(imageH, alignment);
-    return TileInputRegion{
-        tileX - prepadding,
-        tileY - prepadding,
-        tileW + prepadding + rightPadding,
-        tileH + prepadding + bottomPadding,
-        prepadding * params.scale,
-        prepadding * params.scale,
-        tileX * params.scale,
-        tileY * params.scale,
-        tileW * params.scale,
-        tileH * params.scale
-    };
+    return ::make_waifu2x_tile_region(
+        params.scale,
+        waifu2x_prepadding(params),
+        imageW,
+        imageH,
+        tileX,
+        tileY,
+        tileW,
+        tileH
+    );
 }
 
 TileInputRegion make_overlapped_tile_region(
