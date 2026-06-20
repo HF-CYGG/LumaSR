@@ -15,6 +15,7 @@ import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ModelAssetRepository
 import com.lumasr.data.ModelManifestRepository
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.UpscaleParams
@@ -376,21 +377,16 @@ class LumaViewModel(
     }
 
     private fun loadManifest() {
-        runCatching { repository.loadManifest() }
-            .onSuccess { manifest ->
-                val defaultModel = manifest.models.firstOrNull { it.id == "realcugan-standard" }
-                    ?: manifest.models.firstOrNull()
-                _uiState.update {
-                    it.copy(
-                        models = manifest.models,
-                        selectedModelId = defaultModel?.id,
-                        scale = defaultModel?.defaultScale ?: 2,
-                        noise = defaultModel?.defaultNoise ?: 1
-                    )
+        viewModelScope.launch {
+            runCatching {
+                withContext(ioDispatcher) {
+                    repository.loadManifest()
                 }
-            }
-            .onFailure { error ->
+            }.onSuccess { manifest ->
+                _uiState.update { it.withLoadedManifest(manifest) }
+            }.onFailure { error ->
                 _uiState.update { it.copy(resultMessage = "Model manifest failed: ${error.message}") }
+            }
         }
     }
 
@@ -558,6 +554,17 @@ fun LumaUiState.clearImageSelection(): LumaUiState {
     )
 }
 
+fun LumaUiState.withLoadedManifest(manifest: ModelManifest): LumaUiState {
+    val defaultModel = manifest.models.firstOrNull { it.id == DEFAULT_MODEL_ID }
+        ?: manifest.models.firstOrNull()
+    return copy(
+        models = manifest.models,
+        selectedModelId = defaultModel?.id,
+        scale = defaultModel?.defaultScale ?: scale,
+        noise = defaultModel?.defaultNoise ?: noise
+    )
+}
+
 private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {
     return when (stage) {
         UpscaleStage.DONE -> RenderTaskStatus.DONE
@@ -575,3 +582,5 @@ private fun com.lumasr.data.CachedImageInfo.toSelectedImageInfo() = SelectedImag
     height = height,
     mimeType = mimeType
 )
+
+private const val DEFAULT_MODEL_ID = "realcugan-standard"

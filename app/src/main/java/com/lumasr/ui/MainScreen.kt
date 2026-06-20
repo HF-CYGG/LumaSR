@@ -5,6 +5,7 @@ package com.lumasr.ui
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
@@ -43,9 +44,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,6 +81,18 @@ fun MainScreen(viewModel: LumaViewModel) {
     val navController = rememberNavController()
     val state by viewModel.uiState.collectAsState()
     val showBottomBar = state.screen == LumaScreen.EDITING
+    var hasShownEditingBottomBar by remember { mutableStateOf(false) }
+    val bottomBarEnterTransition = if (shouldAnimateBottomBarEnter(hasShownEditingBottomBar, showBottomBar)) {
+        slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160))
+    } else {
+        EnterTransition.None
+    }
+
+    LaunchedEffect(showBottomBar) {
+        if (showBottomBar) {
+            hasShownEditingBottomBar = true
+        }
+    }
 
     Scaffold { paddingValues ->
         Box(
@@ -116,7 +132,7 @@ fun MainScreen(viewModel: LumaViewModel) {
 
             AnimatedVisibility(
                 visible = showBottomBar,
-                enter = slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160)),
+                enter = bottomBarEnterTransition,
                 exit = slideOutVertically(animationSpec = tween(180)) { it } + fadeOut(tween(120)),
                 modifier = Modifier.align(Alignment.BottomCenter)
             ) {
@@ -127,6 +143,11 @@ fun MainScreen(viewModel: LumaViewModel) {
         }
     }
 }
+
+internal fun shouldAnimateBottomBarEnter(
+    hasShownEditingBottomBar: Boolean,
+    showBottomBar: Boolean
+): Boolean = hasShownEditingBottomBar && showBottomBar
 
 @Composable
 private fun LumaNavHost(

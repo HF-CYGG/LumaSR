@@ -1,5 +1,8 @@
 package com.lumasr.ui
 
+import com.lumasr.domain.ModelManifest
+import com.lumasr.domain.ModelPack
+import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import org.junit.Assert.assertEquals
@@ -118,4 +121,80 @@ class LumaUiStateSelectionTest {
         assertEquals(768, sanitizeTileSize(768))
         assertEquals(1024, sanitizeTileSize(1024))
     }
+
+    @Test
+    fun appliesLoadedManifestUsingRealCuganStandardAsDefaultModel() {
+        val state = LumaUiState().withLoadedManifest(
+            ModelManifest(
+                version = 1,
+                models = listOf(
+                    modelPack(id = "waifu2x-anime", defaultScale = 2, defaultNoise = 1),
+                    modelPack(id = "realcugan-standard", defaultScale = 4, defaultNoise = 2)
+                )
+            )
+        )
+
+        assertEquals("realcugan-standard", state.selectedModelId)
+        assertEquals(4, state.scale)
+        assertEquals(2, state.noise)
+        assertEquals(2, state.models.size)
+    }
+
+    @Test
+    fun appliesLoadedManifestUsingFirstModelWhenPreferredDefaultIsMissing() {
+        val state = LumaUiState().withLoadedManifest(
+            ModelManifest(
+                version = 1,
+                models = listOf(
+                    modelPack(id = "waifu2x-anime", defaultScale = 2, defaultNoise = 3),
+                    modelPack(id = "realesrgan-general-x4", defaultScale = 4, defaultNoise = 0)
+                )
+            )
+        )
+
+        assertEquals("waifu2x-anime", state.selectedModelId)
+        assertEquals(2, state.scale)
+        assertEquals(3, state.noise)
+    }
+
+    @Test
+    fun appliesEmptyLoadedManifestWithoutChangingSafeDefaults() {
+        val state = LumaUiState().withLoadedManifest(ModelManifest(version = 1, models = emptyList()))
+
+        assertNull(state.selectedModelId)
+        assertEquals(2, state.scale)
+        assertEquals(1, state.noise)
+        assertTrue(state.models.isEmpty())
+    }
+
+    @Test
+    fun bottomBarEnterAnimationIsSkippedForFirstEditingFrameOnly() {
+        assertFalse(shouldAnimateBottomBarEnter(hasShownEditingBottomBar = false, showBottomBar = true))
+        assertTrue(shouldAnimateBottomBarEnter(hasShownEditingBottomBar = true, showBottomBar = true))
+        assertFalse(shouldAnimateBottomBarEnter(hasShownEditingBottomBar = true, showBottomBar = false))
+    }
+
+    private fun modelPack(
+        id: String,
+        defaultScale: Int,
+        defaultNoise: Int
+    ) = ModelPack(
+        id = id,
+        displayName = id,
+        engine = SuperResEngine.REAL_CUGAN,
+        modelDir = id,
+        assetPath = id,
+        isBuiltIn = true,
+        requiredFiles = emptyList(),
+        assetBytes = null,
+        description = id,
+        scenes = emptyList(),
+        scales = listOf(defaultScale),
+        denoise = listOf(defaultNoise),
+        supportsTta = false,
+        defaultScale = defaultScale,
+        defaultNoise = defaultNoise,
+        speedLevel = "medium",
+        qualityLevel = "medium"
+    )
 }

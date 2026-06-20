@@ -1,5 +1,6 @@
 package com.lumasr.ui
 
+import android.os.Build
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -35,25 +36,42 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.SuperResEngine
+
+internal const val SettingsFooterBottomSpacerDp = 128
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreenV2(
     state: LumaUiState,
     onAccelerationChanged: (AccelerationMode) -> Unit,
-    onTileSizeChanged: (Int) -> Unit
+    onTileSizeChanged: (Int) -> Unit,
+    appVersionLabel: String? = null
 ) {
     var notifications by remember { mutableStateOf(true) }
     var exif by remember { mutableStateOf(true) }
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
+    val context = LocalContext.current
+    val resolvedAppVersionLabel = appVersionLabel ?: remember(context) {
+        val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+        val versionName = packageInfo.versionName ?: "unknown"
+        @Suppress("DEPRECATION")
+        val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.longVersionCode
+        } else {
+            packageInfo.versionCode.toLong()
+        }
+        formatSettingsVersion(versionName, versionCode)
+    }
 
     Scaffold(
         topBar = {
@@ -117,9 +135,23 @@ fun SettingsScreenV2(
                 checked = exif,
                 onCheckedChange = { exif = it }
             )
-            Spacer(modifier = Modifier.height(28.dp))
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(
+                text = resolvedAppVersionLabel,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+            )
+            Spacer(modifier = Modifier.height(SettingsFooterBottomSpacerDp.dp))
         }
     }
+}
+
+internal fun formatSettingsVersion(versionName: String, versionCode: Long): String {
+    return "\u7248\u672c $versionName ($versionCode)"
 }
 
 @Composable
