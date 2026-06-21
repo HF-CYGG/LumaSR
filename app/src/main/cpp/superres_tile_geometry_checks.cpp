@@ -80,4 +80,79 @@ static_assert(kCunetDenoiseOnly.cropY == 0);
 static_assert(kCunetDenoiseOnly.copyW == 512);
 static_assert(kCunetDenoiseOnly.copyH == 512);
 
+constexpr TileInputRegion kRealCugan2xFirstTile = make_realcugan_tile_region(
+    2,
+    18,
+    751,
+    1182,
+    0,
+    0,
+    128,
+    128
+);
+
+static_assert(kRealCugan2xFirstTile.inputX == -18);
+static_assert(kRealCugan2xFirstTile.inputY == -18);
+static_assert(kRealCugan2xFirstTile.inputW == 164);
+static_assert(kRealCugan2xFirstTile.inputH == 164);
+static_assert(kRealCugan2xFirstTile.cropX == 0);
+static_assert(kRealCugan2xFirstTile.cropY == 0);
+static_assert(kRealCugan2xFirstTile.dstX == 0);
+static_assert(kRealCugan2xFirstTile.dstY == 0);
+static_assert(kRealCugan2xFirstTile.copyW == 256);
+static_assert(kRealCugan2xFirstTile.copyH == 256);
+
+constexpr TileInputRegion kRealCugan3xRightBottom = make_realcugan_tile_region(
+    3,
+    14,
+    751,
+    1182,
+    640,
+    1152,
+    111,
+    30
+);
+
+static_assert(kRealCugan3xRightBottom.inputX == 626);
+static_assert(kRealCugan3xRightBottom.inputY == 1138);
+static_assert(kRealCugan3xRightBottom.inputW == 140);
+static_assert(kRealCugan3xRightBottom.inputH == 60);
+static_assert(kRealCugan3xRightBottom.cropX == 0);
+static_assert(kRealCugan3xRightBottom.cropY == 0);
+static_assert(kRealCugan3xRightBottom.dstX == 1920);
+static_assert(kRealCugan3xRightBottom.dstY == 3456);
+static_assert(kRealCugan3xRightBottom.copyW == 333);
+static_assert(kRealCugan3xRightBottom.copyH == 90);
+
+static_assert(tile_output_has_rgb_channels(1, 4));
+static_assert(tile_output_has_rgb_channels(3, 1));
+static_assert(!tile_output_has_rgb_channels(1, 1));
+static_assert(tile_output_needs_unpacking(1, 4));
+static_assert(!tile_output_needs_unpacking(3, 1));
+static_assert(tile_output_needs_fp32_conversion(2, 1));
+static_assert(!tile_output_needs_fp32_conversion(4, 1));
+static_assert(resolve_waifu2x_output_crop(1024, 1024) == 0);
+static_assert(resolve_waifu2x_output_crop(1098, 1024) == 0);
+static_assert(resolve_waifu2x_output_crop(1000, 1024) == -1);
+static_assert(resolve_tile_output_crop(1098, 1024, 36) == 36);
+static_assert(resolve_tile_output_crop(1024, 1024, 36) == 0);
+static_assert(resolve_tile_output_crop(1030, 1024, 36) == 6);
+static_assert(resolve_tile_output_crop(1000, 1024, 36) == -1);
+static_assert(should_retry_cpu_after_gpu_code(0, 8));
+static_assert(should_retry_cpu_after_gpu_code(0, 9));
+static_assert(!should_retry_cpu_after_gpu_code(1, 9));
+static_assert(!should_retry_cpu_after_gpu_code(0, 5));
+static_assert(!should_force_cpu_before_vulkan_model_load(0));
+static_assert(!should_force_cpu_before_vulkan_model_load(1));
+static_assert(is_large_realesrgan_model_base("realesrgan-x4plus"));
+static_assert(is_large_realesrgan_model_base("realesrgan-x4plus-anime"));
+static_assert(!is_large_realesrgan_model_base("realesr-animevideov3-x2"));
+static_assert(is_waifu2x_cunet_dir("models/waifu2x/models-cunet"));
+static_assert(is_waifu2x_cunet_dir("/data/user/0/com.lumasr/cache/models/waifu2x-cunet"));
+static_assert(!is_waifu2x_cunet_dir("/data/user/0/com.lumasr/cache/models/waifu2x-photo"));
+static_assert(is_waifu2x_upconv_dir("models/waifu2x/models-upconv_7_anime_style_art_rgb"));
+static_assert(is_waifu2x_upconv_dir("/data/user/0/com.lumasr/cache/models/waifu2x-anime"));
+static_assert(is_waifu2x_upconv_dir("/data/user/0/com.lumasr/cache/models/waifu2x-photo"));
+static_assert(!is_waifu2x_upconv_dir("/data/user/0/com.lumasr/cache/models/waifu2x-cunet"));
+
 }

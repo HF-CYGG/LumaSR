@@ -5,6 +5,7 @@
 package com.lumasr.ui
 
 import android.app.Application
+import android.os.Build
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
@@ -17,6 +18,7 @@ import com.lumasr.data.ModelManifestRepository
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
+import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleParamsFactory
@@ -44,6 +46,7 @@ class LumaViewModel(
     private val modelAssetRepository: ModelAssetRepository = ModelAssetRepository.fromContext(application),
     private val galleryRepository: GalleryRepository = GalleryRepository(application),
     private val processor: SuperResProcessor = HybridSuperResProcessor(),
+    private val modelRuntimePolicy: ModelRuntimePolicy = ModelRuntimePolicy(Build.SUPPORTED_ABIS.toList()),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(LumaUiState())
@@ -71,6 +74,7 @@ class LumaViewModel(
                         selectedTab = LumaTab.PROCESS,
                         progress = null,
                         completedResults = emptyList(),
+                        savedOutputUri = null,
                         savedOutputUris = emptyList(),
                         resultMessage = null
                     )
@@ -99,6 +103,7 @@ class LumaViewModel(
                         activeBatchIndex = 0,
                         activeBatchSize = images.size,
                         completedResults = emptyList(),
+                        savedOutputUri = null,
                         savedOutputUris = emptyList(),
                         resultMessage = null
                     )
@@ -121,6 +126,7 @@ class LumaViewModel(
                 selectedModelId = modelId,
                 scale = model.defaultScale,
                 noise = model.defaultNoise,
+                accelerationMode = modelRuntimePolicy.sanitizeAccelerationMode(model, it.accelerationMode),
                 tta = false
             )
         }
@@ -135,7 +141,16 @@ class LumaViewModel(
     }
 
     fun setAccelerationMode(mode: AccelerationMode) {
-        _uiState.update { it.copy(accelerationMode = mode) }
+        _uiState.update { state ->
+            val model = state.selectedModel
+            state.copy(
+                accelerationMode = if (model != null) {
+                    modelRuntimePolicy.sanitizeAccelerationMode(model, mode)
+                } else {
+                    mode
+                }
+            )
+        }
     }
 
     fun setTileSize(tileSize: Int) {
@@ -197,6 +212,7 @@ class LumaViewModel(
                         activeBatchIndex = index + 1,
                         activeBatchSize = images.size,
                         completedResults = emptyList(),
+                        savedOutputUri = null,
                         savedOutputUris = emptyList(),
                         resultMessage = null
                     )
@@ -216,6 +232,7 @@ class LumaViewModel(
                             tileSize = state.tileSize,
                             gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                             accelerationMode = state.accelerationMode,
+                            allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
                             tta = state.tta,
                             outputFormat = OutputFormat.PNG
                         )
@@ -383,7 +400,8 @@ class LumaViewModel(
                     repository.loadManifest()
                 }
             }.onSuccess { manifest ->
-                _uiState.update { it.withLoadedManifest(manifest) }
+                val runtimeManifest = manifest.copy(models = modelRuntimePolicy.visibleModels(manifest.models))
+                _uiState.update { it.withLoadedManifest(runtimeManifest) }
             }.onFailure { error ->
                 _uiState.update { it.copy(resultMessage = "Model manifest failed: ${error.message}") }
             }

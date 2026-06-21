@@ -16,10 +16,12 @@ object UpscaleParamsFactory {
         tileSize: Int = DEFAULT_TILE_SIZE,
         gpuHeadroomPercent: Int = DEFAULT_GPU_HEADROOM_PERCENT,
         accelerationMode: AccelerationMode = AccelerationMode.AUTO,
+        allowRealEsrganVulkan: Boolean = true,
         tta: Boolean = false,
         outputFormat: OutputFormat = OutputFormat.PNG
     ): UpscaleParams {
-        val resolvedNoise = model.availableDenoiseForScale(scale)
+        val resolvedScale = model.sanitizeTargetScale(scale)
+        val resolvedNoise = model.availableDenoiseForScale(resolvedScale)
             .ifEmpty { listOf(model.defaultNoise) }
             .minBy { kotlin.math.abs(it - noise) }
 
@@ -31,12 +33,12 @@ object UpscaleParamsFactory {
             modelDir = resolvedModelDir,
             modelName = model.displayName,
             modelFileBase = model.modelFileBase,
-            modelScales = model.scales,
-            scale = scale,
+            modelScales = model.availableNativePassScales(),
+            scale = resolvedScale,
             noise = resolvedNoise,
             tileSize = sanitizeTileSize(tileSize),
             gpuHeadroomPercent = sanitizeGpuHeadroomPercent(gpuHeadroomPercent),
-            accelerationMode = accelerationMode,
+            accelerationMode = sanitizeAccelerationMode(model, accelerationMode, allowRealEsrganVulkan),
             tta = tta && model.supportsTta,
             outputFormat = outputFormat
         )
@@ -48,5 +50,20 @@ object UpscaleParamsFactory {
 
     fun sanitizeGpuHeadroomPercent(value: Int): Int {
         return if (value in 5..10) value else DEFAULT_GPU_HEADROOM_PERCENT
+    }
+
+    private fun sanitizeAccelerationMode(
+        model: ModelPack,
+        accelerationMode: AccelerationMode,
+        allowRealEsrganVulkan: Boolean
+    ): AccelerationMode {
+        return if (model.engine == SuperResEngine.REAL_ESRGAN &&
+            !allowRealEsrganVulkan &&
+            accelerationMode != AccelerationMode.CPU
+        ) {
+            AccelerationMode.CPU
+        } else {
+            accelerationMode
+        }
     }
 }

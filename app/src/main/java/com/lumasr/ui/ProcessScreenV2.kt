@@ -104,7 +104,9 @@ import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
+import com.lumasr.domain.availableNativePassScales
 import com.lumasr.domain.availableDenoiseForScale
+import com.lumasr.domain.availableTargetScales
 import java.io.File
 import java.io.InputStream
 import kotlin.math.abs
@@ -118,6 +120,8 @@ private enum class ProcessVisualMode {
     Editing,
     Rendering
 }
+
+internal const val ProcessSheetBottomSpacerDp = 600
 
 @Composable
 fun ProcessTabV2(
@@ -287,7 +291,7 @@ private fun ParameterSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(sheetScrollState)
-                .padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 116.dp),
+                .padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = ProcessSheetBottomSpacerDp.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -738,12 +742,13 @@ private data class ModelChoiceGroup(
     val models: List<ModelPack>
 ) {
     val representative: ModelPack = models.first()
-    val scales: List<Int> = models.flatMap { it.scales }.expandedScaleOptions()
+    val scales: List<Int> = models.flatMap { it.availableTargetScales() }.distinct().sorted()
 
     fun containsModel(modelId: String?): Boolean = models.any { it.id == modelId }
 
     fun modelForScale(scale: Int): ModelPack? {
-        models.firstOrNull { scale in it.scales }?.let { return it }
+        models.firstOrNull { scale in it.availableNativePassScales() }?.let { return it }
+        models.firstOrNull { scale in it.availableTargetScales() }?.let { return it }
         return when {
             scale == 16 -> models.firstOrNull { 4 in it.scales }
             scale == 9 -> models.firstOrNull { 3 in it.scales }
@@ -758,19 +763,6 @@ private data class ModelChoiceGroup(
         } else {
             scales.joinToString(" / ") { "${it}x" }
         }
-}
-
-private fun List<Int>.expandedScaleOptions(): List<Int> {
-    val base = filter { it > 0 }.distinct().sorted()
-    val extra = buildList {
-        if (2 in base) {
-            add(4)
-            add(8)
-        }
-        if (3 in base) add(9)
-        if (4 in base) add(16)
-    }
-    return (base + extra).distinct().sorted()
 }
 
 private fun List<ModelPack>.modelChoiceGroups(): List<ModelChoiceGroup> =

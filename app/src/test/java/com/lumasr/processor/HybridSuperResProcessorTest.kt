@@ -91,6 +91,16 @@ class HybridSuperResProcessorTest {
         assertEquals(listOf(1), nativeProcessor.calls.map { it.scale })
     }
 
+    @Test
+    fun nativeScalePlanFallsBackToRunnablePassInsteadOfReturningUnsupportedScale() {
+        val plan = defaultParams().copy(
+            scale = 5,
+            modelScales = listOf(2)
+        ).nativeScalePlan()
+
+        assertEquals(listOf(2), plan)
+    }
+
     private fun defaultParams() = UpscaleParams(
         taskId = "task-1",
         inputPath = "cache/input.png",

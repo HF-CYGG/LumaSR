@@ -2,6 +2,7 @@
 #include "superres_engine.h"
 #include "superres_tile_geometry.h"
 
+#include <android/log.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -14,6 +15,7 @@
 
 #include "net.h"
 #include "gpu.h"
+#include "mat.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -21,6 +23,7 @@
 #include "stb_image_write.h"
 
 namespace {
+constexpr const char* kLogTag = "LumaSRNative";
 constexpr int kEngineWaifu2x = 0;
 constexpr int kEngineRealCugan = 1;
 constexpr int kEngineRealEsrgan = 2;
@@ -56,6 +59,10 @@ NetCacheEntry net_cache;
 bool is_regular_file(const std::string& path) {
     std::error_code error;
     return std::filesystem::is_regular_file(std::filesystem::path(path), error) && !error;
+}
+
+const char* acceleration_name(bool useVulkan) {
+    return useVulkan ? "vulkan" : "cpu";
 }
 
 int clamp_gpu_headroom_percent(int value) {
@@ -106,7 +113,9 @@ std::shared_ptr<ncnn::Net> load_cached_net(
     if (useVulkan) {
         net->opt.use_fp16_packed = true;
         net->opt.use_fp16_storage = true;
-        net->opt.use_fp16_arithmetic = true;
+        // Keep arithmetic in fp32 like the upstream waifu2x/RealCUGAN Vulkan pipelines.
+        // Some desktop/emulator Vulkan stacks advertise fp16 arithmetic but crash on CUnet.
+        net->opt.use_fp16_arithmetic = false;
         net->set_vulkan_device(ncnn::get_default_gpu_index());
     }
     if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
@@ -284,7 +293,7 @@ int waifu2x_prepadding(const SuperResNativeParams& params) {
     if (params.engineType != kEngineWaifu2x) {
         return 0;
     }
-    if (params.modelDir.find("models-cunet") != std::string::npos) {
+    if (is_waifu2x_cunet_dir(params.modelDir.c_str())) {
         if (params.noise < 0) {
             return 18;
         }
@@ -296,9 +305,24 @@ int waifu2x_prepadding(const SuperResNativeParams& params) {
         }
         return 18;
     }
-    if (params.modelDir.find("models-upconv_7_anime_style_art_rgb") != std::string::npos ||
-        params.modelDir.find("models-upconv_7_photo") != std::string::npos) {
+    if (is_waifu2x_upconv_dir(params.modelDir.c_str())) {
         return 7;
+    }
+    return 0;
+}
+
+int realcugan_prepadding(const SuperResNativeParams& params) {
+    if (params.engineType != kEngineRealCugan) {
+        return 0;
+    }
+    if (params.scale == 2) {
+        return 18;
+    }
+    if (params.scale == 3) {
+        return 14;
+    }
+    if (params.scale == 4) {
+        return 19;
     }
     return 0;
 }
@@ -315,6 +339,27 @@ TileInputRegion make_waifu2x_tile_region(
     return ::make_waifu2x_tile_region(
         params.scale,
         waifu2x_prepadding(params),
+        imageW,
+        imageH,
+        tileX,
+        tileY,
+        tileW,
+        tileH
+    );
+}
+
+TileInputRegion make_realcugan_tile_region(
+    const SuperResNativeParams& params,
+    int imageW,
+    int imageH,
+    int tileX,
+    int tileY,
+    int tileW,
+    int tileH
+) {
+    return ::make_realcugan_tile_region(
+        params.scale,
+        realcugan_prepadding(params),
         imageW,
         imageH,
         tileX,
@@ -389,10 +434,20 @@ bool copy_output_tile(
     int dstX,
     int dstY,
     int requestedCopyW,
-    int requestedCopyH
+    int requestedCopyH,
+    bool useOriginOutputWindow
 ) {
-    if (tile.empty() || tile.c < 3) {
+    if (tile.empty() || tile.elempack != 1 || tile.elembits() != 32 ||
+        !tile_output_has_rgb_channels(tile.c, tile.elempack)) {
         return false;
+    }
+
+    if (useOriginOutputWindow) {
+        srcX = resolve_waifu2x_output_crop(tile.w, requestedCopyW);
+        srcY = resolve_waifu2x_output_crop(tile.h, requestedCopyH);
+        if (srcX < 0 || srcY < 0) {
+            return false;
+        }
     }
 
     if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0 ||
@@ -423,10 +478,95 @@ bool copy_output_tile(
     return true;
 }
 
+bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normalized) {
+    if (source.empty()) {
+        normalized = source;
+        return false;
+    }
+
+    ncnn::Option opt;
+    opt.num_threads = 1;
+
+    ncnn::Mat current = source;
+    ncnn::Mat fp32;
+    if (tile_output_needs_fp32_conversion(static_cast<int>(current.elemsize), current.elempack)) {
+        ncnn::cast_float16_to_float32(current, fp32, opt);
+        if (fp32.empty()) {
+            return false;
+        }
+        current = fp32;
+    } else if (current.elembits() != 32) {
+        return false;
+    }
+
+    ncnn::Mat unpacked;
+    if (tile_output_needs_unpacking(current.c, current.elempack)) {
+        ncnn::convert_packing(current, unpacked, 1, opt);
+        if (unpacked.empty()) {
+            return false;
+        }
+        current = unpacked;
+    }
+
+    normalized = current;
+    return !normalized.empty() &&
+        normalized.elempack == 1 &&
+        normalized.elembits() == 32 &&
+        tile_output_has_rgb_channels(normalized.c, normalized.elempack);
+}
+
 bool all_output_pixels_covered(const std::vector<unsigned char>& coverage) {
     return std::all_of(coverage.begin(), coverage.end(), [](unsigned char value) {
         return value != 0;
     });
+}
+
+void log_tile_output_mismatch(
+    const SuperResNativeParams& params,
+    bool useVulkan,
+    const char* reason,
+    int tileX,
+    int tileY,
+    int tileW,
+    int tileH,
+    const TileInputRegion& region,
+    const ncnn::Mat& raw,
+    const ncnn::Mat& normalized
+) {
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        kLogTag,
+        "TileOutputMismatch reason=%s engine=%d scale=%d noise=%d accel=%s tile=%d,%d %dx%d inputRegion=%d,%d %dx%d copySrc=%d,%d dst=%d,%d copy=%dx%d raw=%dx%d c=%d pack=%d bits=%d norm=%dx%d c=%d pack=%d bits=%d",
+        reason,
+        params.engineType,
+        params.scale,
+        params.noise,
+        acceleration_name(useVulkan),
+        tileX,
+        tileY,
+        tileW,
+        tileH,
+        region.inputX,
+        region.inputY,
+        region.inputW,
+        region.inputH,
+        region.cropX,
+        region.cropY,
+        region.dstX,
+        region.dstY,
+        region.copyW,
+        region.copyH,
+        raw.w,
+        raw.h,
+        raw.c,
+        raw.elempack,
+        raw.elembits(),
+        normalized.w,
+        normalized.h,
+        normalized.c,
+        normalized.elempack,
+        normalized.elembits()
+    );
 }
 
 SuperResNativeCode run_ncnn(
@@ -437,6 +577,18 @@ SuperResNativeCode run_ncnn(
     const ModelFiles files = select_model_files(params);
     if (!is_regular_file(files.paramPath) || !is_regular_file(files.binPath)) {
         return SuperResNativeCode::ModelMissing;
+    }
+    if (!useVulkan &&
+        params.engineType == kEngineRealEsrgan &&
+        is_large_realesrgan_model_base(params.modelFileBase.c_str())) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Rejecting CPU load for large Real-ESRGAN model to avoid process OOM model=%s scale=%d",
+            params.modelFileBase.c_str(),
+            params.scale
+        );
+        return SuperResNativeCode::OutOfMemory;
     }
 
     emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
@@ -492,17 +644,19 @@ SuperResNativeCode run_ncnn(
             const int tileH = std::min(tileSize, image.height - tileY);
             const TileInputRegion region = params.engineType == kEngineWaifu2x
                 ? make_waifu2x_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
-                : make_overlapped_tile_region(
-                    image.width,
-                    image.height,
-                    tileX,
-                    tileY,
-                    tileW,
-                    tileH,
-                    tileSize,
-                    tileOverlap,
-                    params.scale
-                );
+                : params.engineType == kEngineRealCugan
+                    ? make_realcugan_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                    : make_overlapped_tile_region(
+                        image.width,
+                        image.height,
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        tileSize,
+                        tileOverlap,
+                        params.scale
+                    );
             ncnn::Mat input = make_input_tile(image, region.inputX, region.inputY, region.inputW, region.inputH);
             ncnn::Mat result;
             const auto tileStart = std::chrono::steady_clock::now();
@@ -512,9 +666,25 @@ SuperResNativeCode run_ncnn(
                 extractor.extract(files.outputBlob, result) != 0) {
                 return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
             }
+            ncnn::Mat copySource;
+            if (!normalize_output_tile_for_copy(result, copySource)) {
+                log_tile_output_mismatch(
+                    params,
+                    useVulkan,
+                    "normalize",
+                    tileX,
+                    tileY,
+                    tileW,
+                    tileH,
+                    region,
+                    result,
+                    copySource
+                );
+                return SuperResNativeCode::TileOutputMismatch;
+            }
 
             if (!copy_output_tile(
-                    result,
+                    copySource,
                     output,
                     coverage,
                     outputW,
@@ -524,8 +694,21 @@ SuperResNativeCode run_ncnn(
                     region.dstX,
                     region.dstY,
                     region.copyW,
-                    region.copyH
+                    region.copyH,
+                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan
                 )) {
+                log_tile_output_mismatch(
+                    params,
+                    useVulkan,
+                    "copy",
+                    tileX,
+                    tileY,
+                    tileW,
+                    tileH,
+                    region,
+                    result,
+                    copySource
+                );
                 return SuperResNativeCode::TileOutputMismatch;
             }
 
@@ -554,6 +737,17 @@ SuperResNativeCode run_ncnn(
 
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
     if (!all_output_pixels_covered(coverage)) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "TileOutputMismatch reason=coverage engine=%d scale=%d noise=%d accel=%s output=%dx%d",
+            params.engineType,
+            params.scale,
+            params.noise,
+            acceleration_name(useVulkan),
+            outputW,
+            outputH
+        );
         return SuperResNativeCode::TileOutputMismatch;
     }
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.96f, "Saving output");
@@ -597,10 +791,36 @@ SuperResNativeCode process_superres(
     emit(onProgress, SuperResNativeStage::Preparing, 0, 0, 0.0f, "Preparing native inference");
 
     if (params.accelerationMode == kAccelerationVulkan || params.accelerationMode == kAccelerationAuto) {
+        if (should_force_cpu_before_vulkan_model_load(params.engineType)) {
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                kLogTag,
+                "Skipping Vulkan model load to avoid native GPU loader crash engine=%d scale=%d noise=%d mode=%d",
+                params.engineType,
+                params.scale,
+                params.noise,
+                params.accelerationMode
+            );
+            emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Using CPU for this model");
+            return run_ncnn(params, onProgress, false);
+        }
         SuperResNativeCode code = run_ncnn(params, onProgress, true);
-        if (code != SuperResNativeCode::VulkanFailed || params.accelerationMode == kAccelerationVulkan) {
+        const bool canRetryCpu = should_retry_cpu_after_gpu_code(
+            params.accelerationMode,
+            static_cast<int>(code)
+        );
+        if (!canRetryCpu || params.accelerationMode == kAccelerationVulkan) {
             return code;
         }
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "AUTO retrying CPU after GPU code=%d engine=%d scale=%d noise=%d",
+            static_cast<int>(code),
+            params.engineType,
+            params.scale,
+            params.noise
+        );
         emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "GPU failed; retrying on CPU");
     }
 

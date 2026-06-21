@@ -93,6 +93,62 @@ class UpscaleParamsFactoryTest {
         assertEquals(0, params.noise)
     }
 
+    @Test
+    fun fallsBackUnsupportedScaleToRunnableDefault() {
+        val params = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            scale = 5,
+            noise = 0
+        )
+
+        assertEquals(4, params.scale)
+    }
+
+    @Test
+    fun routesRealEsrganVulkanRequestsToCpuWhenRuntimeDisallowsIt() {
+        val autoParams = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            accelerationMode = AccelerationMode.AUTO,
+            allowRealEsrganVulkan = false
+        )
+        val vulkanParams = UpscaleParamsFactory.create(
+            taskId = "task-2",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            accelerationMode = AccelerationMode.VULKAN,
+            allowRealEsrganVulkan = false
+        )
+
+        assertEquals(AccelerationMode.CPU, autoParams.accelerationMode)
+        assertEquals(AccelerationMode.CPU, vulkanParams.accelerationMode)
+    }
+
+    @Test
+    fun removesUnavailableWaifuScaleOnlyOneXNoise() {
+        val params = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = waifu2xCunetModel(),
+            resolvedModelDir = "cache/models/waifu2x-cunet",
+            scale = 1,
+            noise = -1
+        )
+
+        assertEquals(1, params.scale)
+        assertEquals(0, params.noise)
+    }
+
     private fun realEsrganModel() = ModelPack(
             id = "realesrgan-general-x4",
             displayName = "x4plus",
@@ -113,4 +169,35 @@ class UpscaleParamsFactoryTest {
             speedLevel = "slow",
             qualityLevel = "high"
         )
+
+    private fun waifu2xCunetModel() = ModelPack(
+        id = "waifu2x-cunet",
+        displayName = "CUnet",
+        engine = SuperResEngine.WAIFU2X,
+        modelDir = "models-cunet",
+        assetPath = "models/waifu2x/models-cunet",
+        isBuiltIn = true,
+        requiredFiles = listOf(
+            "noise0_model.param",
+            "noise0_model.bin",
+            "noise1_model.param",
+            "noise1_model.bin",
+            "noise0_scale2.0x_model.param",
+            "noise0_scale2.0x_model.bin",
+            "noise1_scale2.0x_model.param",
+            "noise1_scale2.0x_model.bin",
+            "scale2.0x_model.param",
+            "scale2.0x_model.bin"
+        ),
+        assetBytes = null,
+        description = "Waifu2x CUnet model.",
+        scenes = listOf("anime"),
+        scales = listOf(1, 2),
+        denoise = listOf(-1, 0, 1),
+        supportsTta = true,
+        defaultScale = 2,
+        defaultNoise = 1,
+        speedLevel = "slow",
+        qualityLevel = "high"
+    )
 }

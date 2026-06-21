@@ -46,6 +46,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.SuperResEngine
+import com.lumasr.domain.availableTargetScales
 
 internal const val SettingsFooterBottomSpacerDp = 128
 
@@ -117,7 +118,7 @@ fun SettingsScreenV2(
                 SettingsInfoRowV2(
                     icon = if (model.engine == SuperResEngine.WAIFU2X) Icons.Rounded.PhotoLibrary else Icons.Rounded.Security,
                     title = model.settingsModelTitle(),
-                    subtitle = if (model.isBuiltIn) "已内置 · ${model.scales.joinToString("x / ", postfix = "x")}" else "未安装"
+                    subtitle = if (model.isBuiltIn) "已内置 · ${model.availableTargetScales().joinToString("x / ", postfix = "x")}" else "未安装"
                 )
             }
 

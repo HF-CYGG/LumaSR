@@ -55,7 +55,8 @@ class LumaUiStateSelectionTest {
                 estimatedRemainingMs = null
             ),
             resultMessage = "busy",
-            savedOutputUri = "content://saved"
+            savedOutputUri = "content://saved",
+            savedOutputUris = listOf("content://saved")
         )
 
         val cleared = state.clearImageSelection()
@@ -67,6 +68,7 @@ class LumaUiStateSelectionTest {
         assertNull(cleared.progress)
         assertNull(cleared.resultMessage)
         assertNull(cleared.savedOutputUri)
+        assertTrue(cleared.savedOutputUris.isEmpty())
         assertEquals(LumaScreen.EDITING, cleared.screen)
         assertEquals(LumaTab.PROCESS, cleared.selectedTab)
     }

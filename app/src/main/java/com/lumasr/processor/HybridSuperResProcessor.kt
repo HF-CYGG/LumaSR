@@ -5,6 +5,7 @@ import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleResult
 import com.lumasr.domain.UpscaleStage
+import com.lumasr.domain.nativeScalePlanFor
 import java.io.File
 
 class HybridSuperResProcessor(
@@ -91,21 +92,7 @@ class HybridSuperResProcessor(
 }
 
 internal fun UpscaleParams.nativeScalePlan(): List<Int> {
-    if (scale <= 1) return listOf(scale)
-    val singlePassScales = modelScales
-        .filter { it > 1 }
-        .distinct()
-        .sortedDescending()
-    if (singlePassScales.isEmpty() || scale in singlePassScales) return listOf(scale)
-
-    var remaining = scale
-    val plan = mutableListOf<Int>()
-    while (remaining > 1) {
-        val factor = singlePassScales.firstOrNull { remaining % it == 0 } ?: return listOf(scale)
-        plan += factor
-        remaining /= factor
-    }
-    return plan
+    return nativeScalePlanFor(scale, modelScales)
 }
 
 private fun UpscaleProgress.asChainedProgress(passIndex: Int, passCount: Int): UpscaleProgress {
