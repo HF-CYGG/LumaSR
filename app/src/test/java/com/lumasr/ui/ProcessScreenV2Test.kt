@@ -121,6 +121,11 @@ class ProcessScreenV2Test {
     }
 
     @Test
+    fun hidesExportModeSelectorFromProcessParameters() {
+        assertEquals(emptyList<String>(), userSelectableExportModeLabels())
+    }
+
+    @Test
     fun darkSegmentedSelectorSelectionHasVisibleContrast() {
         val colors = segmentedSelectorVisualSpec(darkTheme = true)
 

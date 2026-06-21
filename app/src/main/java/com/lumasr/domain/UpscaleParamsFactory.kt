@@ -20,7 +20,13 @@ object UpscaleParamsFactory {
         accelerationMode: AccelerationMode = AccelerationMode.AUTO,
         allowRealEsrganVulkan: Boolean = true,
         tta: Boolean = false,
-        outputFormat: OutputFormat = OutputFormat.PNG
+        outputFormat: OutputFormat = OutputFormat.PNG,
+        exportMode: ExportMode = ExportMode.AUTO,
+        outputMode: NativeOutputMode = NativeOutputMode.PNG_IMAGE,
+        outputCropLeft: Int = 0,
+        outputCropTop: Int = 0,
+        outputCropWidth: Int = 0,
+        outputCropHeight: Int = 0
     ): UpscaleParams {
         val resolvedScale = model.sanitizeTargetScale(scale)
         val resolvedNoise = model.sanitizeDenoiseForScale(resolvedScale, noise)
@@ -40,7 +46,13 @@ object UpscaleParamsFactory {
             gpuHeadroomPercent = sanitizeGpuHeadroomPercent(gpuHeadroomPercent),
             accelerationMode = sanitizeAccelerationMode(model, accelerationMode, allowRealEsrganVulkan),
             tta = tta && model.supportsTta,
-            outputFormat = outputFormat
+            outputFormat = outputFormat,
+            exportMode = exportMode,
+            outputMode = outputMode,
+            outputCropLeft = outputCropLeft,
+            outputCropTop = outputCropTop,
+            outputCropWidth = outputCropWidth,
+            outputCropHeight = outputCropHeight
         )
     }
 
@@ -59,7 +71,13 @@ object UpscaleParamsFactory {
         accelerationMode: AccelerationMode = AccelerationMode.AUTO,
         allowRealEsrganVulkan: Boolean = true,
         tta: Boolean = false,
-        outputFormat: OutputFormat = OutputFormat.PNG
+        outputFormat: OutputFormat = OutputFormat.PNG,
+        exportMode: ExportMode = ExportMode.AUTO,
+        outputMode: NativeOutputMode = NativeOutputMode.PNG_IMAGE,
+        outputCropLeft: Int = 0,
+        outputCropTop: Int = 0,
+        outputCropWidth: Int = 0,
+        outputCropHeight: Int = 0
     ): UpscalePipelinePlan {
         val resolvedScale = model.sanitizeTargetScale(scale)
         if (model.engine != SuperResEngine.REAL_ESRGAN || noise <= 0 || denoiseModel == null || resolvedDenoiseModelDir.isNullOrBlank()) {
@@ -76,7 +94,13 @@ object UpscaleParamsFactory {
                 accelerationMode = accelerationMode,
                 allowRealEsrganVulkan = allowRealEsrganVulkan,
                 tta = tta,
-                outputFormat = outputFormat
+                outputFormat = outputFormat,
+                exportMode = exportMode,
+                outputMode = outputMode,
+                outputCropLeft = outputCropLeft,
+                outputCropTop = outputCropTop,
+                outputCropWidth = outputCropWidth,
+                outputCropHeight = outputCropHeight
             ).copy(
                 pipelineLabel = pipelineLabel(model.displayName, resolvedScale, if (model.engine == SuperResEngine.REAL_ESRGAN) 0 else noise)
             )
@@ -99,7 +123,8 @@ object UpscaleParamsFactory {
             accelerationMode = accelerationMode,
             allowRealEsrganVulkan = true,
             tta = false,
-            outputFormat = OutputFormat.PNG
+            outputFormat = OutputFormat.PNG,
+            outputMode = NativeOutputMode.PNG_IMAGE
         )
         val finalPass = create(
             taskId = taskId,
@@ -114,7 +139,13 @@ object UpscaleParamsFactory {
             accelerationMode = accelerationMode,
             allowRealEsrganVulkan = allowRealEsrganVulkan,
             tta = tta,
-            outputFormat = outputFormat
+            outputFormat = outputFormat,
+            exportMode = exportMode,
+            outputMode = outputMode,
+            outputCropLeft = outputCropLeft,
+            outputCropTop = outputCropTop,
+            outputCropWidth = outputCropWidth,
+            outputCropHeight = outputCropHeight
         ).copy(
             pipelineLabel = pipelineLabel(model.displayName, resolvedScale, denoiseNoise)
         )

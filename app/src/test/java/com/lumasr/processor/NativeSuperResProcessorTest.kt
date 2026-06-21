@@ -2,6 +2,7 @@ package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.NativePerformanceSnapshot
+import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
@@ -122,7 +123,10 @@ class NativeSuperResProcessorTest {
             totalMs = 231,
             cacheHit = true,
             accelerationMode = AccelerationMode.VULKAN,
-            tileSize = 256
+            tileSize = 256,
+            cacheSize = 3,
+            retryCount = 1,
+            regionIndex = 7
         )
         val bridge = FakeNativeBridge(
             code = NativeProcessCode.OK,
@@ -151,6 +155,9 @@ class NativeSuperResProcessorTest {
 
         assertEquals(listOf(snapshot), progressSnapshots)
         assertEquals(listOf(snapshot), logged)
+        assertEquals(3, progressSnapshots.single().cacheSize)
+        assertEquals(1, progressSnapshots.single().retryCount)
+        assertEquals(7, progressSnapshots.single().regionIndex)
     }
 
     @Test
@@ -230,6 +237,61 @@ class NativeSuperResProcessorTest {
         assertEquals(1, bridge.clearCacheCount)
     }
 
+    @Test
+    fun forwardsRawCroppedOutputParamsToNativeBridge() = runBlocking {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        processor.process(
+            defaultParams().copy(
+                outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
+                outputCropLeft = 12,
+                outputCropTop = 18,
+                outputCropWidth = 256,
+                outputCropHeight = 128,
+                regionIndex = 3,
+                retryCount = 1
+            )
+        ) {}
+
+        assertEquals(NativeOutputMode.RAW_CROPPED_RGB_TILE.ordinal, bridge.lastRequest?.outputMode)
+        assertEquals(12, bridge.lastRequest?.outputCropLeft)
+        assertEquals(18, bridge.lastRequest?.outputCropTop)
+        assertEquals(256, bridge.lastRequest?.outputCropWidth)
+        assertEquals(128, bridge.lastRequest?.outputCropHeight)
+        assertEquals(3, bridge.lastRequest?.regionIndex)
+        assertEquals(1, bridge.lastRequest?.retryCount)
+    }
+
+    @Test
+    fun mergeRawTilesToPngForwardsToBridge() {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+        val tiles = listOf(
+            NativeRawTile("tile-0.rgb", x = 0, y = 0, width = 16, height = 8),
+            NativeRawTile("tile-1.rgb", x = 16, y = 0, width = 16, height = 8)
+        )
+
+        val code = processor.mergeRawTilesToPng(
+            outputPath = "cache/output.png",
+            outputWidth = 32,
+            outputHeight = 8,
+            tiles = tiles
+        )
+
+        assertEquals(NativeProcessCode.OK, code)
+        assertEquals("cache/output.png", bridge.lastMergeOutputPath)
+        assertEquals(32, bridge.lastMergeOutputWidth)
+        assertEquals(8, bridge.lastMergeOutputHeight)
+        assertEquals(tiles, bridge.lastMergeTiles)
+    }
+
     private fun defaultParams() = UpscaleParams(
         taskId = "task-1",
         inputPath = "cache/input.png",
@@ -260,6 +322,14 @@ private class FakeNativeBridge(
     var clearCacheCount = 0
         private set
     val cancelledTaskIds = mutableListOf<String>()
+    var lastMergeOutputPath: String? = null
+        private set
+    var lastMergeOutputWidth: Int? = null
+        private set
+    var lastMergeOutputHeight: Int? = null
+        private set
+    var lastMergeTiles: List<NativeRawTile>? = null
+        private set
 
     override fun process(
         request: NativeProcessRequest,
@@ -278,5 +348,18 @@ private class FakeNativeBridge(
 
     override fun clearCache() {
         clearCacheCount += 1
+    }
+
+    override fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode {
+        lastMergeOutputPath = outputPath
+        lastMergeOutputWidth = outputWidth
+        lastMergeOutputHeight = outputHeight
+        lastMergeTiles = tiles
+        return code
     }
 }

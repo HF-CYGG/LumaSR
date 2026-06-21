@@ -5,6 +5,8 @@
 #include <android/log.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -16,6 +18,7 @@
 #include "net.h"
 #include "gpu.h"
 #include "mat.h"
+#include "zlib.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -29,6 +32,8 @@ constexpr int kEngineRealCugan = 1;
 constexpr int kEngineRealEsrgan = 2;
 constexpr int kAccelerationAuto = 0;
 constexpr int kAccelerationVulkan = 1;
+constexpr int kNativeOutputPng = 0;
+constexpr int kNativeOutputRawCroppedRgbTile = 1;
 
 std::mutex cancel_mutex;
 std::mutex gpu_mutex;
@@ -60,6 +65,8 @@ struct LoadedNet {
 };
 
 NetCacheEntry net_cache;
+std::vector<NetCacheEntry> net_cache_entries;
+constexpr size_t kNetCacheCapacity = 3;
 
 long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -112,8 +119,13 @@ LoadedNet load_cached_net(
     const std::string key = make_net_cache_key(files, useVulkan, threadCount);
     {
         std::lock_guard<std::mutex> lock(net_cache_mutex);
-        if (net_cache.key == key && net_cache.net) {
-            return LoadedNet{net_cache.net, true};
+        for (auto it = net_cache_entries.begin(); it != net_cache_entries.end(); ++it) {
+            if (it->key == key && it->net) {
+                auto cached = *it;
+                net_cache_entries.erase(it);
+                net_cache_entries.push_back(cached);
+                return LoadedNet{cached.net, true};
+            }
         }
     }
 
@@ -134,13 +146,30 @@ LoadedNet load_cached_net(
     }
 
     std::lock_guard<std::mutex> lock(net_cache_mutex);
-    net_cache = NetCacheEntry{key, net};
-    return LoadedNet{net_cache.net, false};
+    net_cache_entries.erase(
+        std::remove_if(
+            net_cache_entries.begin(),
+            net_cache_entries.end(),
+            [&key](const NetCacheEntry& entry) { return entry.key == key; }
+        ),
+        net_cache_entries.end()
+    );
+    if (net_cache_entries.size() >= kNetCacheCapacity) {
+        net_cache_entries.erase(net_cache_entries.begin());
+    }
+    net_cache_entries.push_back(NetCacheEntry{key, net});
+    return LoadedNet{net_cache_entries.back().net, false};
 }
 
 void clear_cached_net() {
     std::lock_guard<std::mutex> lock(net_cache_mutex);
     net_cache = NetCacheEntry{};
+    net_cache_entries.clear();
+}
+
+int cached_net_count() {
+    std::lock_guard<std::mutex> lock(net_cache_mutex);
+    return static_cast<int>(net_cache_entries.size());
 }
 
 void sleep_for_gpu_headroom(
@@ -490,6 +519,41 @@ bool copy_output_tile(
     return true;
 }
 
+bool write_cropped_raw_rgb_tile(
+    const std::string& outputPath,
+    const std::vector<unsigned char>& output,
+    int outputW,
+    int outputH,
+    int cropLeft,
+    int cropTop,
+    int cropWidth,
+    int cropHeight
+) {
+    if (outputPath.empty() || outputW <= 0 || outputH <= 0 ||
+        cropLeft < 0 || cropTop < 0 || cropWidth <= 0 || cropHeight <= 0 ||
+        cropLeft + cropWidth > outputW ||
+        cropTop + cropHeight > outputH) {
+        return false;
+    }
+    const size_t expectedBytes = static_cast<size_t>(outputW) * outputH * 3;
+    if (output.size() < expectedBytes) {
+        return false;
+    }
+
+    FILE* file = std::fopen(outputPath.c_str(), "wb");
+    if (file == nullptr) {
+        return false;
+    }
+    const size_t rowBytes = static_cast<size_t>(cropWidth) * 3;
+    bool ok = true;
+    for (int y = 0; y < cropHeight && ok; ++y) {
+        const size_t offset = (static_cast<size_t>(cropTop + y) * outputW + cropLeft) * 3;
+        ok = std::fwrite(output.data() + offset, 1, rowBytes, file) == rowBytes;
+    }
+    ok = std::fclose(file) == 0 && ok;
+    return ok;
+}
+
 bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normalized, long long& tileCopyMs) {
     const auto normalizeStart = std::chrono::steady_clock::now();
     if (source.empty()) {
@@ -646,6 +710,9 @@ SuperResNativeCode run_ncnn(
     LoadedNet loadedNet = load_cached_net(files, useVulkan, threadCount);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
+    performance.cacheSize = cached_net_count();
+    performance.retryCount = params.retryCount;
+    performance.regionIndex = params.regionIndex;
     std::shared_ptr<ncnn::Net> net = loadedNet.net;
     if (!net) {
         return SuperResNativeCode::ModelMissing;
@@ -801,10 +868,25 @@ SuperResNativeCode run_ncnn(
         return SuperResNativeCode::TileOutputMismatch;
     }
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.96f, "Saving output");
-    // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
     const auto saveStart = std::chrono::steady_clock::now();
-    if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {
-        return SuperResNativeCode::OutputFailed;
+    if (params.outputMode == kNativeOutputRawCroppedRgbTile) {
+        if (!write_cropped_raw_rgb_tile(
+                params.outputPath,
+                output,
+                outputW,
+                outputH,
+                params.outputCropLeft,
+                params.outputCropTop,
+                params.outputCropWidth,
+                params.outputCropHeight
+            )) {
+            return SuperResNativeCode::OutputFailed;
+        }
+    } else {
+        // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
+        if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {
+            return SuperResNativeCode::OutputFailed;
+        }
     }
     performance.saveMs = elapsed_ms(saveStart);
     performance.totalMs = elapsed_ms(totalStart);
@@ -812,11 +894,14 @@ SuperResNativeCode run_ncnn(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s accel=%s cacheHit=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld totalMs=%lld",
+        "Performance task=%s model=%s accel=%s cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld totalMs=%lld",
         params.taskId.c_str(),
         params.modelFileBase.c_str(),
         acceleration_name(useVulkan),
         performance.cacheHit ? 1 : 0,
+        performance.cacheSize,
+        performance.retryCount,
+        performance.regionIndex,
         performance.tileSize,
         performance.decodeMs,
         performance.modelLoadMs,
@@ -829,6 +914,74 @@ SuperResNativeCode run_ncnn(
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);
 
     return is_cancelled(params.taskId) ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+}
+
+bool write_all(FILE* file, const void* data, size_t size) {
+    return size == 0 || std::fwrite(data, 1, size, file) == size;
+}
+
+void put_be32(unsigned char* output, uint32_t value) {
+    output[0] = static_cast<unsigned char>((value >> 24) & 0xff);
+    output[1] = static_cast<unsigned char>((value >> 16) & 0xff);
+    output[2] = static_cast<unsigned char>((value >> 8) & 0xff);
+    output[3] = static_cast<unsigned char>(value & 0xff);
+}
+
+bool write_png_chunk(FILE* file, const char type[4], const unsigned char* data, size_t size) {
+    if (size > 0xffffffffu) {
+        return false;
+    }
+    unsigned char length[4];
+    put_be32(length, static_cast<uint32_t>(size));
+    if (!write_all(file, length, sizeof(length)) || !write_all(file, type, 4) || !write_all(file, data, size)) {
+        return false;
+    }
+    uLong crc = crc32(0L, Z_NULL, 0);
+    crc = crc32(crc, reinterpret_cast<const Bytef*>(type), 4);
+    if (size > 0) {
+        crc = crc32(crc, reinterpret_cast<const Bytef*>(data), static_cast<uInt>(size));
+    }
+    unsigned char crcBytes[4];
+    put_be32(crcBytes, static_cast<uint32_t>(crc));
+    return write_all(file, crcBytes, sizeof(crcBytes));
+}
+
+bool write_png_signature_and_header(FILE* file, int width, int height) {
+    static const unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    unsigned char ihdr[13] = {};
+    put_be32(ihdr, static_cast<uint32_t>(width));
+    put_be32(ihdr + 4, static_cast<uint32_t>(height));
+    ihdr[8] = 8;
+    ihdr[9] = 2;
+    return write_all(file, signature, sizeof(signature)) && write_png_chunk(file, "IHDR", ihdr, sizeof(ihdr));
+}
+
+bool deflate_png_bytes(
+    FILE* file,
+    z_stream& stream,
+    const unsigned char* data,
+    size_t size,
+    int flush,
+    std::vector<unsigned char>& compressed,
+    bool& finished
+) {
+    stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data));
+    stream.avail_in = static_cast<uInt>(size);
+    do {
+        stream.next_out = compressed.data();
+        stream.avail_out = static_cast<uInt>(compressed.size());
+        const int result = deflate(&stream, flush);
+        if (result == Z_STREAM_END) {
+            finished = true;
+        } else if (result != Z_OK) {
+            return false;
+        }
+        const size_t produced = compressed.size() - stream.avail_out;
+        if (produced > 0 && !write_png_chunk(file, "IDAT", compressed.data(), produced)) {
+            return false;
+        }
+    } while (stream.avail_out == 0);
+    return stream.avail_in == 0;
 }
 }
 
@@ -843,6 +996,13 @@ SuperResNativeCode process_superres(
 
     if (params.taskId.empty() || params.inputPath.empty() || params.outputPath.empty() ||
         params.modelDir.empty() || params.scale <= 0 || params.tileSize <= 0) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    if (params.outputMode != kNativeOutputPng && params.outputMode != kNativeOutputRawCroppedRgbTile) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    if (params.outputMode == kNativeOutputRawCroppedRgbTile &&
+        (params.outputCropWidth <= 0 || params.outputCropHeight <= 0)) {
         return SuperResNativeCode::InvalidParams;
     }
 
@@ -907,4 +1067,129 @@ void cancel_superres(const std::string& taskId) {
 void clear_superres_cache() {
     std::lock_guard<std::mutex> gpuLock(gpu_mutex);
     clear_cached_net();
+}
+
+SuperResNativeCode merge_raw_tiles_to_png(
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    const std::vector<SuperResRawTile>& tiles
+) {
+    if (outputPath.empty() || outputWidth <= 0 || outputHeight <= 0 || tiles.empty()) {
+        return SuperResNativeCode::InvalidParams;
+    }
+
+    struct OpenTile {
+        SuperResRawTile spec;
+        FILE* file = nullptr;
+    };
+
+    std::vector<OpenTile> openTiles;
+    openTiles.reserve(tiles.size());
+    for (const SuperResRawTile& tile : tiles) {
+        if (tile.path.empty() || tile.x < 0 || tile.y < 0 || tile.width <= 0 || tile.height <= 0 ||
+            tile.x + tile.width > outputWidth || tile.y + tile.height > outputHeight) {
+            for (OpenTile& openTile : openTiles) {
+                std::fclose(openTile.file);
+            }
+            return SuperResNativeCode::InvalidParams;
+        }
+
+        std::error_code error;
+        const uintmax_t actualSize = std::filesystem::file_size(tile.path, error);
+        const uintmax_t expectedSize = static_cast<uintmax_t>(tile.width) * tile.height * 3;
+        if (error || actualSize != expectedSize) {
+            for (OpenTile& openTile : openTiles) {
+                std::fclose(openTile.file);
+            }
+            return SuperResNativeCode::OutputFailed;
+        }
+
+        FILE* file = std::fopen(tile.path.c_str(), "rb");
+        if (file == nullptr) {
+            for (OpenTile& openTile : openTiles) {
+                std::fclose(openTile.file);
+            }
+            return SuperResNativeCode::OutputFailed;
+        }
+        openTiles.push_back(OpenTile{tile, file});
+    }
+
+    FILE* output = std::fopen(outputPath.c_str(), "wb");
+    if (output == nullptr) {
+        for (OpenTile& openTile : openTiles) {
+            std::fclose(openTile.file);
+        }
+        return SuperResNativeCode::OutputFailed;
+    }
+
+    z_stream stream{};
+    if (deflateInit(&stream, Z_BEST_SPEED) != Z_OK) {
+        std::fclose(output);
+        for (OpenTile& openTile : openTiles) {
+            std::fclose(openTile.file);
+        }
+        return SuperResNativeCode::OutputFailed;
+    }
+
+    bool ok = write_png_signature_and_header(output, outputWidth, outputHeight);
+    bool finished = false;
+    std::vector<unsigned char> row(static_cast<size_t>(outputWidth) * 3 + 1, 0);
+    std::vector<unsigned char> coverage(static_cast<size_t>(outputWidth), 0);
+    std::vector<unsigned char> tileRow;
+    std::vector<unsigned char> compressed(64 * 1024);
+
+    for (int y = 0; ok && y < outputHeight; ++y) {
+        std::fill(row.begin() + 1, row.end(), 0);
+        std::fill(coverage.begin(), coverage.end(), 0);
+        for (OpenTile& tile : openTiles) {
+            if (y < tile.spec.y || y >= tile.spec.y + tile.spec.height) {
+                continue;
+            }
+            const int localY = y - tile.spec.y;
+            const size_t rowBytes = static_cast<size_t>(tile.spec.width) * 3;
+            tileRow.resize(rowBytes);
+            const long offset = static_cast<long>(static_cast<long long>(localY) * tile.spec.width * 3);
+            if (std::fseek(tile.file, offset, SEEK_SET) != 0 ||
+                std::fread(tileRow.data(), 1, rowBytes, tile.file) != rowBytes) {
+                ok = false;
+                break;
+            }
+            for (int x = 0; x < tile.spec.width; ++x) {
+                const int outputX = tile.spec.x + x;
+                if (coverage[outputX] != 0) {
+                    ok = false;
+                    break;
+                }
+                coverage[outputX] = 1;
+            }
+            if (!ok) {
+                break;
+            }
+            std::copy(tileRow.begin(), tileRow.end(), row.begin() + 1 + static_cast<size_t>(tile.spec.x) * 3);
+        }
+        if (!ok || std::any_of(coverage.begin(), coverage.end(), [](unsigned char value) { return value == 0; })) {
+            ok = false;
+            break;
+        }
+        row[0] = 0;
+        ok = deflate_png_bytes(output, stream, row.data(), row.size(), Z_NO_FLUSH, compressed, finished);
+    }
+
+    while (ok && !finished) {
+        ok = deflate_png_bytes(output, stream, nullptr, 0, Z_FINISH, compressed, finished);
+    }
+    ok = deflateEnd(&stream) == Z_OK && ok;
+    ok = ok && write_png_chunk(output, "IEND", nullptr, 0);
+    ok = std::fclose(output) == 0 && ok;
+    for (OpenTile& openTile : openTiles) {
+        std::fclose(openTile.file);
+    }
+
+    if (!ok) {
+        std::error_code error;
+        std::filesystem::remove(outputPath, error);
+        return SuperResNativeCode::OutputFailed;
+    }
+    return SuperResNativeCode::Ok;
 }

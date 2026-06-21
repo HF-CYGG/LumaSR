@@ -2,6 +2,8 @@ package com.lumasr.domain
 
 object ResourceBudgetPolicy {
     const val MAX_OUTPUT_PIXELS: Long = 64_000_000L
+    const val HIGH_RISK_MAX_OUTPUT_PIXELS: Long = 128_000_000L
+    const val EXTREME_MAX_OUTPUT_PIXELS: Long = 256_000_000L
     const val HIGH_RISK_OUTPUT_PIXELS: Long = 24_000_000L
     private const val TIGHT_MEMORY_BYTES: Long = 768_000_000L
 
@@ -14,6 +16,7 @@ object ResourceBudgetPolicy {
         gpuHeadroomPercent: Int,
         accelerationMode: AccelerationMode,
         tta: Boolean,
+        exportMode: ExportMode = ExportMode.AUTO,
         resourceProfile: ProcessingResourceProfile = ProcessingResourceProfile(
             imageWidth = imageWidth,
             imageHeight = imageHeight
@@ -22,7 +25,13 @@ object ResourceBudgetPolicy {
         val resolvedScale = model.sanitizeTargetScale(scale)
         val outputPixels = resourceProfile.outputPixelsFor(resolvedScale)
             ?: estimateOutputPixels(imageWidth, imageHeight, resolvedScale)
-        if (outputPixels != null && outputPixels > MAX_OUTPUT_PIXELS) {
+        val resolvedExportMode = resolveExportMode(exportMode, outputPixels)
+        val maxPixels = if (resolvedExportMode == ExportMode.EXTREME_SINGLE_PNG) {
+            EXTREME_MAX_OUTPUT_PIXELS
+        } else {
+            MAX_OUTPUT_PIXELS
+        }
+        if (outputPixels != null && outputPixels > maxPixels) {
             return ResourceBudgetDecision(
                 allowed = false,
                 scale = resolvedScale,
@@ -30,14 +39,23 @@ object ResourceBudgetPolicy {
                 gpuHeadroomPercent = UpscaleParamsFactory.sanitizeGpuHeadroomPercent(gpuHeadroomPercent),
                 accelerationMode = accelerationMode,
                 tta = false,
-                message = "输出尺寸过大，请降低倍率或换用更小图片"
+                exportMode = resolvedExportMode,
+                message = if (resolvedExportMode == ExportMode.EXTREME_SINGLE_PNG) {
+                    "输出尺寸超过极限模式 256MP，请降低倍率或换用更小图片"
+                } else {
+                    "输出尺寸过大，请降低倍率或换用更小图片"
+                }
             )
         }
 
         val realEsrganTileLimit = model.realEsrganTileLimit(outputPixels, resourceProfile)
-        val highRisk = model.engine == SuperResEngine.REAL_ESRGAN ||
+        val extreme = resolvedExportMode == ExportMode.EXTREME_SINGLE_PNG
+        val highRisk = extreme ||
+            model.engine == SuperResEngine.REAL_ESRGAN ||
             (outputPixels != null && outputPixels > HIGH_RISK_OUTPUT_PIXELS)
         val maxTileSize = when {
+            extreme && model.engine == SuperResEngine.REAL_ESRGAN -> 128
+            extreme -> 256
             realEsrganTileLimit != null -> realEsrganTileLimit
             highRisk -> 256
             else -> UpscaleParamsFactory.supportedTileSizes.maxOrNull() ?: UpscaleParamsFactory.DEFAULT_TILE_SIZE
@@ -53,7 +71,8 @@ object ResourceBudgetPolicy {
         val changed = resolvedScale != scale ||
             resolvedTileSize != sanitizedTileSize ||
             resolvedHeadroom != UpscaleParamsFactory.sanitizeGpuHeadroomPercent(gpuHeadroomPercent) ||
-            resolvedTta != tta
+            resolvedTta != tta ||
+            resolvedExportMode != exportMode
 
         return ResourceBudgetDecision(
             allowed = true,
@@ -62,8 +81,21 @@ object ResourceBudgetPolicy {
             gpuHeadroomPercent = resolvedHeadroom,
             accelerationMode = accelerationMode,
             tta = resolvedTta,
-            message = if (changed) "已自动降低资源占用以避免卡顿" else null
+            exportMode = resolvedExportMode,
+            message = if (changed) {
+                if (extreme) "已切换为极限导出模式，将逐块处理并流式合并" else "已自动降低资源占用以避免卡顿"
+            } else {
+                null
+            }
         )
+    }
+
+    private fun resolveExportMode(exportMode: ExportMode, outputPixels: Long?): ExportMode {
+        return when {
+            exportMode != ExportMode.AUTO -> exportMode
+            outputPixels != null && outputPixels > MAX_OUTPUT_PIXELS -> ExportMode.EXTREME_SINGLE_PNG
+            else -> ExportMode.SAFE_IMAGE
+        }
     }
 
     private fun estimateOutputPixels(width: Int?, height: Int?, scale: Int): Long? {
@@ -128,5 +160,6 @@ data class ResourceBudgetDecision(
     val gpuHeadroomPercent: Int,
     val accelerationMode: AccelerationMode,
     val tta: Boolean,
+    val exportMode: ExportMode = ExportMode.SAFE_IMAGE,
     val message: String?
 )

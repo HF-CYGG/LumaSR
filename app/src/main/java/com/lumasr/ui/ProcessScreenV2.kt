@@ -104,6 +104,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.ExportMode
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
@@ -610,6 +611,8 @@ internal fun nearestNoiseLevel(options: List<Int>, raw: Float): Int =
     options.sorted().ifEmpty { listOf(0) }.minBy { abs(it - raw) }
 
 internal fun scaleOptionLabel(scale: Int): String = "${scale}x"
+
+internal fun userSelectableExportModeLabels(): List<String> = emptyList()
 
 internal fun denoiseControlType(options: List<Int>): DenoiseControlType {
     val safeOptions = options.distinct().sorted()
@@ -1464,7 +1467,8 @@ fun CompareScreenV2(
                     modelName = it.modelName,
                     scale = it.scale,
                     noise = it.noise,
-                    outputFormat = it.outputFormat
+                    outputFormat = it.outputFormat,
+                    isExtremeExport = it.exportMode == ExportMode.EXTREME_SINGLE_PNG
                 )
             )
         }.orEmpty()
@@ -1773,16 +1777,25 @@ private fun ResultPreviewPage(
 }
 
 @Composable
-private fun CompareImageSurface(inputPath: String?, outputPath: String?, modifier: Modifier) {
+private fun CompareImageSurface(
+    inputPath: String?,
+    outputPath: String?,
+    modifier: Modifier,
+    skipOutputDecode: Boolean = false
+) {
     val context = LocalContext.current
     val inputImage by produceState<ImageBitmap?>(initialValue = null, inputPath) {
         value = withContext(Dispatchers.IO) {
             decodePreviewImage(context, inputPath)
         }
     }
-    val outputImage by produceState<ImageBitmap?>(initialValue = null, outputPath) {
-        value = withContext(Dispatchers.IO) {
-            decodePreviewImage(context, outputPath)
+    val outputImage by produceState<ImageBitmap?>(initialValue = null, outputPath, skipOutputDecode) {
+        value = if (skipOutputDecode) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                decodePreviewImage(context, outputPath)
+            }
         }
     }
     val split by animateFloatAsState(targetValue = 0.5f, animationSpec = tween(220), label = "compareSplit")
@@ -1848,7 +1861,7 @@ private fun CompareImageSurface(inputPath: String?, outputPath: String?, modifie
                     tonalElevation = 2.dp
                 ) {
                     Text(
-                        text = "结果预览不可用",
+                        text = if (skipOutputDecode) "极限 PNG 已生成" else "结果预览不可用",
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant

@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 enum class SuperResNativeCode {
     Ok = 0,
@@ -41,6 +42,21 @@ struct SuperResNativeParams {
     int gpuHeadroomPercent;
     int accelerationMode;
     bool tta;
+    int outputMode;
+    int outputCropLeft;
+    int outputCropTop;
+    int outputCropWidth;
+    int outputCropHeight;
+    int retryCount;
+    int regionIndex;
+};
+
+struct SuperResRawTile {
+    std::string path;
+    int x;
+    int y;
+    int width;
+    int height;
 };
 
 struct SuperResNativePerformance {
@@ -55,6 +71,9 @@ struct SuperResNativePerformance {
     bool cacheHit = false;
     int accelerationMode = 0;
     int tileSize = 0;
+    int cacheSize = 0;
+    int retryCount = 0;
+    int regionIndex = -1;
 };
 
 using SuperResProgressCallback = std::function<void(
@@ -72,3 +91,9 @@ SuperResNativeCode process_superres(
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();
+SuperResNativeCode merge_raw_tiles_to_png(
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    const std::vector<SuperResRawTile>& tiles
+);

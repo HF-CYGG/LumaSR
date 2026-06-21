@@ -135,6 +135,22 @@ class UpscaleParamsFactoryTest {
     }
 
     @Test
+    fun extremeExportKeepsRequestedAccelerationForExtremePolicy() {
+        val params = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            accelerationMode = AccelerationMode.VULKAN,
+            allowRealEsrganVulkan = true,
+            exportMode = ExportMode.EXTREME_SINGLE_PNG
+        )
+
+        assertEquals(AccelerationMode.VULKAN, params.accelerationMode)
+    }
+
+    @Test
     fun removesUnavailableWaifuScaleOnlyOneXNoise() {
         val params = UpscaleParamsFactory.create(
             taskId = "task-1",
@@ -211,6 +227,33 @@ class UpscaleParamsFactoryTest {
 
         assertEquals(1, plan.passes.size)
         assertEquals(0, plan.passes.single().noise)
+    }
+
+    @Test
+    fun rawCroppedOutputParamsAreAppliedOnlyToFinalPipelinePass() {
+        val plan = UpscaleParamsFactory.createPipeline(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/tile.rgb",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            denoiseModel = waifu2xCunetModel(),
+            resolvedDenoiseModelDir = "cache/models/waifu2x-cunet",
+            scale = 4,
+            noise = 2,
+            outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
+            outputCropLeft = 64,
+            outputCropTop = 32,
+            outputCropWidth = 512,
+            outputCropHeight = 256
+        )
+
+        assertEquals(NativeOutputMode.PNG_IMAGE, plan.passes.first().outputMode)
+        assertEquals(NativeOutputMode.RAW_CROPPED_RGB_TILE, plan.passes.last().outputMode)
+        assertEquals(64, plan.passes.last().outputCropLeft)
+        assertEquals(32, plan.passes.last().outputCropTop)
+        assertEquals(512, plan.passes.last().outputCropWidth)
+        assertEquals(256, plan.passes.last().outputCropHeight)
     }
 
     private fun realEsrganModel() = ModelPack(

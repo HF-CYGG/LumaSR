@@ -3,6 +3,7 @@ package com.lumasr.processor
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.NativePerformanceSnapshot
+import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.UpscaleErrorCode
 import com.lumasr.domain.UpscaleErrorMapper
 import com.lumasr.domain.SuperResProcessor
@@ -46,7 +47,22 @@ data class NativeProcessRequest(
     val tileSize: Int,
     val gpuHeadroomPercent: Int,
     val accelerationMode: Int,
-    val tta: Boolean
+    val tta: Boolean,
+    val outputMode: Int,
+    val outputCropLeft: Int,
+    val outputCropTop: Int,
+    val outputCropWidth: Int,
+    val outputCropHeight: Int,
+    val retryCount: Int,
+    val regionIndex: Int
+)
+
+data class NativeRawTile(
+    val path: String,
+    val x: Int,
+    val y: Int,
+    val width: Int,
+    val height: Int
 )
 
 data class NativeProgressEvent(
@@ -67,10 +83,26 @@ interface NativeProcessBridge {
     fun cancel(taskId: String)
 
     fun clearCache()
+
+    fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode
 }
 
 interface NativeCacheOwner {
     fun clearNativeCache()
+}
+
+interface NativeRawTileMerger {
+    fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode
 }
 
 object JniNativeProcessBridge : NativeProcessBridge {
@@ -92,6 +124,13 @@ object JniNativeProcessBridge : NativeProcessBridge {
                 gpuHeadroomPercent = request.gpuHeadroomPercent,
                 accelerationMode = request.accelerationMode,
                 tta = request.tta,
+                outputMode = request.outputMode,
+                outputCropLeft = request.outputCropLeft,
+                outputCropTop = request.outputCropTop,
+                outputCropWidth = request.outputCropWidth,
+                outputCropHeight = request.outputCropHeight,
+                retryCount = request.retryCount,
+                regionIndex = request.regionIndex,
                 progressSink = NativeProgressSink(onProgress)
             )
         )
@@ -103,6 +142,23 @@ object JniNativeProcessBridge : NativeProcessBridge {
 
     override fun clearCache() {
         clearCacheNative()
+    }
+
+    override fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode {
+        return NativeProcessCode.fromRawCode(
+            mergeRawTilesToPngNative(
+                outputPath = outputPath,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                tilePaths = tiles.map { it.path }.toTypedArray(),
+                tileRects = tiles.flatMap { listOf(it.x, it.y, it.width, it.height) }.toIntArray()
+            )
+        )
     }
 
     private external fun processNative(
@@ -118,12 +174,27 @@ object JniNativeProcessBridge : NativeProcessBridge {
         gpuHeadroomPercent: Int,
         accelerationMode: Int,
         tta: Boolean,
+        outputMode: Int,
+        outputCropLeft: Int,
+        outputCropTop: Int,
+        outputCropWidth: Int,
+        outputCropHeight: Int,
+        retryCount: Int,
+        regionIndex: Int,
         progressSink: NativeProgressSink
     ): Int
 
     private external fun cancelNative(taskId: String)
 
     private external fun clearCacheNative()
+
+    private external fun mergeRawTilesToPngNative(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tilePaths: Array<String>,
+        tileRects: IntArray
+    ): Int
 }
 
 class NativeProgressSink(
@@ -146,7 +217,10 @@ class NativeProgressSink(
         totalMs: Long,
         cacheHit: Boolean,
         accelerationModeOrdinal: Int,
-        tileSize: Int
+        tileSize: Int,
+        cacheSize: Int,
+        retryCount: Int,
+        regionIndex: Int
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -169,7 +243,10 @@ class NativeProgressSink(
                         accelerationMode = AccelerationMode.entries.getOrElse(accelerationModeOrdinal) {
                             AccelerationMode.AUTO
                         },
-                        tileSize = tileSize
+                        tileSize = tileSize,
+                        cacheSize = cacheSize,
+                        retryCount = retryCount,
+                        regionIndex = regionIndex
                     )
                 } else {
                     null
@@ -184,7 +261,7 @@ class NativeSuperResProcessor(
     isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
     private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit = ::logPerformance
-) : SuperResProcessor, NativeCacheOwner {
+) : SuperResProcessor, NativeCacheOwner, NativeRawTileMerger {
     private val isNativeAvailable = isAvailable
 
     override suspend fun process(
@@ -215,7 +292,14 @@ class NativeSuperResProcessor(
             tileSize = params.tileSize,
             gpuHeadroomPercent = params.gpuHeadroomPercent,
             accelerationMode = params.accelerationMode.ordinal,
-            tta = params.tta
+            tta = params.tta,
+            outputMode = params.outputMode.ordinal,
+            outputCropLeft = params.outputCropLeft,
+            outputCropTop = params.outputCropTop,
+            outputCropWidth = params.outputCropWidth,
+            outputCropHeight = params.outputCropHeight,
+            retryCount = params.retryCount,
+            regionIndex = params.regionIndex
         )
         // Native ncnn/Vulkan execution can monopolize a thread, so it must never run on Main.
         val code = withContext(inferenceDispatcher) {
@@ -239,6 +323,16 @@ class NativeSuperResProcessor(
 
     override fun clearNativeCache() {
         if (isNativeAvailable()) bridge.clearCache()
+    }
+
+    override fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode {
+        if (!isNativeAvailable()) return NativeProcessCode.UNSUPPORTED
+        return bridge.mergeRawTilesToPng(outputPath, outputWidth, outputHeight, tiles)
     }
 
     private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: Float) = UpscaleProgress(
@@ -310,6 +404,7 @@ class NativeSuperResProcessor(
                 LOG_TAG,
                 "task=${params.taskId} model=${params.modelName} scale=${params.scale} tile=${snapshot.tileSize} " +
                     "accel=${snapshot.accelerationMode} cacheHit=${snapshot.cacheHit} " +
+                    "cacheSize=${snapshot.cacheSize} retry=${snapshot.retryCount} region=${snapshot.regionIndex} " +
                     "decodeMs=${snapshot.decodeMs} modelLoadMs=${snapshot.modelLoadMs} " +
                     "tileInputMs=${snapshot.tileInputMs} tileExtractMs=${snapshot.tileExtractMs} " +
                     "tileCopyMs=${snapshot.tileCopyMs} saveMs=${snapshot.saveMs} totalMs=${snapshot.totalMs}"

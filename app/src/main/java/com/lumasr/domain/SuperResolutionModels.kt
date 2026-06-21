@@ -18,6 +18,17 @@ enum class OutputFormat {
     WEBP
 }
 
+enum class ExportMode {
+    AUTO,
+    SAFE_IMAGE,
+    EXTREME_SINGLE_PNG
+}
+
+enum class NativeOutputMode {
+    PNG_IMAGE,
+    RAW_CROPPED_RGB_TILE
+}
+
 data class ModelManifest(
     val version: Int,
     val models: List<ModelPack>
@@ -60,6 +71,14 @@ data class UpscaleParams(
     val accelerationMode: AccelerationMode,
     val tta: Boolean,
     val outputFormat: OutputFormat,
+    val exportMode: ExportMode = ExportMode.AUTO,
+    val outputMode: NativeOutputMode = NativeOutputMode.PNG_IMAGE,
+    val outputCropLeft: Int = 0,
+    val outputCropTop: Int = 0,
+    val outputCropWidth: Int = 0,
+    val outputCropHeight: Int = 0,
+    val retryCount: Int = 0,
+    val regionIndex: Int = -1,
     val pipelinePasses: List<UpscaleParams> = emptyList(),
     val pipelineLabel: String? = null
 )
@@ -104,7 +123,10 @@ data class NativePerformanceSnapshot(
     val totalMs: Long,
     val cacheHit: Boolean,
     val accelerationMode: AccelerationMode,
-    val tileSize: Int
+    val tileSize: Int,
+    val cacheSize: Int = 0,
+    val retryCount: Int = 0,
+    val regionIndex: Int = -1
 )
 
 enum class UpscaleStage {

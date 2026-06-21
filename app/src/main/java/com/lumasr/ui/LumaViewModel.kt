@@ -19,6 +19,8 @@ import com.lumasr.data.ModelManifestRepository
 import com.lumasr.data.UserPreferencesRepository
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.AutoTileSizePolicy
+import com.lumasr.domain.ExportMode
+import com.lumasr.domain.ExtremeExportEstimate
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
@@ -240,6 +242,7 @@ class LumaViewModel(
                 gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                 accelerationMode = state.accelerationMode,
                 tta = state.tta,
+                exportMode = ExportMode.AUTO,
                 resourceProfile = profile
             )
             if (decision.allowed) null else image.displayName to decision.message
@@ -300,6 +303,7 @@ class LumaViewModel(
                     gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                     accelerationMode = state.accelerationMode,
                     tta = state.tta,
+                    exportMode = ExportMode.AUTO,
                     resourceProfile = profile
                 )
                 if (state.tileSizeMode == TileSizeMode.AUTO) {
@@ -348,7 +352,8 @@ class LumaViewModel(
                             accelerationMode = budgetDecision.accelerationMode,
                             allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
                             tta = budgetDecision.tta,
-                            outputFormat = OutputFormat.PNG
+                            outputFormat = OutputFormat.PNG,
+                            exportMode = budgetDecision.exportMode
                         ).processorParams
                     }
                 }.getOrElse { error ->
@@ -407,7 +412,8 @@ class LumaViewModel(
                         scale = params.scale,
                         noise = params.noise,
                         pipelineLabel = params.pipelineLabel,
-                        outputFormat = params.outputFormat
+                        outputFormat = params.outputFormat,
+                        isExtremeExport = params.exportMode == ExportMode.EXTREME_SINGLE_PNG
                     )
                 }
 
@@ -483,7 +489,8 @@ class LumaViewModel(
                         scale = it.scale,
                         noise = it.noise,
                         pipelineLabel = it.pipelineLabel,
-                        outputFormat = it.outputFormat
+                        outputFormat = it.outputFormat,
+                        isExtremeExport = it.exportMode == ExportMode.EXTREME_SINGLE_PNG
                     )
                 )
             }.orEmpty()
@@ -580,6 +587,7 @@ data class LumaUiState(
     val lastAutoTileSize: Int = DEFAULT_TILE_SIZE,
     val tileSize: Int = DEFAULT_TILE_SIZE,
     val accelerationMode: AccelerationMode = AccelerationMode.AUTO,
+    val exportMode: ExportMode = ExportMode.AUTO,
     val tta: Boolean = false,
     val screen: LumaScreen = LumaScreen.EDITING,
     val selectedTab: LumaTab = LumaTab.PROCESS,
@@ -647,7 +655,8 @@ data class RenderResultInfo(
     val scale: Int,
     val noise: Int,
     val pipelineLabel: String? = null,
-    val outputFormat: OutputFormat
+    val outputFormat: OutputFormat,
+    val isExtremeExport: Boolean = false
 )
 
 enum class LumaScreen {
@@ -771,6 +780,41 @@ fun LumaUiState.autoTileSizeForCurrentSelection(
         .minOrNull()
         ?.let(::sanitizeTileSize)
         ?: DEFAULT_TILE_SIZE
+}
+
+fun LumaUiState.extremeExportEstimate(): ExtremeExportEstimate? {
+    val image = selectedImage ?: selectedImages.firstOrNull() ?: return null
+    val model = selectedModel ?: return null
+    val width = image.width?.takeIf { it > 0 } ?: return null
+    val height = image.height?.takeIf { it > 0 } ?: return null
+    val profile = ProcessingResourceProfile(width, height)
+    val outputPixels = profile.outputPixelsFor(scale) ?: return null
+    val decision = ResourceBudgetPolicy.evaluate(
+        imageWidth = width,
+        imageHeight = height,
+        model = model,
+        scale = scale,
+        tileSize = tileSize,
+        gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
+        accelerationMode = accelerationMode,
+        tta = tta,
+        exportMode = exportMode,
+        resourceProfile = profile
+    )
+    val outputWidth = (width.toLong() * decision.scale)
+        .coerceAtMost(Int.MAX_VALUE.toLong())
+        .toInt()
+    val outputHeight = (height.toLong() * decision.scale)
+        .coerceAtMost(Int.MAX_VALUE.toLong())
+        .toInt()
+    return ExtremeExportEstimate(
+        outputWidth = outputWidth,
+        outputHeight = outputHeight,
+        outputPixels = outputPixels,
+        mode = decision.exportMode,
+        recommendedTileSize = decision.tileSize,
+        message = decision.message
+    )
 }
 
 private fun LumaUiState.tileSizeFor(

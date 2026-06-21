@@ -2,6 +2,7 @@ package com.lumasr.ui
 
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
+import com.lumasr.domain.ExportMode
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.TileSizePreferences
@@ -119,6 +120,46 @@ class LumaUiStateSelectionTest {
     }
 
     @Test
+    fun defaultsExportModeToAuto() {
+        val state = LumaUiState()
+
+        assertEquals(ExportMode.AUTO, state.exportMode)
+    }
+
+    @Test
+    fun estimatesExtremeExportForLargeAutoOutput() {
+        val model = modelPack(
+            id = "realesrgan-general-x4",
+            defaultScale = 4,
+            defaultNoise = 0,
+            engine = SuperResEngine.REAL_ESRGAN
+        )
+        val state = LumaUiState(
+            models = listOf(model),
+            selectedModelId = model.id,
+            selectedImage = SelectedImageInfo(
+                sourceUri = "content://large",
+                displayName = "large.png",
+                sizeBytes = null,
+                width = 3000,
+                height = 3000,
+                mimeType = "image/png"
+            ),
+            scale = 4,
+            exportMode = ExportMode.AUTO
+        )
+
+        val estimate = state.extremeExportEstimate()
+
+        requireNotNull(estimate)
+        assertEquals(12000, estimate.outputWidth)
+        assertEquals(12000, estimate.outputHeight)
+        assertEquals(144_000_000L, estimate.outputPixels)
+        assertEquals(ExportMode.EXTREME_SINGLE_PNG, estimate.mode)
+        assertEquals(128, estimate.recommendedTileSize)
+    }
+
+    @Test
     fun appliesRememberedManualTileSizePreference() {
         val state = LumaUiState().withTileSizePreferences(
             TileSizePreferences(
@@ -212,11 +253,12 @@ class LumaUiStateSelectionTest {
     private fun modelPack(
         id: String,
         defaultScale: Int,
-        defaultNoise: Int
+        defaultNoise: Int,
+        engine: SuperResEngine = SuperResEngine.REAL_CUGAN
     ) = ModelPack(
         id = id,
         displayName = id,
-        engine = SuperResEngine.REAL_CUGAN,
+        engine = engine,
         modelDir = id,
         assetPath = id,
         isBuiltIn = true,

@@ -1,6 +1,7 @@
 package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.SuperResProcessor
@@ -71,6 +72,35 @@ class HybridSuperResProcessorTest {
         assertEquals(listOf(2, 2, 2), nativeProcessor.calls.map { it.scale })
         assertEquals("cache/input.png", nativeProcessor.calls.first().inputPath)
         assertEquals("cache/output.png", nativeProcessor.calls.last().outputPath)
+    }
+
+    @Test
+    fun chainedRawOutputUsesPngForIntermediatePassAndRawOnlyForFinalPass() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        processor.process(
+            defaultParams().copy(
+                scale = 16,
+                modelScales = listOf(4),
+                outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
+                outputCropLeft = 32,
+                outputCropTop = 48,
+                outputCropWidth = 1536,
+                outputCropHeight = 1536
+            )
+        ) {}
+
+        assertEquals(listOf(4, 4), nativeProcessor.calls.map { it.scale })
+        assertEquals(
+            listOf(NativeOutputMode.PNG_IMAGE, NativeOutputMode.RAW_CROPPED_RGB_TILE),
+            nativeProcessor.calls.map { it.outputMode }
+        )
+        assertEquals(0, nativeProcessor.calls.first().outputCropWidth)
+        assertEquals(1536, nativeProcessor.calls.last().outputCropWidth)
     }
 
     @Test

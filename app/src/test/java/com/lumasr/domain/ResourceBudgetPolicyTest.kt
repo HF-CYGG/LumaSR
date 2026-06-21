@@ -36,7 +36,8 @@ class ResourceBudgetPolicyTest {
             tileSize = 512,
             gpuHeadroomPercent = 8,
             accelerationMode = AccelerationMode.AUTO,
-            tta = false
+            tta = false,
+            exportMode = ExportMode.SAFE_IMAGE
         )
 
         assertFalse(decision.allowed)
@@ -53,7 +54,8 @@ class ResourceBudgetPolicyTest {
             tileSize = 1024,
             gpuHeadroomPercent = 8,
             accelerationMode = AccelerationMode.AUTO,
-            tta = false
+            tta = false,
+            exportMode = ExportMode.SAFE_IMAGE
         )
 
         assertFalse(decision.allowed)
@@ -149,6 +151,85 @@ class ResourceBudgetPolicyTest {
         assertEquals(512, decision.tileSize)
         assertEquals(8, decision.gpuHeadroomPercent)
         assertFalse(decision.tta)
+    }
+
+    @Test
+    fun autoExportUsesExtremeModeBetweenSafeAndExtremeLimits() {
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = 3000,
+            imageHeight = 3000,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 512,
+            gpuHeadroomPercent = 8,
+            accelerationMode = AccelerationMode.AUTO,
+            tta = true,
+            exportMode = ExportMode.AUTO
+        )
+
+        assertTrue(decision.allowed)
+        assertEquals(ExportMode.EXTREME_SINGLE_PNG, decision.exportMode)
+        assertEquals(128, decision.tileSize)
+        assertEquals(10, decision.gpuHeadroomPercent)
+        assertFalse(decision.tta)
+    }
+
+    @Test
+    fun extremeExportPreservesRequestedAccelerationForExtremePolicy() {
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = 3000,
+            imageHeight = 3000,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 512,
+            gpuHeadroomPercent = 8,
+            accelerationMode = AccelerationMode.VULKAN,
+            tta = true,
+            exportMode = ExportMode.AUTO
+        )
+
+        assertTrue(decision.allowed)
+        assertEquals(ExportMode.EXTREME_SINGLE_PNG, decision.exportMode)
+        assertEquals(AccelerationMode.VULKAN, decision.accelerationMode)
+        assertEquals(128, decision.tileSize)
+        assertEquals(10, decision.gpuHeadroomPercent)
+        assertFalse(decision.tta)
+    }
+
+    @Test
+    fun safeExportStillRejectsAboveSixtyFourMegapixels() {
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = 3000,
+            imageHeight = 3000,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 512,
+            gpuHeadroomPercent = 8,
+            accelerationMode = AccelerationMode.AUTO,
+            tta = false,
+            exportMode = ExportMode.SAFE_IMAGE
+        )
+
+        assertFalse(decision.allowed)
+        assertEquals(ExportMode.SAFE_IMAGE, decision.exportMode)
+    }
+
+    @Test
+    fun rejectsOutputsAboveExtremeLimit() {
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = 5000,
+            imageHeight = 5000,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 128,
+            gpuHeadroomPercent = 10,
+            accelerationMode = AccelerationMode.CPU,
+            tta = false,
+            exportMode = ExportMode.EXTREME_SINGLE_PNG
+        )
+
+        assertFalse(decision.allowed)
+        assertTrue(decision.message.orEmpty().contains("256MP"))
     }
 
     private fun realEsrganModel(id: String, modelFileBase: String, nativeScale: Int) = ModelPack(
