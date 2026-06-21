@@ -73,6 +73,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -122,6 +123,34 @@ private enum class ProcessVisualMode {
 }
 
 internal const val ProcessSheetBottomSpacerDp = 128
+internal const val ResultSaveFlashDurationMillis = 2500L
+
+internal enum class ResultSaveCardPhase {
+    Ready,
+    SavedFlash,
+    SavedSettled
+}
+
+internal fun initialResultSaveCardPhase(savedCount: Int): ResultSaveCardPhase =
+    if (savedCount > 0) ResultSaveCardPhase.SavedSettled else ResultSaveCardPhase.Ready
+
+internal fun resultSaveCardPhaseAfterStateChange(
+    currentPhase: ResultSaveCardPhase,
+    previousResultsKey: String,
+    resultsKey: String,
+    previousSavedCount: Int,
+    savedCount: Int
+): ResultSaveCardPhase {
+    if (previousResultsKey != resultsKey) return ResultSaveCardPhase.Ready
+    if (previousSavedCount == 0 && savedCount > 0) return ResultSaveCardPhase.SavedFlash
+    return currentPhase
+}
+
+internal fun settleResultSaveCardPhase(phase: ResultSaveCardPhase): ResultSaveCardPhase =
+    if (phase == ResultSaveCardPhase.SavedFlash) ResultSaveCardPhase.SavedSettled else phase
+
+internal fun resultSaveCardButtonLabels(phase: ResultSaveCardPhase): List<String> =
+    if (phase == ResultSaveCardPhase.Ready) listOf("保存", "返回") else listOf("返回")
 
 @Composable
 fun ProcessTabV2(
@@ -1342,12 +1371,31 @@ fun CompareScreenV2(
     val currentResult = results.getOrNull(safePreviewIndex)
     val savedCount = state.savedOutputUris.size.coerceAtLeast(if (state.savedOutputUri != null) 1 else 0)
     val animationKey = remember(results) { results.joinToString(separator = "|") { it.taskId } }
-    var contentVisible by remember(animationKey) { androidx.compose.runtime.mutableStateOf(false) }
+    var contentVisible by remember(animationKey) { mutableStateOf(false) }
+    var saveCardPhase by remember(animationKey) { mutableStateOf(initialResultSaveCardPhase(savedCount)) }
+    var observedResultsKey by remember { mutableStateOf(animationKey) }
+    var observedSavedCount by remember { mutableIntStateOf(savedCount) }
 
     LaunchedEffect(animationKey) {
         contentVisible = false
         delay(60)
         contentVisible = true
+    }
+    LaunchedEffect(animationKey, savedCount) {
+        val nextPhase = resultSaveCardPhaseAfterStateChange(
+            currentPhase = saveCardPhase,
+            previousResultsKey = observedResultsKey,
+            resultsKey = animationKey,
+            previousSavedCount = observedSavedCount,
+            savedCount = savedCount
+        )
+        saveCardPhase = nextPhase
+        observedResultsKey = animationKey
+        observedSavedCount = savedCount
+        if (nextPhase == ResultSaveCardPhase.SavedFlash) {
+            delay(ResultSaveFlashDurationMillis)
+            saveCardPhase = settleResultSaveCardPhase(saveCardPhase)
+        }
     }
 
     Box(
@@ -1391,38 +1439,110 @@ fun CompareScreenV2(
                 shadowElevation = 10.dp
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("本地处理完成", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        currentResult?.let {
-                            buildString {
-                                append("${it.modelName} · ${it.scale}x · 降噪 ${it.noise}")
-                                if (results.size > 1) append(" · ${safePreviewIndex + 1}/${results.size}")
-                                if (savedCount > 0) append(" · 已保存 $savedCount 张")
-                            }
-                        } ?: "没有可预览的输出",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(
-                            onClick = onSave,
-                            enabled = results.isNotEmpty(),
-                            modifier = Modifier.weight(1f).height(50.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
-                            Text("保存")
+                    AnimatedContent(
+                        targetState = resultSaveCardText(
+                            phase = saveCardPhase,
+                            result = currentResult,
+                            resultCount = results.size,
+                            resultIndex = safePreviewIndex,
+                            savedCount = savedCount
+                        ),
+                        transitionSpec = {
+                            (fadeIn(tween(180)) + slideInVertically(tween(180)) { it / 4 }) togetherWith
+                                (fadeOut(tween(120)) + slideOutVertically(tween(120)) { -it / 4 })
+                        },
+                        label = "resultSaveCardText"
+                    ) { text ->
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = text.first,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                text = text.second,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
-                        OutlinedButton(
-                            onClick = onBackHome,
-                            modifier = Modifier.weight(1f).height(50.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
-                            Text("继续处理")
+                    }
+                    AnimatedContent(
+                        targetState = saveCardPhase,
+                        transitionSpec = {
+                            (fadeIn(tween(180)) + slideInVertically(tween(180)) { it / 5 }) togetherWith
+                                (fadeOut(tween(120)) + slideOutVertically(tween(120)) { -it / 5 })
+                        },
+                        label = "resultSaveCardActions"
+                    ) { phase ->
+                        val labels = resultSaveCardButtonLabels(phase)
+                        if (labels.size == 2) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Button(
+                                    onClick = onSave,
+                                    enabled = results.isNotEmpty(),
+                                    modifier = Modifier.weight(1f).height(50.dp),
+                                    shape = RoundedCornerShape(16.dp)
+                                ) {
+                                    Text(labels[0])
+                                }
+                                OutlinedButton(
+                                    onClick = onBackHome,
+                                    modifier = Modifier.weight(1f).height(50.dp),
+                                    shape = RoundedCornerShape(16.dp)
+                                ) {
+                                    Text(labels[1])
+                                }
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = onBackHome,
+                                modifier = Modifier.fillMaxWidth().height(50.dp),
+                                shape = RoundedCornerShape(16.dp)
+                            ) {
+                                Text(labels.single())
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+private fun resultSaveCardText(
+    phase: ResultSaveCardPhase,
+    result: RenderResultInfo?,
+    resultCount: Int,
+    resultIndex: Int,
+    savedCount: Int
+): Pair<String, String> {
+    return if (phase == ResultSaveCardPhase.SavedFlash) {
+        "图片已保存" to savedResultSubtitle(savedCount)
+    } else {
+        "本地处理完成" to resultSummarySubtitle(result, resultCount, resultIndex, savedCount)
+    }
+}
+
+private fun savedResultSubtitle(savedCount: Int): String {
+    return if (savedCount > 1) {
+        "已保存 $savedCount 张到 Pictures/LocalSR"
+    } else {
+        "已保存到 Pictures/LocalSR"
+    }
+}
+
+private fun resultSummarySubtitle(
+    result: RenderResultInfo?,
+    resultCount: Int,
+    resultIndex: Int,
+    savedCount: Int
+): String {
+    return result?.let {
+        buildString {
+            append("${it.modelName} · ${it.scale}x · 降噪 ${it.noise}")
+            if (resultCount > 1) append(" · ${resultIndex + 1}/$resultCount")
+            if (savedCount > 0) append(" · 已保存 $savedCount 张")
+        }
+    } ?: "没有可预览的输出"
 }
 
 @Composable
