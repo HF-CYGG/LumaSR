@@ -40,7 +40,8 @@ class HybridSuperResProcessor(
     private val nativeAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
     private val allowMockFallback: Boolean = false,
     private val supportedAbisProvider: () -> List<String> = { Build.SUPPORTED_ABIS.toList() },
-    private val gpuHealthProbe: NativeGpuHealthProbe = NativeGpuHealthProbe { true }
+    private val gpuHealthProbe: NativeGpuHealthProbe = NativeGpuHealthProbe { true },
+    private val onExtremeGpuDisabled: (String) -> Unit = {}
 ) : SuperResProcessor, NativeCacheOwner {
     private val sessionDisabledExtremeGpuKeys = mutableSetOf<String>()
 
@@ -205,7 +206,7 @@ class HybridSuperResProcessor(
             gpuHealthProbe = gpuHealthProbe
         )
         if (accelerationDecision.disableGpuForSession) {
-            sessionDisabledExtremeGpuKeys += params.extremeGpuKey()
+            disableExtremeGpuForSession(params.extremeGpuKey())
         }
         val jobs = ExtremeTileScheduler.schedule(plan, accelerationDecision.mode)
         if (jobs.isEmpty()) {
@@ -278,7 +279,7 @@ class HybridSuperResProcessor(
                         }
                     }
                     if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
-                        sessionDisabledExtremeGpuKeys += params.extremeGpuKey()
+                        disableExtremeGpuForSession(params.extremeGpuKey())
                         rawOutput.delete()
                         job = job.asCpuRetry()
                         tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
@@ -371,6 +372,12 @@ class HybridSuperResProcessor(
                 bitmap.recycle()
             }
         }.getOrDefault(false)
+    }
+
+    private fun disableExtremeGpuForSession(modelKey: String) {
+        if (modelKey.isBlank()) return
+        sessionDisabledExtremeGpuKeys += modelKey
+        onExtremeGpuDisabled(modelKey)
     }
 
     private fun UpscaleParams.forExtremeTile(
