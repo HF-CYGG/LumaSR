@@ -13,17 +13,16 @@ class HybridSuperResProcessor(
     private val fallbackProcessor: SuperResProcessor = MockSuperResProcessor(),
     private val nativeAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
     private val allowMockFallback: Boolean = false
-) : SuperResProcessor {
+) : SuperResProcessor, NativeCacheOwner {
     override suspend fun process(
         params: UpscaleParams,
         onProgress: (UpscaleProgress) -> Unit
     ): UpscaleResult {
         return if (nativeAvailable()) {
-            val scalePlan = params.nativeScalePlan()
-            if (scalePlan.size == 1) {
-                nativeProcessor.process(params, onProgress)
+            if (params.pipelinePasses.isNotEmpty()) {
+                processExplicitPipeline(params, onProgress)
             } else {
-                processChained(params, scalePlan, onProgress)
+                processSingleOrChainedPass(params, onProgress)
             }
         } else if (allowMockFallback) {
             fallbackProcessor.process(params, onProgress).copy(
@@ -37,8 +36,25 @@ class HybridSuperResProcessor(
     override fun cancel(taskId: String) {
         if (nativeAvailable()) {
             nativeProcessor.cancel(taskId)
+            (nativeProcessor as? NativeCacheOwner)?.clearNativeCache()
         }
         if (allowMockFallback) fallbackProcessor.cancel(taskId)
+    }
+
+    override fun clearNativeCache() {
+        (nativeProcessor as? NativeCacheOwner)?.clearNativeCache()
+    }
+
+    private suspend fun processSingleOrChainedPass(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        val scalePlan = params.nativeScalePlan()
+        return if (scalePlan.size == 1) {
+            nativeProcessor.process(params, onProgress)
+        } else {
+            processChained(params, scalePlan, onProgress)
+        }
     }
 
     private suspend fun processChained(
@@ -61,7 +77,8 @@ class HybridSuperResProcessor(
             val passParams = params.copy(
                 inputPath = currentInput,
                 outputPath = passOutput,
-                scale = passScale
+                scale = passScale,
+                pipelinePasses = emptyList()
             )
             val result = nativeProcessor.process(passParams) { progress ->
                 onProgress(progress.asChainedProgress(index, scalePlan.size))
@@ -87,6 +104,35 @@ class HybridSuperResProcessor(
             outputPath = params.outputPath,
             success = true,
             message = "Chained native inference complete"
+        )
+    }
+
+    private suspend fun processExplicitPipeline(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        val passes = params.pipelinePasses
+        val tempFiles = passes.dropLast(1).map { File(it.outputPath) }
+
+        passes.forEachIndexed { index, pass ->
+            val result = processSingleOrChainedPass(pass) { progress ->
+                onProgress(progress.asChainedProgress(index, passes.size))
+            }
+            if (!result.success) {
+                tempFiles.forEach { it.delete() }
+                return result.copy(taskId = params.taskId)
+            }
+        }
+
+        tempFiles.forEach { it.delete() }
+        val message = params.pipelineLabel ?: "Pipeline native inference complete"
+        onProgress(params.progress(UpscaleStage.DONE, message, 1f))
+        return UpscaleResult(
+            taskId = params.taskId,
+            stage = UpscaleStage.DONE,
+            outputPath = params.outputPath,
+            success = true,
+            message = message
         )
     }
 }

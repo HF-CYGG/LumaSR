@@ -18,9 +18,9 @@ class AutoTileSizePolicyTest {
     }
 
     @Test
-    fun usesSmallTilesForRealEsrganX4PlusAndAnimeVideo() {
+    fun usesLargerTilesForSafeSmallRealEsrganImages() {
         assertEquals(
-            128,
+            256,
             AutoTileSizePolicy.resolve(
                 imageWidth = 1024,
                 imageHeight = 1024,
@@ -29,12 +29,31 @@ class AutoTileSizePolicyTest {
             )
         )
         assertEquals(
-            256,
+            512,
             AutoTileSizePolicy.resolve(
                 imageWidth = 589,
                 imageHeight = 1280,
                 model = realEsrganModel("realesr-animevideov3-x4"),
                 scale = 4
+            )
+        )
+    }
+
+    @Test
+    fun keepsAnimeVideoTilesConservativeOnLowRamDevices() {
+        assertEquals(
+            256,
+            AutoTileSizePolicy.resolve(
+                imageWidth = 589,
+                imageHeight = 1280,
+                model = realEsrganModel("realesr-animevideov3-x4"),
+                scale = 4,
+                resourceProfile = ProcessingResourceProfile(
+                    imageWidth = 589,
+                    imageHeight = 1280,
+                    isLowRamDevice = true,
+                    availableMemoryBytes = 400_000_000L
+                )
             )
         )
     }

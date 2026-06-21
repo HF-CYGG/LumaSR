@@ -163,6 +163,7 @@ fun MainScreen(viewModel: LumaViewModel) {
 
             TopNoticeHost(
                 message = noticeMessage,
+                eventId = state.resultMessageEventId,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .zIndex(2f)
@@ -218,12 +219,13 @@ internal fun noticeToneForMessage(message: String): NoticeTone {
 @Composable
 private fun TopNoticeHost(
     message: String?,
+    eventId: Long,
     modifier: Modifier = Modifier
 ) {
     var visibleMessage by remember { mutableStateOf<String?>(null) }
     var isNoticeVisible by remember { mutableStateOf(false) }
 
-    LaunchedEffect(message) {
+    LaunchedEffect(message, eventId) {
         if (message.isNullOrBlank()) {
             isNoticeVisible = false
             delay(TopNoticeExitHoldMillis)

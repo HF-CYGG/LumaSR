@@ -95,6 +95,15 @@ class ModelCapabilitiesTest {
         assertEquals(listOf(-1, 0, 3), model.availableDenoiseForScale(8))
     }
 
+    @Test
+    fun realEsrganDenoiseOptionsUseCunetPreprocessorWhenAvailable() {
+        val manifest = bundledManifest()
+        val model = manifest.models.first { it.id == "realesrgan-general-x4" }
+
+        assertEquals(listOf(0, 1, 2, 3), model.availableDenoiseForScale(4, manifest.models))
+        assertEquals(listOf(0), model.availableDenoiseForScale(4, listOf(model)))
+    }
+
     private fun realCuganStandard() = ModelPack(
         id = "realcugan-standard",
         displayName = "Standard",

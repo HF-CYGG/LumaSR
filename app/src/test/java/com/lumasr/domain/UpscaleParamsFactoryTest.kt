@@ -3,6 +3,7 @@ package com.lumasr.domain
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Test
+import java.io.File
 
 class UpscaleParamsFactoryTest {
     @Test
@@ -149,6 +150,69 @@ class UpscaleParamsFactoryTest {
         assertEquals(0, params.noise)
     }
 
+    @Test
+    fun realEsrganWithoutDenoiseCreatesSinglePassPipeline() {
+        val plan = UpscaleParamsFactory.createPipeline(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            denoiseModel = waifu2xCunetModel(),
+            resolvedDenoiseModelDir = "cache/models/waifu2x-cunet",
+            scale = 4,
+            noise = 0
+        )
+
+        assertEquals(1, plan.passes.size)
+        assertEquals(SuperResEngine.REAL_ESRGAN, plan.passes.single().engine)
+        assertEquals("cache/output.png", plan.passes.single().outputPath)
+        assertEquals("cache/output.png", plan.outputPath)
+    }
+
+    @Test
+    fun realEsrganWithDenoiseCreatesCunetPrepassThenFinalPass() {
+        val plan = UpscaleParamsFactory.createPipeline(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            denoiseModel = waifu2xCunetModel(),
+            resolvedDenoiseModelDir = "cache/models/waifu2x-cunet",
+            scale = 4,
+            noise = 2
+        )
+
+        assertEquals(2, plan.passes.size)
+        assertEquals(SuperResEngine.WAIFU2X, plan.passes[0].engine)
+        assertEquals(1, plan.passes[0].scale)
+        assertEquals(2, plan.passes[0].noise)
+        assertEquals("task-1_denoise.png", File(plan.passes[0].outputPath).name)
+        assertEquals(SuperResEngine.REAL_ESRGAN, plan.passes[1].engine)
+        assertEquals(0, plan.passes[1].noise)
+        assertEquals(plan.passes[0].outputPath, plan.passes[1].inputPath)
+        assertEquals("cache/output.png", plan.passes[1].outputPath)
+    }
+
+    @Test
+    fun realEsrganDenoiseFallsBackToOffWhenCunetIsUnavailable() {
+        val plan = UpscaleParamsFactory.createPipeline(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            denoiseModel = null,
+            resolvedDenoiseModelDir = null,
+            scale = 4,
+            noise = 3
+        )
+
+        assertEquals(1, plan.passes.size)
+        assertEquals(0, plan.passes.single().noise)
+    }
+
     private fun realEsrganModel() = ModelPack(
             id = "realesrgan-general-x4",
             displayName = "x4plus",
@@ -182,6 +246,8 @@ class UpscaleParamsFactoryTest {
             "noise0_model.bin",
             "noise1_model.param",
             "noise1_model.bin",
+            "noise2_model.param",
+            "noise2_model.bin",
             "noise0_scale2.0x_model.param",
             "noise0_scale2.0x_model.bin",
             "noise1_scale2.0x_model.param",

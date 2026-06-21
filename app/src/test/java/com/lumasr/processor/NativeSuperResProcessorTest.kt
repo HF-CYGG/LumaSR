@@ -1,6 +1,7 @@
 package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
@@ -110,6 +111,49 @@ class NativeSuperResProcessorTest {
     }
 
     @Test
+    fun forwardsNativePerformanceSnapshotToProgressAndLogger() = runBlocking {
+        val snapshot = NativePerformanceSnapshot(
+            decodeMs = 11,
+            modelLoadMs = 22,
+            tileInputMs = 33,
+            tileExtractMs = 44,
+            tileCopyMs = 55,
+            saveMs = 66,
+            totalMs = 231,
+            cacheHit = true,
+            accelerationMode = AccelerationMode.VULKAN,
+            tileSize = 256
+        )
+        val bridge = FakeNativeBridge(
+            code = NativeProcessCode.OK,
+            progressEvents = listOf(
+                NativeProgressEvent(
+                    stage = UpscaleStage.SAVING,
+                    currentTile = 4,
+                    totalTiles = 4,
+                    progress = 0.99f,
+                    message = "Performance sample",
+                    performanceSnapshot = snapshot
+                )
+            )
+        )
+        val logged = mutableListOf<NativePerformanceSnapshot>()
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true },
+            performanceLogger = { _, performance -> logged += performance }
+        )
+        val progressSnapshots = mutableListOf<NativePerformanceSnapshot>()
+
+        processor.process(defaultParams()) { progress ->
+            progress.performanceSnapshot?.let(progressSnapshots::add)
+        }
+
+        assertEquals(listOf(snapshot), progressSnapshots)
+        assertEquals(listOf(snapshot), logged)
+    }
+
+    @Test
     fun mapsVulkanRuntimeFailureNativeCodeToUserMessage() = runBlocking {
         val processor = NativeSuperResProcessor(
             bridge = FakeNativeBridge(NativeProcessCode.VULKAN_FAILED),
@@ -159,6 +203,33 @@ class NativeSuperResProcessorTest {
         }
     }
 
+    @Test
+    fun clearNativeCacheForwardsToBridgeWhenNativeIsAvailable() {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        processor.clearNativeCache()
+
+        assertEquals(1, bridge.clearCacheCount)
+    }
+
+    @Test
+    fun cancelForwardsToBridgeAndClearsNativeCacheWhenAvailable() {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        processor.cancel("task-1")
+
+        assertEquals(listOf("task-1"), bridge.cancelledTaskIds)
+        assertEquals(1, bridge.clearCacheCount)
+    }
+
     private fun defaultParams() = UpscaleParams(
         taskId = "task-1",
         inputPath = "cache/input.png",
@@ -186,6 +257,9 @@ private class FakeNativeBridge(
         private set
     var lastProcessThreadName: String? = null
         private set
+    var clearCacheCount = 0
+        private set
+    val cancelledTaskIds = mutableListOf<String>()
 
     override fun process(
         request: NativeProcessRequest,
@@ -198,5 +272,11 @@ private class FakeNativeBridge(
         return code
     }
 
-    override fun cancel(taskId: String) = Unit
+    override fun cancel(taskId: String) {
+        cancelledTaskIds += taskId
+    }
+
+    override fun clearCache() {
+        clearCacheCount += 1
+    }
 }

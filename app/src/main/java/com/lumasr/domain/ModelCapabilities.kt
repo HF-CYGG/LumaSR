@@ -36,6 +36,25 @@ fun ModelPack.availableDenoiseForScale(targetScale: Int): List<Int> {
     return available.ifEmpty { denoise.sorted() }
 }
 
+fun ModelPack.availableDenoiseForScale(targetScale: Int, allModels: List<ModelPack>): List<Int> {
+    if (engine == SuperResEngine.REAL_ESRGAN) {
+        return if (allModels.realEsrganDenoisePreprocessor() != null) {
+            listOf(0, 1, 2, 3)
+        } else {
+            listOf(0)
+        }
+    }
+    return availableDenoiseForScale(targetScale)
+}
+
+fun List<ModelPack>.realEsrganDenoisePreprocessor(): ModelPack? {
+    return firstOrNull { model ->
+        model.id == "waifu2x-cunet" &&
+            model.engine == SuperResEngine.WAIFU2X &&
+            (1..3).all { it in model.availableDenoiseForScale(1) }
+    }
+}
+
 fun ModelPack.sanitizeDenoiseForScale(targetScale: Int, noise: Int): Int {
     return availableDenoiseForScale(targetScale)
         .ifEmpty { listOf(defaultNoise) }

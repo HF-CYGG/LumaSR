@@ -105,6 +105,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ModelPack
+import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
@@ -439,13 +440,19 @@ private fun ParameterSheet(
             }
 
             val noises = state.selectedModel
-                ?.availableDenoiseForScale(state.scale)
+                ?.availableDenoiseForScale(state.scale, state.models)
                 .orEmpty()
                 .ifEmpty { listOf(0) }
+            val denoiseTitle = if (state.selectedModel?.engine == SuperResEngine.REAL_ESRGAN) {
+                "预降噪"
+            } else {
+                "降噪等级"
+            }
             when (denoiseControlType(noises)) {
                 DenoiseControlType.SLIDER -> {
                     ParameterMorphContainer(morphKey = noises) {
                         NoiseSliderRow(
+                            title = denoiseTitle,
                             value = state.noise,
                             options = noises,
                             onNoiseChanged = onNoiseChanged
@@ -455,6 +462,7 @@ private fun ParameterSheet(
                 DenoiseControlType.SEGMENTED -> {
                     ParameterMorphContainer(morphKey = noises) {
                         DenoiseSegmentedRow(
+                            title = denoiseTitle,
                             value = state.noise,
                             options = noises,
                             onNoiseChanged = onNoiseChanged
@@ -625,6 +633,7 @@ internal fun denoiseOptionLabel(value: Int): String {
 
 @Composable
 private fun NoiseSliderRow(
+    title: String,
     value: Int,
     options: List<Int>,
     onNoiseChanged: (Int) -> Unit
@@ -648,7 +657,7 @@ private fun NoiseSliderRow(
     )
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        ParameterHeader(title = "降噪等级", value = denoiseOptionLabel(safeValue))
+        ParameterHeader(title = title, value = denoiseOptionLabel(safeValue))
         Slider(
             value = animatedValue.coerceIn(rangeStart, rangeEnd),
             onValueChange = { raw ->
@@ -665,6 +674,7 @@ private fun NoiseSliderRow(
 
 @Composable
 private fun DenoiseSegmentedRow(
+    title: String,
     value: Int,
     options: List<Int>,
     onNoiseChanged: (Int) -> Unit
@@ -672,7 +682,7 @@ private fun DenoiseSegmentedRow(
     val safeOptions = options.distinct().sorted().ifEmpty { listOf(0) }
     val safeValue = nearestNoiseLevel(safeOptions, value.toFloat())
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        ParameterHeader(title = "降噪等级", value = denoiseOptionLabel(safeValue))
+        ParameterHeader(title = title, value = denoiseOptionLabel(safeValue))
         AnimatedSegmentedSelector(
             items = safeOptions,
             selected = safeValue,
@@ -1634,7 +1644,7 @@ private fun resultSummarySubtitle(
 ): String {
     return result?.let {
         buildString {
-            append("${it.modelName} · ${it.scale}x · 降噪 ${it.noise}")
+            append(it.pipelineLabel ?: "${it.modelName} · ${it.scale}x · 降噪 ${denoiseOptionLabel(it.noise)}")
             if (resultCount > 1) append(" · ${resultIndex + 1}/$resultCount")
             if (savedCount > 0) append(" · 已保存 $savedCount 张")
         }

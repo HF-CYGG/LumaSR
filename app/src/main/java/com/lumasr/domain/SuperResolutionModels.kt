@@ -59,8 +59,28 @@ data class UpscaleParams(
     val gpuHeadroomPercent: Int = 8,
     val accelerationMode: AccelerationMode,
     val tta: Boolean,
-    val outputFormat: OutputFormat
+    val outputFormat: OutputFormat,
+    val pipelinePasses: List<UpscaleParams> = emptyList(),
+    val pipelineLabel: String? = null
 )
+
+data class UpscalePipelinePlan(
+    val passes: List<UpscaleParams>,
+    val outputPath: String
+) {
+    val processorParams: UpscaleParams
+        get() {
+            val finalPass = passes.last()
+            return finalPass.copy(
+                inputPath = passes.first().inputPath,
+                pipelinePasses = passes,
+                pipelineLabel = label
+            )
+        }
+
+    val label: String?
+        get() = passes.lastOrNull()?.pipelineLabel
+}
 
 data class UpscaleProgress(
     val taskId: String,
@@ -70,7 +90,21 @@ data class UpscaleProgress(
     val totalTiles: Int,
     val completedTileIndexes: Set<Int>,
     val message: String,
-    val estimatedRemainingMs: Long?
+    val estimatedRemainingMs: Long?,
+    val performanceSnapshot: NativePerformanceSnapshot? = null
+)
+
+data class NativePerformanceSnapshot(
+    val decodeMs: Long,
+    val modelLoadMs: Long,
+    val tileInputMs: Long,
+    val tileExtractMs: Long,
+    val tileCopyMs: Long,
+    val saveMs: Long,
+    val totalMs: Long,
+    val cacheHit: Boolean,
+    val accelerationMode: AccelerationMode,
+    val tileSize: Int
 )
 
 enum class UpscaleStage {

@@ -20,7 +20,7 @@ class ResourceBudgetPolicyTest {
         )
 
         assertTrue(decision.allowed)
-        assertEquals(256, decision.tileSize)
+        assertEquals(512, decision.tileSize)
         assertEquals(10, decision.gpuHeadroomPercent)
         assertFalse(decision.tta)
         assertTrue(decision.message.orEmpty().contains("降低资源占用"))
@@ -61,7 +61,7 @@ class ResourceBudgetPolicyTest {
     }
 
     @Test
-    fun limitsLargeRealEsrganModelsToSmallTiles() {
+    fun allowsMediumRealEsrganX4PlusTileWhenMemoryRiskIsUnknownAndOutputIsSafe() {
         val decision = ResourceBudgetPolicy.evaluate(
             imageWidth = 1024,
             imageHeight = 1024,
@@ -74,8 +74,61 @@ class ResourceBudgetPolicyTest {
         )
 
         assertTrue(decision.allowed)
-        assertEquals(128, decision.tileSize)
+        assertEquals(256, decision.tileSize)
         assertEquals(10, decision.gpuHeadroomPercent)
+        assertFalse(decision.tta)
+    }
+
+    @Test
+    fun allowsLargerRealEsrganTileForSafeSmallImages() {
+        val profile = ProcessingResourceProfile(
+            imageWidth = 512,
+            imageHeight = 512,
+            isLowRamDevice = false,
+            availableMemoryBytes = 2_000_000_000L
+        )
+
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = profile.imageWidth,
+            imageHeight = profile.imageHeight,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 512,
+            gpuHeadroomPercent = 8,
+            accelerationMode = AccelerationMode.AUTO,
+            tta = true,
+            resourceProfile = profile
+        )
+
+        assertTrue(decision.allowed)
+        assertEquals(256, decision.tileSize)
+        assertEquals(10, decision.gpuHeadroomPercent)
+        assertFalse(decision.tta)
+    }
+
+    @Test
+    fun keepsSmallRealEsrganTileOnLowRamDevices() {
+        val profile = ProcessingResourceProfile(
+            imageWidth = 512,
+            imageHeight = 512,
+            isLowRamDevice = true,
+            availableMemoryBytes = 400_000_000L
+        )
+
+        val decision = ResourceBudgetPolicy.evaluate(
+            imageWidth = profile.imageWidth,
+            imageHeight = profile.imageHeight,
+            model = realEsrganModel("realesrgan-general-x4", "realesrgan-x4plus", 4),
+            scale = 4,
+            tileSize = 512,
+            gpuHeadroomPercent = 8,
+            accelerationMode = AccelerationMode.AUTO,
+            tta = true,
+            resourceProfile = profile
+        )
+
+        assertTrue(decision.allowed)
+        assertEquals(128, decision.tileSize)
         assertFalse(decision.tta)
     }
 

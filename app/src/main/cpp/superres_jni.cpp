@@ -23,7 +23,8 @@ void emit_progress(
     int current_tile,
     int total_tiles,
     float progress,
-    const std::string& message
+    const std::string& message,
+    const SuperResNativePerformance& performance
 ) {
     if (progress_sink == nullptr || env->ExceptionCheck()) {
         return;
@@ -34,7 +35,7 @@ void emit_progress(
         return;
     }
 
-    jmethodID method = env->GetMethodID(sink_class, "onProgress", "(IIIFLjava/lang/String;)V");
+    jmethodID method = env->GetMethodID(sink_class, "onProgress", "(IIIFLjava/lang/String;ZJJJJJJJZII)V");
     env->DeleteLocalRef(sink_class);
     if (method == nullptr || env->ExceptionCheck()) {
         return;
@@ -48,7 +49,18 @@ void emit_progress(
         static_cast<jint>(current_tile),
         static_cast<jint>(total_tiles),
         static_cast<jfloat>(progress),
-        j_message
+        j_message,
+        performance.hasValue ? JNI_TRUE : JNI_FALSE,
+        static_cast<jlong>(performance.decodeMs),
+        static_cast<jlong>(performance.modelLoadMs),
+        static_cast<jlong>(performance.tileInputMs),
+        static_cast<jlong>(performance.tileExtractMs),
+        static_cast<jlong>(performance.tileCopyMs),
+        static_cast<jlong>(performance.saveMs),
+        static_cast<jlong>(performance.totalMs),
+        performance.cacheHit ? JNI_TRUE : JNI_FALSE,
+        static_cast<jint>(performance.accelerationMode),
+        static_cast<jint>(performance.tileSize)
     );
     env->DeleteLocalRef(j_message);
 }
@@ -94,9 +106,10 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
             int current_tile,
             int total_tiles,
             float progress,
-            const std::string& message
+            const std::string& message,
+            const SuperResNativePerformance& performance
         ) {
-            emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message);
+            emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
         }
     ));
 }
@@ -109,4 +122,13 @@ Java_com_lumasr_processor_JniNativeProcessBridge_cancelNative(
     jstring task_id
 ) {
     cancel_superres(to_string(env, task_id));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_clearCacheNative(
+    JNIEnv*,
+    jobject
+) {
+    clear_superres_cache();
 }

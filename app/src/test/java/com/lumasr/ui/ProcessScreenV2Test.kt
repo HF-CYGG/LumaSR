@@ -58,6 +58,15 @@ class ProcessScreenV2Test {
     }
 
     @Test
+    fun incrementsTopNoticeEventWhenSameMessageIsSetAgain() {
+        val first = LumaUiState().withResultMessage("oversized output")
+        val second = first.withResultMessage("oversized output")
+
+        assertEquals("oversized output", second.resultMessage)
+        assertTrue(second.resultMessageEventId > first.resultMessageEventId)
+    }
+
+    @Test
     fun hidesTopNoticeOutsideProcessRouteOrCompareScreen() {
         assertNull(
             topNoticeMessage(

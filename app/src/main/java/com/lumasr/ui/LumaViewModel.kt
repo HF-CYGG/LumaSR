@@ -5,6 +5,7 @@
 package com.lumasr.ui
 
 import android.app.Application
+import android.app.ActivityManager
 import android.os.Build
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
@@ -22,16 +23,20 @@ import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.ProcessingResourceProfile
 import com.lumasr.domain.ResourceBudgetPolicy
+import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.TileSizePreferences
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleParamsFactory
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
-import com.lumasr.domain.sanitizeDenoiseForScale
+import com.lumasr.domain.availableDenoiseForScale
+import com.lumasr.domain.realEsrganDenoisePreprocessor
 import com.lumasr.domain.sanitizeTargetScale
 import com.lumasr.processor.HybridSuperResProcessor
+import com.lumasr.processor.NativeCacheOwner
 import com.lumasr.domain.SuperResProcessor
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -45,6 +50,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
+import kotlin.math.abs
 
 class LumaViewModel(
     application: Application,
@@ -90,7 +96,7 @@ class LumaViewModel(
                 }
                 persistTileSizePreferences(_uiState.value)
             }.onFailure { error ->
-                _uiState.update { it.copy(resultMessage = "Cannot read selected image: ${error.message}") }
+                _uiState.update { it.withResultMessage("Cannot read selected image: ${error.message}") }
             }
         }
     }
@@ -120,7 +126,7 @@ class LumaViewModel(
                 }
                 persistTileSizePreferences(_uiState.value)
             }.onFailure { error ->
-                _uiState.update { it.copy(resultMessage = "Cannot read selected images: ${error.message}") }
+                _uiState.update { it.withResultMessage("Cannot read selected images: ${error.message}") }
             }
         }
     }
@@ -131,13 +137,17 @@ class LumaViewModel(
     }
 
     fun selectModel(modelId: String) {
+        val previousModelId = _uiState.value.selectedModelId
         val model = _uiState.value.models.firstOrNull { it.id == modelId } ?: return
+        if (previousModelId != null && previousModelId != modelId) {
+            releaseNativeCacheIfSupported()
+        }
         _uiState.update {
             val scale = model.defaultScale
             it.copy(
                 selectedModelId = modelId,
                 scale = scale,
-                noise = model.sanitizeDenoiseForScale(scale, model.defaultNoise),
+                noise = model.sanitizeNoiseForUi(scale, model.defaultNoise, it.models),
                 accelerationMode = modelRuntimePolicy.sanitizeAccelerationMode(model, it.accelerationMode),
                 tta = false
             ).withAutoTileSizeForCurrentSelection(model = model, scale = scale)
@@ -149,7 +159,7 @@ class LumaViewModel(
         _uiState.update { state ->
             val model = state.selectedModel
             val resolvedScale = model?.sanitizeTargetScale(scale) ?: scale
-            val resolvedNoise = model?.sanitizeDenoiseForScale(resolvedScale, state.noise) ?: state.noise
+            val resolvedNoise = model?.sanitizeNoiseForUi(resolvedScale, state.noise, state.models) ?: state.noise
             state.copy(
                 scale = resolvedScale,
                 noise = resolvedNoise
@@ -162,7 +172,7 @@ class LumaViewModel(
         _uiState.update { state ->
             val model = state.selectedModel
             state.copy(
-                noise = model?.sanitizeDenoiseForScale(state.scale, noise) ?: noise
+                noise = model?.sanitizeNoiseForUi(state.scale, noise, state.models) ?: noise
             )
         }
     }
@@ -216,8 +226,11 @@ class LumaViewModel(
         val images = state.selectedImages.ifEmpty { state.selectedImage?.let(::listOf).orEmpty() }
         if (images.isEmpty()) return
         val model = state.selectedModel ?: return
+        val denoiseModel = state.models.realEsrganDenoisePreprocessor()
+            .takeIf { model.engine == SuperResEngine.REAL_ESRGAN && state.noise > 0 }
         val rejectedImage = images.firstNotNullOfOrNull { image ->
-            val requestedTileSize = state.tileSizeFor(image, model, state.scale)
+            val profile = processingResourceProfile(image)
+            val requestedTileSize = state.tileSizeFor(image, model, state.scale, profile)
             val decision = ResourceBudgetPolicy.evaluate(
                 imageWidth = image.width,
                 imageHeight = image.height,
@@ -226,7 +239,8 @@ class LumaViewModel(
                 tileSize = requestedTileSize,
                 gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                 accelerationMode = state.accelerationMode,
-                tta = state.tta
+                tta = state.tta,
+                resourceProfile = profile
             )
             if (decision.allowed) null else image.displayName to decision.message
         }
@@ -235,12 +249,12 @@ class LumaViewModel(
                 it.copy(
                     screen = LumaScreen.EDITING,
                     selectedTab = LumaTab.PROCESS,
-                    progress = null,
-                    resultMessage = "${rejectedImage.first}: ${rejectedImage.second.orEmpty()}"
-                )
+                    progress = null
+                ).withResultMessage("${rejectedImage.first}: ${rejectedImage.second.orEmpty()}")
             }
             return
         }
+        currentTaskId?.let(processor::cancel)
         currentJob?.cancel()
 
         // Batch state stays in the ViewModel so Compose can render the queue without owning task logic.
@@ -250,26 +264,33 @@ class LumaViewModel(
             var lastStage: UpscaleStage = UpscaleStage.CANCELLED
             var lastSuccess = false
             val completedResults = mutableListOf<RenderResultInfo>()
-            val modelDir = runCatching {
+            val preparedModelDirs = runCatching {
                 withContext(ioDispatcher) {
-                    modelAssetRepository.prepareModel(model).absolutePath
+                    buildMap {
+                        put(model.id, modelAssetRepository.prepareModel(model).absolutePath)
+                        denoiseModel?.let { denoiser ->
+                            put(denoiser.id, modelAssetRepository.prepareModel(denoiser).absolutePath)
+                        }
+                    }
                 }
             }.getOrElse { error ->
                 _uiState.update {
                     it.copy(
                         screen = LumaScreen.EDITING,
-                        progress = null,
-                        resultMessage = "Cannot prepare ${model.displayName}: ${error.message}"
-                    )
+                        progress = null
+                    ).withResultMessage("Cannot prepare ${model.displayName}: ${error.message}")
                 }
                 currentTaskId = null
                 return@launch
             }
+            val modelDir = preparedModelDirs.getValue(model.id)
+            val denoiseModelDir = denoiseModel?.let { preparedModelDirs[it.id] }
 
             for ((index, image) in images.withIndex()) {
                 if (!isActive) break
 
-                val requestedTileSize = state.tileSizeFor(image, model, state.scale)
+                val profile = processingResourceProfile(image)
+                val requestedTileSize = state.tileSizeFor(image, model, state.scale, profile)
                 val budgetDecision = ResourceBudgetPolicy.evaluate(
                     imageWidth = image.width,
                     imageHeight = image.height,
@@ -278,7 +299,8 @@ class LumaViewModel(
                     tileSize = requestedTileSize,
                     gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                     accelerationMode = state.accelerationMode,
-                    tta = state.tta
+                    tta = state.tta,
+                    resourceProfile = profile
                 )
                 if (state.tileSizeMode == TileSizeMode.AUTO) {
                     persistTileSizePreferences(
@@ -301,23 +323,24 @@ class LumaViewModel(
                         completedResults = emptyList(),
                         savedOutputUri = null,
                         savedOutputUris = emptyList(),
-                        resultMessage = budgetDecision.message,
                         scale = budgetDecision.scale,
                         tileSize = budgetDecision.tileSize,
                         accelerationMode = budgetDecision.accelerationMode,
                         tta = budgetDecision.tta
-                    )
+                    ).withResultMessage(budgetDecision.message)
                 }
 
                 val params = runCatching {
                     withContext(ioDispatcher) {
                         val paths = imageCacheRepository.copyToTaskCache(Uri.parse(image.sourceUri), taskId, image.mimeType)
-                        UpscaleParamsFactory.create(
+                        UpscaleParamsFactory.createPipeline(
                             taskId = taskId,
                             inputPath = paths.inputFile.absolutePath,
                             outputPath = paths.outputFile.absolutePath,
                             model = model,
                             resolvedModelDir = modelDir,
+                            denoiseModel = denoiseModel,
+                            resolvedDenoiseModelDir = denoiseModelDir,
                             scale = budgetDecision.scale,
                             noise = state.noise,
                             tileSize = budgetDecision.tileSize,
@@ -326,16 +349,15 @@ class LumaViewModel(
                             allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
                             tta = budgetDecision.tta,
                             outputFormat = OutputFormat.PNG
-                        )
+                        ).processorParams
                     }
                 }.getOrElse { error ->
                     currentTaskId = null
                     _uiState.update {
                         it.copy(
                             screen = LumaScreen.EDITING,
-                            progress = null,
-                            resultMessage = "Cannot prepare ${image.displayName}: ${error.message}"
-                        )
+                            progress = null
+                        ).withResultMessage("Cannot prepare ${image.displayName}: ${error.message}")
                     }
                     return@launch
                 }
@@ -384,6 +406,7 @@ class LumaViewModel(
                         modelName = params.modelName,
                         scale = params.scale,
                         noise = params.noise,
+                        pipelineLabel = params.pipelineLabel,
                         outputFormat = params.outputFormat
                     )
                 }
@@ -410,14 +433,14 @@ class LumaViewModel(
 
             val finalTaskId = lastParams?.taskId ?: currentTaskId
             _uiState.update {
+                val finalMessage = if (lastSuccess) it.resultMessage ?: lastResultMessage else lastResultMessage
                 it.copy(
                     screen = if (lastSuccess) LumaScreen.COMPARE else LumaScreen.EDITING,
-                    resultMessage = if (lastSuccess) it.resultMessage ?: lastResultMessage else lastResultMessage,
                     progress = it.progress ?: finalTaskId?.let(::doneProgress),
                     activeBatchIndex = 0,
                     activeBatchSize = images.size,
                     completedResults = completedResults.toList()
-                )
+                ).withResultMessage(finalMessage)
             }
             if (lastStage != UpscaleStage.PROCESSING_TILE) {
                 currentTaskId = null
@@ -437,6 +460,15 @@ class LumaViewModel(
         _uiState.update { it.copy(screen = LumaScreen.EDITING, selectedTab = LumaTab.PROCESS) }
     }
 
+    private fun releaseNativeCacheIfSupported() {
+        (processor as? NativeCacheOwner)?.clearNativeCache()
+    }
+
+    override fun onCleared() {
+        releaseNativeCacheIfSupported()
+        super.onCleared()
+    }
+
     fun saveResultToGallery() {
         val state = _uiState.value
         val results = state.completedResults.ifEmpty {
@@ -450,6 +482,7 @@ class LumaViewModel(
                         modelName = it.modelName,
                         scale = it.scale,
                         noise = it.noise,
+                        pipelineLabel = it.pipelineLabel,
                         outputFormat = it.outputFormat
                     )
                 )
@@ -471,19 +504,19 @@ class LumaViewModel(
                     }
                 }
             }.onSuccess { uris ->
+                val message = if (uris.size > 1) {
+                    "Saved ${uris.size} images to Pictures/LocalSR"
+                } else {
+                    "Saved to Pictures/LocalSR"
+                }
                 _uiState.update {
                     it.copy(
                         savedOutputUri = uris.lastOrNull()?.toString(),
-                        savedOutputUris = uris.map { uri -> uri.toString() },
-                        resultMessage = if (uris.size > 1) {
-                            "Saved ${uris.size} images to Pictures/LocalSR"
-                        } else {
-                            "Saved to Pictures/LocalSR"
-                        }
-                    )
+                        savedOutputUris = uris.map { uri -> uri.toString() }
+                    ).withResultMessage(message)
                 }
             }.onFailure { error ->
-                _uiState.update { it.copy(resultMessage = "Save failed: ${error.message}") }
+                _uiState.update { it.withResultMessage("Save failed: ${error.message}") }
             }
         }
     }
@@ -498,7 +531,7 @@ class LumaViewModel(
                 val runtimeManifest = manifest.copy(models = modelRuntimePolicy.visibleModels(manifest.models))
                 _uiState.update { it.withLoadedManifest(runtimeManifest) }
             }.onFailure { error ->
-                _uiState.update { it.copy(resultMessage = "Model manifest failed: ${error.message}") }
+                _uiState.update { it.withResultMessage("Model manifest failed: ${error.message}") }
             }
         }
     }
@@ -558,7 +591,8 @@ data class LumaUiState(
     val completedResults: List<RenderResultInfo> = emptyList(),
     val savedOutputUri: String? = null,
     val savedOutputUris: List<String> = emptyList(),
-    val resultMessage: String? = null
+    val resultMessage: String? = null,
+    val resultMessageEventId: Long = 0L
 ) {
     val selectedModel: ModelPack?
         get() = models.firstOrNull { it.id == selectedModelId }
@@ -574,7 +608,18 @@ data class LumaUiState(
             "开始批量处理 $selectedImageCount 张"
         } else {
             "开始处理"
-        }
+    }
+}
+
+fun LumaUiState.withResultMessage(message: String?): LumaUiState {
+    return if (message.isNullOrBlank()) {
+        copy(resultMessage = null)
+    } else {
+        copy(
+            resultMessage = message,
+            resultMessageEventId = resultMessageEventId + 1
+        )
+    }
 }
 
 val TileSizeOptions: List<Int> = UpscaleParamsFactory.supportedTileSizes.sorted()
@@ -601,6 +646,7 @@ data class RenderResultInfo(
     val modelName: String,
     val scale: Int,
     val noise: Int,
+    val pipelineLabel: String? = null,
     val outputFormat: OutputFormat
 )
 
@@ -640,7 +686,7 @@ data class RenderTaskSummary(
         ) = RenderTaskSummary(
             taskId = params.taskId,
             fileName = fileName,
-            modelName = params.modelName,
+            modelName = params.pipelineLabel ?: params.modelName,
             scale = params.scale,
             tileSize = params.tileSize,
             status = status,
@@ -678,7 +724,7 @@ fun LumaUiState.withLoadedManifest(manifest: ModelManifest): LumaUiState {
         models = manifest.models,
         selectedModelId = defaultModel?.id,
         scale = resolvedScale,
-        noise = defaultModel?.sanitizeDenoiseForScale(resolvedScale, defaultModel.defaultNoise) ?: noise
+        noise = defaultModel?.sanitizeNoiseForUi(resolvedScale, defaultModel.defaultNoise, manifest.models) ?: noise
     ).withAutoTileSizeForCurrentSelection(model = defaultModel, scale = resolvedScale)
 }
 
@@ -730,13 +776,36 @@ fun LumaUiState.autoTileSizeForCurrentSelection(
 private fun LumaUiState.tileSizeFor(
     image: SelectedImageInfo,
     model: ModelPack,
-    scale: Int
+    scale: Int,
+    resourceProfile: ProcessingResourceProfile = ProcessingResourceProfile(image.width, image.height)
 ): Int {
     return if (tileSizeMode == TileSizeMode.AUTO) {
-        AutoTileSizePolicy.resolve(image.width, image.height, model, scale)
+        AutoTileSizePolicy.resolve(image.width, image.height, model, scale, resourceProfile)
     } else {
         manualTileSize
     }.let(::sanitizeTileSize)
+}
+
+private fun AndroidViewModel.processingResourceProfile(image: SelectedImageInfo): ProcessingResourceProfile {
+    val activityManager = getApplication<Application>().getSystemService(ActivityManager::class.java)
+    val memoryInfo = ActivityManager.MemoryInfo()
+    activityManager?.getMemoryInfo(memoryInfo)
+    return ProcessingResourceProfile(
+        imageWidth = image.width,
+        imageHeight = image.height,
+        isLowRamDevice = activityManager?.isLowRamDevice == true,
+        availableMemoryBytes = memoryInfo.availMem.takeIf { it > 0L }
+    )
+}
+
+private fun ModelPack.sanitizeNoiseForUi(
+    targetScale: Int,
+    noise: Int,
+    allModels: List<ModelPack>
+): Int {
+    return availableDenoiseForScale(targetScale, allModels)
+        .ifEmpty { listOf(defaultNoise) }
+        .minBy { abs(it - noise) }
 }
 
 private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {

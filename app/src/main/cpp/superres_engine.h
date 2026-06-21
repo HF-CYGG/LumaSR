@@ -43,12 +43,27 @@ struct SuperResNativeParams {
     bool tta;
 };
 
+struct SuperResNativePerformance {
+    bool hasValue = false;
+    long long decodeMs = 0;
+    long long modelLoadMs = 0;
+    long long tileInputMs = 0;
+    long long tileExtractMs = 0;
+    long long tileCopyMs = 0;
+    long long saveMs = 0;
+    long long totalMs = 0;
+    bool cacheHit = false;
+    int accelerationMode = 0;
+    int tileSize = 0;
+};
+
 using SuperResProgressCallback = std::function<void(
     SuperResNativeStage stage,
     int currentTile,
     int totalTiles,
     float progress,
-    const std::string& message
+    const std::string& message,
+    const SuperResNativePerformance& performance
 )>;
 
 SuperResNativeCode process_superres(
@@ -56,3 +71,4 @@ SuperResNativeCode process_superres(
     const SuperResProgressCallback& onProgress
 );
 void cancel_superres(const std::string& taskId);
+void clear_superres_cache();

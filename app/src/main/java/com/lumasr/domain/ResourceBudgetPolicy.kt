@@ -3,6 +3,7 @@ package com.lumasr.domain
 object ResourceBudgetPolicy {
     const val MAX_OUTPUT_PIXELS: Long = 64_000_000L
     const val HIGH_RISK_OUTPUT_PIXELS: Long = 24_000_000L
+    private const val TIGHT_MEMORY_BYTES: Long = 768_000_000L
 
     fun evaluate(
         imageWidth: Int?,
@@ -12,10 +13,15 @@ object ResourceBudgetPolicy {
         tileSize: Int,
         gpuHeadroomPercent: Int,
         accelerationMode: AccelerationMode,
-        tta: Boolean
+        tta: Boolean,
+        resourceProfile: ProcessingResourceProfile = ProcessingResourceProfile(
+            imageWidth = imageWidth,
+            imageHeight = imageHeight
+        )
     ): ResourceBudgetDecision {
         val resolvedScale = model.sanitizeTargetScale(scale)
-        val outputPixels = estimateOutputPixels(imageWidth, imageHeight, resolvedScale)
+        val outputPixels = resourceProfile.outputPixelsFor(resolvedScale)
+            ?: estimateOutputPixels(imageWidth, imageHeight, resolvedScale)
         if (outputPixels != null && outputPixels > MAX_OUTPUT_PIXELS) {
             return ResourceBudgetDecision(
                 allowed = false,
@@ -28,7 +34,7 @@ object ResourceBudgetPolicy {
             )
         }
 
-        val realEsrganTileLimit = model.realEsrganTileLimit()
+        val realEsrganTileLimit = model.realEsrganTileLimit(outputPixels, resourceProfile)
         val highRisk = model.engine == SuperResEngine.REAL_ESRGAN ||
             (outputPixels != null && outputPixels > HIGH_RISK_OUTPUT_PIXELS)
         val maxTileSize = when {
@@ -74,14 +80,44 @@ object ResourceBudgetPolicy {
         return if (left > Long.MAX_VALUE / right) Long.MAX_VALUE else left * right
     }
 
-    private fun ModelPack.realEsrganTileLimit(): Int? {
+    private fun ModelPack.realEsrganTileLimit(
+        outputPixels: Long?,
+        resourceProfile: ProcessingResourceProfile
+    ): Int? {
         if (engine != SuperResEngine.REAL_ESRGAN) return null
         val base = modelFileBase.orEmpty()
+        val tightMemory = resourceProfile.isLowRamDevice ||
+            (resourceProfile.availableMemoryBytes != null &&
+                resourceProfile.availableMemoryBytes < TIGHT_MEMORY_BYTES)
+        val highOutput = outputPixels != null && outputPixels > HIGH_RISK_OUTPUT_PIXELS
         return when {
-            base.contains("realesrgan-x4plus") -> 128
+            base.contains("realesrgan-x4plus") && (tightMemory || highOutput) -> 128
+            base.contains("realesrgan-x4plus") -> 256
+            base.contains("realesr-animevideo") && !tightMemory && !highOutput -> 512
             base.contains("realesr-animevideo") -> 256
             else -> 256
         }
+    }
+}
+
+data class ProcessingResourceProfile(
+    val imageWidth: Int?,
+    val imageHeight: Int?,
+    val isLowRamDevice: Boolean = false,
+    val availableMemoryBytes: Long? = null
+) {
+    fun outputPixelsFor(scale: Int): Long? {
+        val width = imageWidth?.takeIf { it > 0 } ?: return null
+        val height = imageHeight?.takeIf { it > 0 } ?: return null
+        val safeScale = scale.takeIf { it > 0 } ?: return null
+        return multiplyOrMax(
+            multiplyOrMax(width.toLong(), height.toLong()),
+            multiplyOrMax(safeScale.toLong(), safeScale.toLong())
+        )
+    }
+
+    private fun multiplyOrMax(left: Long, right: Long): Long {
+        return if (left > Long.MAX_VALUE / right) Long.MAX_VALUE else left * right
     }
 }
 

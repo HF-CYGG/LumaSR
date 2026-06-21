@@ -92,6 +92,57 @@ class HybridSuperResProcessorTest {
     }
 
     @Test
+    fun nativeProcessorRunsExplicitPipelinePassesInOrder() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val denoisePass = defaultParams().copy(
+            taskId = "task-1:denoise",
+            inputPath = "cache/input.png",
+            outputPath = "cache/task-1_denoise.png",
+            scale = 1,
+            noise = 2
+        )
+        val finalPass = defaultParams().copy(
+            engine = SuperResEngine.REAL_ESRGAN,
+            modelName = "x4plus",
+            modelFileBase = "realesrgan-x4plus",
+            inputPath = "cache/task-1_denoise.png",
+            outputPath = "cache/output.png",
+            scale = 4,
+            noise = 0
+        )
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        val result = processor.process(
+            finalPass.copy(
+                inputPath = "cache/input.png",
+                pipelinePasses = listOf(denoisePass, finalPass)
+            )
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(listOf("cache/input.png", "cache/task-1_denoise.png"), nativeProcessor.calls.map { it.inputPath })
+        assertEquals(listOf(2, 0), nativeProcessor.calls.map { it.noise })
+        assertEquals("cache/output.png", result.outputPath)
+    }
+
+    @Test
+    fun cancelClearsNativeCacheWhenNativeProcessorOwnsCache() {
+        val nativeProcessor = RecordingCacheProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        processor.cancel("task-1")
+
+        assertEquals(listOf("task-1"), nativeProcessor.cancelledTaskIds)
+        assertEquals(1, nativeProcessor.clearCacheCount)
+    }
+
+    @Test
     fun nativeScalePlanFallsBackToRunnablePassInsteadOfReturningUnsupportedScale() {
         val plan = defaultParams().copy(
             scale = 5,
@@ -141,4 +192,25 @@ private class RecordingProcessor : SuperResProcessor {
     }
 
     override fun cancel(taskId: String) = Unit
+}
+
+private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
+    val cancelledTaskIds = mutableListOf<String>()
+    var clearCacheCount = 0
+        private set
+
+    override suspend fun process(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
+    }
+
+    override fun cancel(taskId: String) {
+        cancelledTaskIds += taskId
+    }
+
+    override fun clearNativeCache() {
+        clearCacheCount += 1
+    }
 }

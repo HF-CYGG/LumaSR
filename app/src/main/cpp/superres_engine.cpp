@@ -54,7 +54,18 @@ struct NetCacheEntry {
     std::shared_ptr<ncnn::Net> net;
 };
 
+struct LoadedNet {
+    std::shared_ptr<ncnn::Net> net;
+    bool cacheHit = false;
+};
+
 NetCacheEntry net_cache;
+
+long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start
+    ).count();
+}
 
 bool is_regular_file(const std::string& path) {
     std::error_code error;
@@ -93,7 +104,7 @@ std::string make_net_cache_key(const ModelFiles& files, bool useVulkan, int thre
     return files.paramPath + "|" + files.binPath + "|" + (useVulkan ? "vulkan" : "cpu") + "|" + std::to_string(threadCount);
 }
 
-std::shared_ptr<ncnn::Net> load_cached_net(
+LoadedNet load_cached_net(
     const ModelFiles& files,
     bool useVulkan,
     int threadCount
@@ -102,7 +113,7 @@ std::shared_ptr<ncnn::Net> load_cached_net(
     {
         std::lock_guard<std::mutex> lock(net_cache_mutex);
         if (net_cache.key == key && net_cache.net) {
-            return net_cache.net;
+            return LoadedNet{net_cache.net, true};
         }
     }
 
@@ -119,12 +130,17 @@ std::shared_ptr<ncnn::Net> load_cached_net(
         net->set_vulkan_device(ncnn::get_default_gpu_index());
     }
     if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
-        return nullptr;
+        return LoadedNet{};
     }
 
     std::lock_guard<std::mutex> lock(net_cache_mutex);
     net_cache = NetCacheEntry{key, net};
-    return net_cache.net;
+    return LoadedNet{net_cache.net, false};
+}
+
+void clear_cached_net() {
+    std::lock_guard<std::mutex> lock(net_cache_mutex);
+    net_cache = NetCacheEntry{};
 }
 
 void sleep_for_gpu_headroom(
@@ -268,10 +284,11 @@ void emit(
     int currentTile,
     int totalTiles,
     float progress,
-    const std::string& message
+    const std::string& message,
+    const SuperResNativePerformance& performance = SuperResNativePerformance{}
 ) {
     if (onProgress) {
-        onProgress(stage, currentTile, totalTiles, progress, message);
+        onProgress(stage, currentTile, totalTiles, progress, message, performance);
     }
 }
 
@@ -426,7 +443,7 @@ ncnn::Mat make_input_tile(
 bool copy_output_tile(
     const ncnn::Mat& tile,
     std::vector<unsigned char>& output,
-    std::vector<unsigned char>& coverage,
+    long long& coveredPixels,
     int outputW,
     int outputH,
     int srcX,
@@ -469,18 +486,15 @@ bool copy_output_tile(
             }
         }
     }
-    for (int y = 0; y < requestedCopyH; ++y) {
-        const size_t rowOffset = static_cast<size_t>(dstY + y) * outputW + dstX;
-        for (int x = 0; x < requestedCopyW; ++x) {
-            coverage[rowOffset + x] = 1;
-        }
-    }
+    coveredPixels += static_cast<long long>(requestedCopyW) * requestedCopyH;
     return true;
 }
 
-bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normalized) {
+bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normalized, long long& tileCopyMs) {
+    const auto normalizeStart = std::chrono::steady_clock::now();
     if (source.empty()) {
         normalized = source;
+        tileCopyMs += elapsed_ms(normalizeStart);
         return false;
     }
 
@@ -492,6 +506,7 @@ bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normaliz
     if (tile_output_needs_fp32_conversion(static_cast<int>(current.elemsize), current.elempack)) {
         ncnn::cast_float16_to_float32(current, fp32, opt);
         if (fp32.empty()) {
+            tileCopyMs += elapsed_ms(normalizeStart);
             return false;
         }
         current = fp32;
@@ -503,22 +518,18 @@ bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normaliz
     if (tile_output_needs_unpacking(current.c, current.elempack)) {
         ncnn::convert_packing(current, unpacked, 1, opt);
         if (unpacked.empty()) {
+            tileCopyMs += elapsed_ms(normalizeStart);
             return false;
         }
         current = unpacked;
     }
 
     normalized = current;
+    tileCopyMs += elapsed_ms(normalizeStart);
     return !normalized.empty() &&
         normalized.elempack == 1 &&
         normalized.elembits() == 32 &&
         tile_output_has_rgb_channels(normalized.c, normalized.elempack);
-}
-
-bool all_output_pixels_covered(const std::vector<unsigned char>& coverage) {
-    return std::all_of(coverage.begin(), coverage.end(), [](unsigned char value) {
-        return value != 0;
-    });
 }
 
 void log_tile_output_mismatch(
@@ -574,6 +585,10 @@ SuperResNativeCode run_ncnn(
     const SuperResProgressCallback& onProgress,
     bool useVulkan
 ) {
+    const auto totalStart = std::chrono::steady_clock::now();
+    SuperResNativePerformance performance;
+    performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
+
     const ModelFiles files = select_model_files(params);
     if (!is_regular_file(files.paramPath) || !is_regular_file(files.binPath)) {
         return SuperResNativeCode::ModelMissing;
@@ -592,7 +607,9 @@ SuperResNativeCode run_ncnn(
     }
 
     emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
+    const auto decodeStart = std::chrono::steady_clock::now();
     LoadedImage image = load_rgb_image(params.inputPath);
+    performance.decodeMs = elapsed_ms(decodeStart);
     if (image.rgb.empty()) {
         return SuperResNativeCode::Unsupported;
     }
@@ -625,12 +642,17 @@ SuperResNativeCode run_ncnn(
 
     emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
     const int threadCount = inference_threads(useVulkan);
-    std::shared_ptr<ncnn::Net> net = load_cached_net(files, useVulkan, threadCount);
+    const auto modelLoadStart = std::chrono::steady_clock::now();
+    LoadedNet loadedNet = load_cached_net(files, useVulkan, threadCount);
+    performance.modelLoadMs = elapsed_ms(modelLoadStart);
+    performance.cacheHit = loadedNet.cacheHit;
+    std::shared_ptr<ncnn::Net> net = loadedNet.net;
     if (!net) {
         return SuperResNativeCode::ModelMissing;
     }
 
     const int tileSize = std::max(32, params.tileSize);
+    performance.tileSize = tileSize;
     const int tileOverlap = std::min(32, std::max(8, tileSize / 4));
     const int tilesX = (image.width + tileSize - 1) / tileSize;
     const int tilesY = (image.height + tileSize - 1) / tileSize;
@@ -639,18 +661,17 @@ SuperResNativeCode run_ncnn(
     const int outputH = image.height * params.scale;
 
     std::vector<unsigned char> output;
-    std::vector<unsigned char> coverage;
     try {
         output.resize(static_cast<size_t>(outputW) * outputH * 3);
-        coverage.resize(static_cast<size_t>(outputW) * outputH);
     } catch (...) {
         return SuperResNativeCode::OutOfMemory;
     }
-    if (output.empty() || coverage.empty()) {
+    if (output.empty()) {
         return SuperResNativeCode::OutOfMemory;
     }
 
     int completed = 0;
+    long long coveredPixels = 0;
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
             if (is_cancelled(params.taskId)) {
@@ -676,17 +697,21 @@ SuperResNativeCode run_ncnn(
                         tileOverlap,
                         params.scale
                     );
+            const auto inputStart = std::chrono::steady_clock::now();
             ncnn::Mat input = make_input_tile(image, region.inputX, region.inputY, region.inputW, region.inputH);
+            performance.tileInputMs += elapsed_ms(inputStart);
             ncnn::Mat result;
             const auto tileStart = std::chrono::steady_clock::now();
 
             ncnn::Extractor extractor = net->create_extractor();
+            const auto extractStart = std::chrono::steady_clock::now();
             if (extractor.input(files.inputBlob, input) != 0 ||
                 extractor.extract(files.outputBlob, result) != 0) {
                 return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
             }
+            performance.tileExtractMs += elapsed_ms(extractStart);
             ncnn::Mat copySource;
-            if (!normalize_output_tile_for_copy(result, copySource)) {
+            if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
                 log_tile_output_mismatch(
                     params,
                     useVulkan,
@@ -702,10 +727,11 @@ SuperResNativeCode run_ncnn(
                 return SuperResNativeCode::TileOutputMismatch;
             }
 
+            const auto copyStart = std::chrono::steady_clock::now();
             if (!copy_output_tile(
                     copySource,
                     output,
-                    coverage,
+                    coveredPixels,
                     outputW,
                     outputH,
                     region.cropX,
@@ -730,6 +756,10 @@ SuperResNativeCode run_ncnn(
                 );
                 return SuperResNativeCode::TileOutputMismatch;
             }
+            performance.tileCopyMs += elapsed_ms(copyStart);
+            copySource.release();
+            result.release();
+            input.release();
 
             if (useVulkan) {
                 sleep_for_gpu_headroom(
@@ -755,25 +785,48 @@ SuperResNativeCode run_ncnn(
     }
 
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
-    if (!all_output_pixels_covered(coverage)) {
+    if (coveredPixels != static_cast<long long>(outputW) * outputH) {
         __android_log_print(
             ANDROID_LOG_WARN,
             kLogTag,
-            "TileOutputMismatch reason=coverage engine=%d scale=%d noise=%d accel=%s output=%dx%d",
+            "TileOutputMismatch reason=coverage engine=%d scale=%d noise=%d accel=%s output=%dx%d covered=%lld",
             params.engineType,
             params.scale,
             params.noise,
             acceleration_name(useVulkan),
             outputW,
-            outputH
+            outputH,
+            coveredPixels
         );
         return SuperResNativeCode::TileOutputMismatch;
     }
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.96f, "Saving output");
     // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
+    const auto saveStart = std::chrono::steady_clock::now();
     if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {
         return SuperResNativeCode::OutputFailed;
     }
+    performance.saveMs = elapsed_ms(saveStart);
+    performance.totalMs = elapsed_ms(totalStart);
+    performance.hasValue = true;
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Performance task=%s model=%s accel=%s cacheHit=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld totalMs=%lld",
+        params.taskId.c_str(),
+        params.modelFileBase.c_str(),
+        acceleration_name(useVulkan),
+        performance.cacheHit ? 1 : 0,
+        performance.tileSize,
+        performance.decodeMs,
+        performance.modelLoadMs,
+        performance.tileInputMs,
+        performance.tileExtractMs,
+        performance.tileCopyMs,
+        performance.saveMs,
+        performance.totalMs
+    );
+    emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);
 
     return is_cancelled(params.taskId) ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
 }
@@ -849,4 +902,9 @@ SuperResNativeCode process_superres(
 void cancel_superres(const std::string& taskId) {
     std::lock_guard<std::mutex> lock(cancel_mutex);
     cancelled_tasks.insert(taskId);
+}
+
+void clear_superres_cache() {
+    std::lock_guard<std::mutex> gpuLock(gpu_mutex);
+    clear_cached_net();
 }

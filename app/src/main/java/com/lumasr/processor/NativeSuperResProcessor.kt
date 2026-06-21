@@ -1,5 +1,8 @@
 package com.lumasr.processor
 
+import android.util.Log
+import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.UpscaleErrorCode
 import com.lumasr.domain.UpscaleErrorMapper
 import com.lumasr.domain.SuperResProcessor
@@ -51,7 +54,8 @@ data class NativeProgressEvent(
     val currentTile: Int,
     val totalTiles: Int,
     val progress: Float,
-    val message: String
+    val message: String,
+    val performanceSnapshot: NativePerformanceSnapshot? = null
 )
 
 interface NativeProcessBridge {
@@ -61,6 +65,12 @@ interface NativeProcessBridge {
     ): NativeProcessCode
 
     fun cancel(taskId: String)
+
+    fun clearCache()
+}
+
+interface NativeCacheOwner {
+    fun clearNativeCache()
 }
 
 object JniNativeProcessBridge : NativeProcessBridge {
@@ -91,6 +101,10 @@ object JniNativeProcessBridge : NativeProcessBridge {
         cancelNative(taskId)
     }
 
+    override fun clearCache() {
+        clearCacheNative()
+    }
+
     private external fun processNative(
         taskId: String,
         inputPath: String,
@@ -108,6 +122,8 @@ object JniNativeProcessBridge : NativeProcessBridge {
     ): Int
 
     private external fun cancelNative(taskId: String)
+
+    private external fun clearCacheNative()
 }
 
 class NativeProgressSink(
@@ -119,7 +135,18 @@ class NativeProgressSink(
         currentTile: Int,
         totalTiles: Int,
         progress: Float,
-        message: String
+        message: String,
+        hasPerformanceSnapshot: Boolean,
+        decodeMs: Long,
+        modelLoadMs: Long,
+        tileInputMs: Long,
+        tileExtractMs: Long,
+        tileCopyMs: Long,
+        saveMs: Long,
+        totalMs: Long,
+        cacheHit: Boolean,
+        accelerationModeOrdinal: Int,
+        tileSize: Int
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -128,7 +155,25 @@ class NativeProgressSink(
                 currentTile = currentTile,
                 totalTiles = totalTiles,
                 progress = progress.coerceIn(0f, 1f),
-                message = message
+                message = message,
+                performanceSnapshot = if (hasPerformanceSnapshot) {
+                    NativePerformanceSnapshot(
+                        decodeMs = decodeMs,
+                        modelLoadMs = modelLoadMs,
+                        tileInputMs = tileInputMs,
+                        tileExtractMs = tileExtractMs,
+                        tileCopyMs = tileCopyMs,
+                        saveMs = saveMs,
+                        totalMs = totalMs,
+                        cacheHit = cacheHit,
+                        accelerationMode = AccelerationMode.entries.getOrElse(accelerationModeOrdinal) {
+                            AccelerationMode.AUTO
+                        },
+                        tileSize = tileSize
+                    )
+                } else {
+                    null
+                }
             )
         )
     }
@@ -137,8 +182,9 @@ class NativeProgressSink(
 class NativeSuperResProcessor(
     private val bridge: NativeProcessBridge = JniNativeProcessBridge,
     isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
-    private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default
-) : SuperResProcessor {
+    private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit = ::logPerformance
+) : SuperResProcessor, NativeCacheOwner {
     private val isNativeAvailable = isAvailable
 
     override suspend fun process(
@@ -176,6 +222,7 @@ class NativeSuperResProcessor(
             bridge.process(
                 request = request,
                 onProgress = { event ->
+                    event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
                 }
             )
@@ -184,7 +231,14 @@ class NativeSuperResProcessor(
     }
 
     override fun cancel(taskId: String) {
-        if (isNativeAvailable()) bridge.cancel(taskId)
+        if (isNativeAvailable()) {
+            bridge.cancel(taskId)
+            bridge.clearCache()
+        }
+    }
+
+    override fun clearNativeCache() {
+        if (isNativeAvailable()) bridge.clearCache()
     }
 
     private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: Float) = UpscaleProgress(
@@ -206,7 +260,8 @@ class NativeSuperResProcessor(
         totalTiles = event.totalTiles,
         completedTileIndexes = (1..event.currentTile).toSet(),
         message = event.message,
-        estimatedRemainingMs = null
+        estimatedRemainingMs = null,
+        performanceSnapshot = event.performanceSnapshot
     )
 
     private fun NativeProcessCode.toResult(
@@ -242,11 +297,24 @@ class NativeSuperResProcessor(
     }
 
     companion object {
+        private const val LOG_TAG = "LumaSRPerformance"
+
         private val loaded: Boolean by lazy {
             runCatching { System.loadLibrary("localsr") }.isSuccess
         }
 
         fun isAvailable(): Boolean = loaded
+
+        private fun logPerformance(params: UpscaleParams, snapshot: NativePerformanceSnapshot) {
+            Log.i(
+                LOG_TAG,
+                "task=${params.taskId} model=${params.modelName} scale=${params.scale} tile=${snapshot.tileSize} " +
+                    "accel=${snapshot.accelerationMode} cacheHit=${snapshot.cacheHit} " +
+                    "decodeMs=${snapshot.decodeMs} modelLoadMs=${snapshot.modelLoadMs} " +
+                    "tileInputMs=${snapshot.tileInputMs} tileExtractMs=${snapshot.tileExtractMs} " +
+                    "tileCopyMs=${snapshot.tileCopyMs} saveMs=${snapshot.saveMs} totalMs=${snapshot.totalMs}"
+            )
+        }
     }
 }
 
