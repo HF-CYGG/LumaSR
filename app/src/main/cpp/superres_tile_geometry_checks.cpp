@@ -142,6 +142,67 @@ static_assert(resolve_tile_output_crop(1098, 1024, 36) == 36);
 static_assert(resolve_tile_output_crop(1024, 1024, 36) == 0);
 static_assert(resolve_tile_output_crop(1030, 1024, 36) == 6);
 static_assert(resolve_tile_output_crop(1000, 1024, 36) == -1);
+static_assert(realcugan_4x_residual_source_coord(0, 16) == 0);
+static_assert(realcugan_4x_residual_source_coord(3, 16) == 0);
+static_assert(realcugan_4x_residual_source_coord(4, 16) == 1);
+static_assert(realcugan_4x_residual_source_coord(67, 16) == 15);
+
+constexpr CroppedCopyWindow kInteriorCropWindow = resolve_cropped_copy_window(
+    10,
+    20,
+    120,
+    200,
+    100,
+    80,
+    120,
+    200,
+    100,
+    80
+);
+
+static_assert(kInteriorCropWindow.valid);
+static_assert(kInteriorCropWindow.srcX == 10);
+static_assert(kInteriorCropWindow.srcY == 20);
+static_assert(kInteriorCropWindow.dstX == 0);
+static_assert(kInteriorCropWindow.dstY == 0);
+static_assert(kInteriorCropWindow.copyW == 100);
+static_assert(kInteriorCropWindow.copyH == 80);
+
+constexpr CroppedCopyWindow kPartialCropWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    64,
+    96,
+    120,
+    90,
+    100,
+    120,
+    100,
+    80
+);
+
+static_assert(kPartialCropWindow.valid);
+static_assert(kPartialCropWindow.srcX == 36);
+static_assert(kPartialCropWindow.srcY == 24);
+static_assert(kPartialCropWindow.dstX == 0);
+static_assert(kPartialCropWindow.dstY == 0);
+static_assert(kPartialCropWindow.copyW == 84);
+static_assert(kPartialCropWindow.copyH == 66);
+
+constexpr CroppedCopyWindow kOutsideCropWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    0,
+    0,
+    20,
+    20,
+    100,
+    100,
+    40,
+    40
+);
+
+static_assert(!kOutsideCropWindow.valid);
 static_assert(should_retry_cpu_after_gpu_code(0, 8));
 static_assert(should_retry_cpu_after_gpu_code(0, 9));
 static_assert(!should_retry_cpu_after_gpu_code(1, 9));

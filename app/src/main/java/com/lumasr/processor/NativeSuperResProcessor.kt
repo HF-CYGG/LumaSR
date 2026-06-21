@@ -1,5 +1,6 @@
 package com.lumasr.processor
 
+import android.graphics.Bitmap
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.NativePerformanceSnapshot
@@ -92,6 +93,14 @@ interface NativeProcessBridge {
     ): NativeProcessCode
 }
 
+interface NativeBitmapRegionBridge {
+    fun processBitmapRegion(
+        request: NativeProcessRequest,
+        bitmap: Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit
+    ): NativeProcessCode
+}
+
 interface NativeCacheOwner {
     fun clearNativeCache()
 }
@@ -105,7 +114,15 @@ interface NativeRawTileMerger {
     ): NativeProcessCode
 }
 
-object JniNativeProcessBridge : NativeProcessBridge {
+interface NativeBitmapRegionProcessor {
+    suspend fun processBitmapRegion(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult
+}
+
+object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
     override fun process(
         request: NativeProcessRequest,
         onProgress: (NativeProgressEvent) -> Unit
@@ -161,6 +178,37 @@ object JniNativeProcessBridge : NativeProcessBridge {
         )
     }
 
+    override fun processBitmapRegion(
+        request: NativeProcessRequest,
+        bitmap: Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit
+    ): NativeProcessCode {
+        return NativeProcessCode.fromRawCode(
+            processBitmapRegionNative(
+                taskId = request.taskId,
+                bitmap = bitmap,
+                outputPath = request.outputPath,
+                engineType = request.engineType,
+                modelDir = request.modelDir,
+                modelFileBase = request.modelFileBase.orEmpty(),
+                scale = request.scale,
+                noise = request.noise,
+                tileSize = request.tileSize,
+                gpuHeadroomPercent = request.gpuHeadroomPercent,
+                accelerationMode = request.accelerationMode,
+                tta = request.tta,
+                outputMode = request.outputMode,
+                outputCropLeft = request.outputCropLeft,
+                outputCropTop = request.outputCropTop,
+                outputCropWidth = request.outputCropWidth,
+                outputCropHeight = request.outputCropHeight,
+                retryCount = request.retryCount,
+                regionIndex = request.regionIndex,
+                progressSink = NativeProgressSink(onProgress)
+            )
+        )
+    }
+
     private external fun processNative(
         taskId: String,
         inputPath: String,
@@ -194,6 +242,29 @@ object JniNativeProcessBridge : NativeProcessBridge {
         outputHeight: Int,
         tilePaths: Array<String>,
         tileRects: IntArray
+    ): Int
+
+    private external fun processBitmapRegionNative(
+        taskId: String,
+        bitmap: Bitmap?,
+        outputPath: String,
+        engineType: Int,
+        modelDir: String,
+        modelFileBase: String,
+        scale: Int,
+        noise: Int,
+        tileSize: Int,
+        gpuHeadroomPercent: Int,
+        accelerationMode: Int,
+        tta: Boolean,
+        outputMode: Int,
+        outputCropLeft: Int,
+        outputCropTop: Int,
+        outputCropWidth: Int,
+        outputCropHeight: Int,
+        retryCount: Int,
+        regionIndex: Int,
+        progressSink: NativeProgressSink
     ): Int
 }
 
@@ -261,7 +332,7 @@ class NativeSuperResProcessor(
     isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
     private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit = ::logPerformance
-) : SuperResProcessor, NativeCacheOwner, NativeRawTileMerger {
+) : SuperResProcessor, NativeCacheOwner, NativeRawTileMerger, NativeBitmapRegionProcessor {
     private val isNativeAvailable = isAvailable
 
     override suspend fun process(
@@ -280,31 +351,50 @@ class NativeSuperResProcessor(
 
         onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native inference", 0f))
         onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
-        val request = NativeProcessRequest(
-            taskId = params.taskId,
-            inputPath = params.inputPath,
-            outputPath = params.outputPath,
-            engineType = params.engine.nativeCode,
-            modelDir = params.modelDir,
-            modelFileBase = params.modelFileBase,
-            scale = params.scale,
-            noise = params.noise,
-            tileSize = params.tileSize,
-            gpuHeadroomPercent = params.gpuHeadroomPercent,
-            accelerationMode = params.accelerationMode.ordinal,
-            tta = params.tta,
-            outputMode = params.outputMode.ordinal,
-            outputCropLeft = params.outputCropLeft,
-            outputCropTop = params.outputCropTop,
-            outputCropWidth = params.outputCropWidth,
-            outputCropHeight = params.outputCropHeight,
-            retryCount = params.retryCount,
-            regionIndex = params.regionIndex
-        )
+        val request = params.toNativeRequest()
         // Native ncnn/Vulkan execution can monopolize a thread, so it must never run on Main.
         val code = withContext(inferenceDispatcher) {
             bridge.process(
                 request = request,
+                onProgress = { event ->
+                    event.performanceSnapshot?.let { performanceLogger(params, it) }
+                    onProgress(params.progress(event))
+                }
+            )
+        }
+        return code.toResult(params, onProgress)
+    }
+
+    override suspend fun processBitmapRegion(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        if (!isNativeAvailable()) {
+            return UpscaleResult(
+                taskId = params.taskId,
+                stage = UpscaleStage.FAILED,
+                outputPath = null,
+                success = false,
+                message = UpscaleErrorMapper.userMessage(UpscaleErrorCode.NATIVE_UNAVAILABLE)
+            )
+        }
+        val regionBridge = bridge as? NativeBitmapRegionBridge
+            ?: return UpscaleResult(
+                taskId = params.taskId,
+                stage = UpscaleStage.FAILED,
+                outputPath = null,
+                success = false,
+                message = UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
+            )
+
+        onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native region inference", 0f))
+        onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
+        val request = params.toNativeRequest()
+        val code = withContext(inferenceDispatcher) {
+            regionBridge.processBitmapRegion(
+                request = request,
+                bitmap = bitmap,
                 onProgress = { event ->
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
@@ -370,7 +460,11 @@ class NativeSuperResProcessor(
             onProgress(params.progress(UpscaleStage.CANCELLED, UpscaleErrorMapper.userMessage(UpscaleErrorCode.CANCELLED), 0f))
             return UpscaleResult(params.taskId, UpscaleStage.CANCELLED, null, false, UpscaleErrorMapper.userMessage(UpscaleErrorCode.CANCELLED))
         }
-        val message = UpscaleErrorMapper.userMessage(toErrorCode())
+        val message = if (this == NativeProcessCode.MODEL_MISSING) {
+            params.modelMissingMessage()
+        } else {
+            UpscaleErrorMapper.userMessage(toErrorCode())
+        }
         onProgress(params.progress(UpscaleStage.FAILED, message, 0f))
         return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, message)
     }
@@ -388,6 +482,25 @@ class NativeSuperResProcessor(
             NativeProcessCode.VULKAN_FAILED -> UpscaleErrorCode.VULKAN_RUNTIME_FAILED
             NativeProcessCode.TILE_OUTPUT_MISMATCH -> UpscaleErrorCode.TILE_OUTPUT_MISMATCH
         }
+    }
+
+    private fun UpscaleParams.modelMissingMessage(): String {
+        val files = runCatching {
+            NativeModelFileSelector.select(
+                engine = engine,
+                modelDir = modelDir,
+                scale = scale,
+                noise = noise,
+                modelFileBase = modelFileBase
+            )
+        }.getOrNull()
+        val expected = if (files == null) {
+            "unknown native model files"
+        } else {
+            "${files.paramPath}, ${files.binPath}"
+        }
+        return UpscaleErrorMapper.userMessage(UpscaleErrorCode.MODEL_NOT_FOUND) +
+            " Expected: $expected; scale=$scale noise=$noise modelDir=$modelDir"
     }
 
     companion object {
@@ -412,6 +525,28 @@ class NativeSuperResProcessor(
         }
     }
 }
+
+private fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
+    taskId = taskId,
+    inputPath = inputPath,
+    outputPath = outputPath,
+    engineType = engine.nativeCode,
+    modelDir = modelDir,
+    modelFileBase = modelFileBase,
+    scale = scale,
+    noise = noise,
+    tileSize = tileSize,
+    gpuHeadroomPercent = gpuHeadroomPercent,
+    accelerationMode = accelerationMode.ordinal,
+    tta = tta,
+    outputMode = outputMode.ordinal,
+    outputCropLeft = outputCropLeft,
+    outputCropTop = outputCropTop,
+    outputCropWidth = outputCropWidth,
+    outputCropHeight = outputCropHeight,
+    retryCount = retryCount,
+    regionIndex = regionIndex
+)
 
 internal val SuperResEngine.nativeCode: Int
     get() = when (this) {

@@ -1,6 +1,8 @@
 package com.lumasr.processor
 
+import android.graphics.Bitmap
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.ExportMode
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.SuperResEngine
@@ -13,9 +15,15 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 
 class HybridSuperResProcessorTest {
+    @get:Rule
+    val temporaryFolder = TemporaryFolder()
+
     @Test
     fun nativeUnavailableFailsByDefaultInsteadOfMockingSuccess() = runBlocking {
         val processor = HybridSuperResProcessor(
@@ -159,6 +167,68 @@ class HybridSuperResProcessorTest {
     }
 
     @Test
+    fun extremeExportUsesBitmapRegionProcessorWithoutCreatingRegionInputFile() = runBlocking {
+        val outputDir = temporaryFolder.newFolder("extreme-output")
+        val nativeProcessor = RecordingBitmapRegionProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true },
+            supportedAbisProvider = { listOf("arm64-v8a") },
+            regionSourceFactory = ExtremeRegionSourceFactory {
+                FakeExtremeRegionSource(width = 256, height = 128)
+            }
+        )
+
+        val result = processor.process(
+            defaultParams().copy(
+                taskId = "extreme-task",
+                inputPath = "input-does-not-need-to-exist.png",
+                outputPath = File(outputDir, "output.png").absolutePath,
+                exportMode = ExportMode.EXTREME_SINGLE_PNG
+            )
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(1, nativeProcessor.bitmapRegionCalls.size)
+        assertEquals(0, nativeProcessor.pathProcessCallCount)
+        assertTrue(outputDir.listFiles().orEmpty().none { it.name.contains("_extreme_region_") })
+    }
+
+    @Test
+    fun extremeExportExpandsNativeScalePlanBeforeBitmapRegionInference() = runBlocking {
+        val outputDir = temporaryFolder.newFolder("extreme-output-chain")
+        val nativeProcessor = RecordingBitmapRegionProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true },
+            supportedAbisProvider = { listOf("arm64-v8a") },
+            regionSourceFactory = ExtremeRegionSourceFactory {
+                FakeExtremeRegionSource(width = 256, height = 128)
+            }
+        )
+
+        val result = processor.process(
+            defaultParams().copy(
+                taskId = "extreme-task",
+                inputPath = "input-does-not-need-to-exist.png",
+                outputPath = File(outputDir, "output.png").absolutePath,
+                exportMode = ExportMode.EXTREME_SINGLE_PNG,
+                scale = 8,
+                modelScales = listOf(2, 4)
+            )
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(1, nativeProcessor.bitmapRegionCalls.size)
+        assertEquals(1, nativeProcessor.pathProcessCallCount)
+        assertEquals(4, nativeProcessor.bitmapRegionCalls.single().scale)
+        assertEquals(NativeOutputMode.PNG_IMAGE, nativeProcessor.bitmapRegionCalls.single().outputMode)
+        assertEquals(2, nativeProcessor.pathProcessCalls.single().scale)
+        assertEquals(NativeOutputMode.RAW_CROPPED_RGB_TILE, nativeProcessor.pathProcessCalls.single().outputMode)
+        assertTrue(outputDir.listFiles().orEmpty().none { it.name.contains("_extreme_region_") })
+    }
+
+    @Test
     fun cancelClearsNativeCacheWhenNativeProcessorOwnsCache() {
         val nativeProcessor = RecordingCacheProcessor()
         val processor = HybridSuperResProcessor(
@@ -243,4 +313,47 @@ private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
     override fun clearNativeCache() {
         clearCacheCount += 1
     }
+}
+
+private class RecordingBitmapRegionProcessor : SuperResProcessor, NativeBitmapRegionProcessor, NativeRawTileMerger {
+    val bitmapRegionCalls = mutableListOf<UpscaleParams>()
+    val pathProcessCalls = mutableListOf<UpscaleParams>()
+    var pathProcessCallCount = 0
+        private set
+
+    override suspend fun process(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        pathProcessCallCount += 1
+        pathProcessCalls += params
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
+    }
+
+    override suspend fun processBitmapRegion(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        bitmapRegionCalls += params
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
+    }
+
+    override fun mergeRawTilesToPng(
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        tiles: List<NativeRawTile>
+    ): NativeProcessCode = NativeProcessCode.OK
+
+    override fun cancel(taskId: String) = Unit
+}
+
+private class FakeExtremeRegionSource(
+    override val width: Int,
+    override val height: Int
+) : ExtremeRegionSource {
+    override fun decode(tile: com.lumasr.domain.ExtremeExportTileSpec): Bitmap? = null
+
+    override fun close() = Unit
 }

@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.lumasr.BuildConfig
 import com.lumasr.data.GalleryRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ModelAssetRepository
@@ -26,6 +27,7 @@ import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingResourceProfile
+import com.lumasr.domain.ProcessingFailureDiagnostics
 import com.lumasr.domain.ResourceBudgetPolicy
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
@@ -401,6 +403,11 @@ class LumaViewModel(
                 lastResultMessage = result.message
                 lastStage = result.stage
                 lastSuccess = result.success
+                ProcessingFailureDiagnostics.throwIfEnabled(
+                    enabled = BuildConfig.LUMASR_CRASH_ON_PROCESSING_FAILURE,
+                    params = params,
+                    result = result
+                )
 
                 if (result.success) {
                     completedResults += RenderResultInfo(

@@ -27,7 +27,9 @@ class NativeSuperResProcessorTest {
 
         assertFalse(result.success)
         assertEquals(UpscaleStage.FAILED, result.stage)
-        assertEquals("The selected model files are missing.", result.message)
+        assertTrue(result.message.contains("The selected model files are missing."))
+        assertTrue(result.message.contains("cache/models/waifu2x-cunet/noise1_scale2.0x_model.param"))
+        assertTrue(result.message.contains("cache/models/waifu2x-cunet/noise1_scale2.0x_model.bin"))
     }
 
     @Test
@@ -267,6 +269,40 @@ class NativeSuperResProcessorTest {
     }
 
     @Test
+    fun forwardsBitmapRegionRequestToNativeBridge() = runBlocking {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        val result = processor.processBitmapRegion(
+            defaultParams().copy(
+                outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
+                outputPath = "cache/tile.rgb",
+                outputCropLeft = 64,
+                outputCropTop = 96,
+                outputCropWidth = 512,
+                outputCropHeight = 384,
+                regionIndex = 5,
+                retryCount = 2
+            ),
+            bitmap = null
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(1, bridge.bitmapRegionCallCount)
+        assertEquals("cache/tile.rgb", bridge.lastBitmapRegionRequest?.outputPath)
+        assertEquals(NativeOutputMode.RAW_CROPPED_RGB_TILE.ordinal, bridge.lastBitmapRegionRequest?.outputMode)
+        assertEquals(64, bridge.lastBitmapRegionRequest?.outputCropLeft)
+        assertEquals(96, bridge.lastBitmapRegionRequest?.outputCropTop)
+        assertEquals(512, bridge.lastBitmapRegionRequest?.outputCropWidth)
+        assertEquals(384, bridge.lastBitmapRegionRequest?.outputCropHeight)
+        assertEquals(5, bridge.lastBitmapRegionRequest?.regionIndex)
+        assertEquals(2, bridge.lastBitmapRegionRequest?.retryCount)
+    }
+
+    @Test
     fun mergeRawTilesToPngForwardsToBridge() {
         val bridge = FakeNativeBridge(NativeProcessCode.OK)
         val processor = NativeSuperResProcessor(
@@ -312,7 +348,7 @@ class NativeSuperResProcessorTest {
 private class FakeNativeBridge(
     private val code: NativeProcessCode,
     private val progressEvents: List<NativeProgressEvent> = emptyList()
-) : NativeProcessBridge {
+) : NativeProcessBridge, NativeBitmapRegionBridge {
     var callCount = 0
         private set
     var lastRequest: NativeProcessRequest? = null
@@ -329,6 +365,10 @@ private class FakeNativeBridge(
     var lastMergeOutputHeight: Int? = null
         private set
     var lastMergeTiles: List<NativeRawTile>? = null
+        private set
+    var bitmapRegionCallCount = 0
+        private set
+    var lastBitmapRegionRequest: NativeProcessRequest? = null
         private set
 
     override fun process(
@@ -360,6 +400,17 @@ private class FakeNativeBridge(
         lastMergeOutputWidth = outputWidth
         lastMergeOutputHeight = outputHeight
         lastMergeTiles = tiles
+        return code
+    }
+
+    override fun processBitmapRegion(
+        request: NativeProcessRequest,
+        bitmap: android.graphics.Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit
+    ): NativeProcessCode {
+        bitmapRegionCallCount += 1
+        lastBitmapRegionRequest = request
+        progressEvents.forEach(onProgress)
         return code
     }
 }

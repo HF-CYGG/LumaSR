@@ -13,6 +13,16 @@ struct TileInputRegion {
     int copyH;
 };
 
+struct CroppedCopyWindow {
+    bool valid;
+    int srcX;
+    int srcY;
+    int dstX;
+    int dstY;
+    int copyW;
+    int copyH;
+};
+
 constexpr long long kMaxOutputPixels = 64000000LL;
 constexpr int kMaxIntDimension = 2147483647;
 
@@ -88,6 +98,61 @@ constexpr int resolve_tile_output_crop(int outputSize, int copySize, int preferr
     }
     const int maxCrop = outputSize - copySize;
     return preferredCrop < maxCrop ? preferredCrop : maxCrop;
+}
+
+constexpr int max_int(int left, int right) {
+    return left > right ? left : right;
+}
+
+constexpr int min_int(int left, int right) {
+    return left < right ? left : right;
+}
+
+constexpr int realcugan_4x_residual_source_coord(int outputCoord, int inputSize) {
+    if (inputSize <= 0) {
+        return 0;
+    }
+    const int sourceCoord = outputCoord / 4;
+    return min_int(max_int(sourceCoord, 0), inputSize - 1);
+}
+
+constexpr CroppedCopyWindow resolve_cropped_copy_window(
+    int srcX,
+    int srcY,
+    int dstX,
+    int dstY,
+    int copyW,
+    int copyH,
+    int cropLeft,
+    int cropTop,
+    int cropWidth,
+    int cropHeight
+) {
+    if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0 ||
+        copyW <= 0 || copyH <= 0 ||
+        cropLeft < 0 || cropTop < 0 || cropWidth <= 0 || cropHeight <= 0) {
+        return CroppedCopyWindow{false, 0, 0, 0, 0, 0, 0};
+    }
+    const int copyRight = dstX + copyW;
+    const int copyBottom = dstY + copyH;
+    const int cropRight = cropLeft + cropWidth;
+    const int cropBottom = cropTop + cropHeight;
+    const int intersectionLeft = max_int(dstX, cropLeft);
+    const int intersectionTop = max_int(dstY, cropTop);
+    const int intersectionRight = min_int(copyRight, cropRight);
+    const int intersectionBottom = min_int(copyBottom, cropBottom);
+    if (intersectionLeft >= intersectionRight || intersectionTop >= intersectionBottom) {
+        return CroppedCopyWindow{false, 0, 0, 0, 0, 0, 0};
+    }
+    return CroppedCopyWindow{
+        true,
+        srcX + intersectionLeft - dstX,
+        srcY + intersectionTop - dstY,
+        intersectionLeft - cropLeft,
+        intersectionTop - cropTop,
+        intersectionRight - intersectionLeft,
+        intersectionBottom - intersectionTop
+    };
 }
 
 constexpr bool should_retry_cpu_after_gpu_code(int accelerationMode, int nativeCode) {

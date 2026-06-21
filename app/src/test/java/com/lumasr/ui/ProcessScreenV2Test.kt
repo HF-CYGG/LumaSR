@@ -1,6 +1,7 @@
 package com.lumasr.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -64,6 +65,14 @@ class ProcessScreenV2Test {
 
         assertEquals("oversized output", second.resultMessage)
         assertTrue(second.resultMessageEventId > first.resultMessageEventId)
+    }
+
+    @Test
+    fun doesNotReplayConsumedTopNoticeEventAfterRouteReturn() {
+        assertTrue(shouldShowTopNoticeEvent("Saved to Pictures/LocalSR", eventId = 1L, consumedEventId = null))
+        assertFalse(shouldShowTopNoticeEvent("Saved to Pictures/LocalSR", eventId = 1L, consumedEventId = 1L))
+        assertTrue(shouldShowTopNoticeEvent("Saved to Pictures/LocalSR", eventId = 2L, consumedEventId = 1L))
+        assertFalse(shouldShowTopNoticeEvent(null, eventId = 2L, consumedEventId = 1L))
     }
 
     @Test

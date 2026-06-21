@@ -5,7 +5,6 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Rect
 import android.os.Build
-import android.os.SystemClock
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
@@ -27,12 +26,25 @@ import com.lumasr.domain.extremeGpuKey
 import com.lumasr.domain.nativeScalePlanFor
 import java.io.BufferedOutputStream
 import java.io.File
+import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withContext
+
+fun interface ExtremeRegionSourceFactory {
+    fun open(path: String): ExtremeRegionSource?
+}
+
+interface ExtremeRegionSource : AutoCloseable {
+    val width: Int
+    val height: Int
+
+    fun decode(tile: ExtremeExportTileSpec): Bitmap?
+
+    override fun close()
+}
 
 class HybridSuperResProcessor(
     private val nativeProcessor: SuperResProcessor = NativeSuperResProcessor(),
@@ -41,6 +53,7 @@ class HybridSuperResProcessor(
     private val allowMockFallback: Boolean = false,
     private val supportedAbisProvider: () -> List<String> = { Build.SUPPORTED_ABIS.toList() },
     private val gpuHealthProbe: NativeGpuHealthProbe = NativeGpuHealthProbe { true },
+    private val regionSourceFactory: ExtremeRegionSourceFactory = AndroidExtremeRegionSourceFactory,
     private val onExtremeGpuDisabled: (String) -> Unit = {}
 ) : SuperResProcessor, NativeCacheOwner {
     private val sessionDisabledExtremeGpuKeys = mutableSetOf<String>()
@@ -180,7 +193,7 @@ class HybridSuperResProcessor(
     ): UpscaleResult {
         val merger = nativeProcessor as? NativeRawTileMerger
             ?: return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Native PNG merger is unavailable.")
-        val inputBounds = decodeBounds(params.inputPath)
+        val regionSource = regionSourceFactory.open(params.inputPath)
             ?: return UpscaleResult(
                 params.taskId,
                 UpscaleStage.FAILED,
@@ -189,15 +202,15 @@ class HybridSuperResProcessor(
                 UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
             )
         val plan = ExtremeExportPlanner.plan(
-            imageWidth = inputBounds.first,
-            imageHeight = inputBounds.second,
+            imageWidth = regionSource.width,
+            imageHeight = regionSource.height,
             scale = params.scale,
             engine = params.engine
         )
         val taskDir = File(params.outputPath).parentFile ?: File(params.outputPath).absoluteFile.parentFile
         val tempFiles = mutableListOf<File>()
         val rawTiles = mutableListOf<NativeRawTile>()
-        val resourceProfile = ProcessingResourceProfile(inputBounds.first, inputBounds.second)
+        val resourceProfile = ProcessingResourceProfile(regionSource.width, regionSource.height)
         val accelerationDecision = ExtremeAccelerationPolicy.decide(
             params = params,
             supportedAbis = supportedAbisProvider(),
@@ -214,87 +227,49 @@ class HybridSuperResProcessor(
         }
 
         onProgress(params.progress(UpscaleStage.ANALYZING, "Planning extreme tiled export", 0.02f))
-        val decoderInput = File(params.inputPath).inputStream()
-        val decoder = BitmapRegionDecoder.newInstance(decoderInput, false) ?: run {
-            decoderInput.close()
-            return UpscaleResult(
-                params.taskId,
-                UpscaleStage.FAILED,
-                null,
-                false,
-                UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
-            )
-        }
-
-        return coroutineScope {
-            val regionFiles = jobs.indices.map { index ->
-                File(taskDir, "${params.taskId}_extreme_region_$index.ppm")
-            }
-            val rawFiles = jobs.indices.map { index ->
-                File(taskDir, "${params.taskId}_extreme_tile_$index.rgb")
-            }
-            tempFiles += regionFiles
-            tempFiles += rawFiles
-
-            fun startRegionPrepare(index: Int): Deferred<File> = async(Dispatchers.IO) {
-                val regionFile = regionFiles[index]
-                if (!writeRegionPpm(decoder, jobs[index].tileSpec, regionFile)) {
-                    error("Cannot prepare extreme export region ${index + 1}/${jobs.size}")
-                }
-                regionFile
-            }
-
-            var pendingRegion: Deferred<File>? = startRegionPrepare(0)
-            try {
+        val bitmapRegionProcessor = nativeProcessor as? NativeBitmapRegionProcessor
+        try {
+            if (bitmapRegionProcessor != null) {
                 jobs.forEachIndexed { index, scheduledJob ->
                     var job = scheduledJob
                     val tile = job.tileSpec
-                    val regionInput = runCatching {
-                        pendingRegion?.await() ?: error("Missing prepared extreme region")
-                    }.getOrElse {
-                        return@coroutineScope UpscaleResult(
-                            params.taskId,
-                            UpscaleStage.FAILED,
-                            null,
-                            false,
-                            UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
-                        )
-                    }
-                    pendingRegion = if (index + 1 < jobs.size) {
-                        startRegionPrepare(index + 1)
-                    } else {
-                        null
-                    }
-
-                    val rawOutput = rawFiles[index]
+                    val regionInput = File(taskDir, "${params.taskId}_extreme_region_$index.ppm")
+                    val rawOutput = File(taskDir, "${params.taskId}_extreme_tile_$index.rgb")
+                    tempFiles += rawOutput
                     var tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
                     tempFiles += tileParams.pipelinePasses.dropLast(1).map { File(it.outputPath) }
-                    var result = if (tileParams.pipelinePasses.isNotEmpty()) {
-                        processExplicitPipeline(tileParams) { progress ->
-                            onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
+                    var regionBitmap: Bitmap? = null
+                    try {
+                        regionBitmap = regionSource.decode(tile)
+                        var result = processExtremeTile(
+                            tileParams = tileParams,
+                            regionBitmap = regionBitmap,
+                            bitmapRegionProcessor = bitmapRegionProcessor,
+                            tileIndex = index,
+                            tileCount = jobs.size,
+                            retryCount = job.attempt,
+                            onProgress = onProgress
+                        )
+                        if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
+                            disableExtremeGpuForSession(params.extremeGpuKey())
+                            rawOutput.delete()
+                            job = job.asCpuRetry()
+                            tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
+                            result = processExtremeTile(
+                                tileParams = tileParams,
+                                regionBitmap = regionBitmap,
+                                bitmapRegionProcessor = bitmapRegionProcessor,
+                                tileIndex = index,
+                                tileCount = jobs.size,
+                                retryCount = job.attempt,
+                                onProgress = onProgress
+                            )
                         }
-                    } else {
-                        processSingleOrChainedPass(tileParams) { progress ->
-                            onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
+                        if (!result.success) {
+                            return result.copy(taskId = params.taskId)
                         }
-                    }
-                    if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
-                        disableExtremeGpuForSession(params.extremeGpuKey())
-                        rawOutput.delete()
-                        job = job.asCpuRetry()
-                        tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
-                        result = if (tileParams.pipelinePasses.isNotEmpty()) {
-                            processExplicitPipeline(tileParams) { progress ->
-                                onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
-                            }
-                        } else {
-                            processSingleOrChainedPass(tileParams) { progress ->
-                                onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
-                            }
-                        }
-                    }
-                    if (!result.success) {
-                        return@coroutineScope result.copy(taskId = params.taskId)
+                    } finally {
+                        regionBitmap?.recycle()
                     }
                     rawTiles += NativeRawTile(
                         path = rawOutput.absolutePath,
@@ -303,50 +278,273 @@ class HybridSuperResProcessor(
                         width = tile.outputW,
                         height = tile.outputH
                     )
-                    regionInput.delete()
                 }
+            } else {
+                val fallbackResult = coroutineScope {
+                    val regionFiles = jobs.indices.map { index ->
+                        File(taskDir, "${params.taskId}_extreme_region_$index.ppm")
+                    }
+                    val rawFiles = jobs.indices.map { index ->
+                        File(taskDir, "${params.taskId}_extreme_tile_$index.rgb")
+                    }
+                    tempFiles += regionFiles
+                    tempFiles += rawFiles
 
-                onProgress(params.progress(UpscaleStage.SAVING, "Streaming PNG output", 0.96f))
-                val mergeStartMs = SystemClock.elapsedRealtime()
-                val mergeCode = merger.mergeRawTilesToPng(
-                    outputPath = params.outputPath,
-                    outputWidth = plan.outputWidth,
-                    outputHeight = plan.outputHeight,
-                    tiles = rawTiles
-                )
-                val mergeMs = SystemClock.elapsedRealtime() - mergeStartMs
+                    fun startRegionPrepare(index: Int): Deferred<File> = async(Dispatchers.IO) {
+                        val regionFile = regionFiles[index]
+                        if (!writeRegionPpm(regionSource, jobs[index].tileSpec, regionFile)) {
+                            error("Cannot prepare extreme export region ${index + 1}/${jobs.size}")
+                        }
+                        regionFile
+                    }
+
+                    var pendingRegion: Deferred<File>? = startRegionPrepare(0)
+                    try {
+                        jobs.forEachIndexed { index, scheduledJob ->
+                            var job = scheduledJob
+                            val tile = job.tileSpec
+                            val regionInput = runCatching {
+                                pendingRegion?.await() ?: error("Missing prepared extreme region")
+                            }.getOrElse {
+                                return@coroutineScope UpscaleResult(
+                                    params.taskId,
+                                    UpscaleStage.FAILED,
+                                    null,
+                                    false,
+                                    UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
+                                )
+                            }
+                            pendingRegion = if (index + 1 < jobs.size) {
+                                startRegionPrepare(index + 1)
+                            } else {
+                                null
+                            }
+
+                            val rawOutput = rawFiles[index]
+                            var tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
+                            tempFiles += tileParams.pipelinePasses.dropLast(1).map { File(it.outputPath) }
+                            var result = processExtremeTile(
+                                tileParams = tileParams,
+                                regionBitmap = null,
+                                bitmapRegionProcessor = null,
+                                tileIndex = index,
+                                tileCount = jobs.size,
+                                retryCount = job.attempt,
+                                onProgress = onProgress
+                            )
+                            if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
+                                disableExtremeGpuForSession(params.extremeGpuKey())
+                                rawOutput.delete()
+                                job = job.asCpuRetry()
+                                tileParams = params.forExtremeTile(regionInput.absolutePath, rawOutput.absolutePath, tile, job.accelerationMode, job.attempt)
+                                result = processExtremeTile(
+                                    tileParams = tileParams,
+                                    regionBitmap = null,
+                                    bitmapRegionProcessor = null,
+                                    tileIndex = index,
+                                    tileCount = jobs.size,
+                                    retryCount = job.attempt,
+                                    onProgress = onProgress
+                                )
+                            }
+                            if (!result.success) {
+                                return@coroutineScope result.copy(taskId = params.taskId)
+                            }
+                            rawTiles += NativeRawTile(
+                                path = rawOutput.absolutePath,
+                                x = tile.outputX,
+                                y = tile.outputY,
+                                width = tile.outputW,
+                                height = tile.outputH
+                            )
+                            regionInput.delete()
+                        }
+                        null
+                    } finally {
+                        pendingRegion?.cancel()
+                    }
+                }
+                if (fallbackResult != null) {
+                    return fallbackResult
+                }
+            }
+
+            onProgress(params.progress(UpscaleStage.SAVING, "Streaming PNG output", 0.96f))
+            val mergeStartNs = System.nanoTime()
+            val mergeCode = merger.mergeRawTilesToPng(
+                outputPath = params.outputPath,
+                outputWidth = plan.outputWidth,
+                outputHeight = plan.outputHeight,
+                tiles = rawTiles
+            )
+            val mergeMs = (System.nanoTime() - mergeStartNs) / 1_000_000L
+            runCatching {
                 Log.i(
                     LOG_TAG,
                     "task=${params.taskId} extremeMergeMs=$mergeMs output=${plan.outputWidth}x${plan.outputHeight} tiles=${rawTiles.size}"
                 )
-                if (mergeCode == NativeProcessCode.OK) {
-                    onProgress(params.progress(UpscaleStage.DONE, "Extreme export complete", 1f))
-                    UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "Extreme export complete")
-                } else {
-                    UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Extreme PNG merge failed.")
-                }
-            } finally {
-                pendingRegion?.cancel()
-                decoder.recycle()
-                decoderInput.close()
-                tempFiles.forEach { it.delete() }
+            }
+            return if (mergeCode == NativeProcessCode.OK) {
+                onProgress(params.progress(UpscaleStage.DONE, "Extreme export complete", 1f))
+                UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "Extreme export complete")
+            } else {
+                UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Extreme PNG merge failed.")
+            }
+        } finally {
+            regionSource.close()
+            tempFiles.forEach { it.delete() }
+        }
+    }
+
+    private suspend fun processExtremeTile(
+        tileParams: UpscaleParams,
+        regionBitmap: Bitmap?,
+        bitmapRegionProcessor: NativeBitmapRegionProcessor?,
+        tileIndex: Int,
+        tileCount: Int,
+        retryCount: Int,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        if (bitmapRegionProcessor != null && tileParams.pipelinePasses.isEmpty()) {
+            return bitmapRegionProcessor.processBitmapRegion(tileParams, regionBitmap) { progress ->
+                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+            }
+        }
+        if (bitmapRegionProcessor != null && tileParams.pipelinePasses.isNotEmpty()) {
+            return processExplicitPipelineWithBitmapRegionFirstPass(
+                params = tileParams,
+                bitmap = regionBitmap,
+                bitmapRegionProcessor = bitmapRegionProcessor
+            ) { progress ->
+                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+            }
+        }
+        return if (tileParams.pipelinePasses.isNotEmpty()) {
+            processExplicitPipeline(tileParams) { progress ->
+                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+            }
+        } else {
+            processSingleOrChainedPass(tileParams) { progress ->
+                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
             }
         }
     }
 
-    private fun decodeBounds(path: String): Pair<Int, Int>? {
-        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(path, options)
-        return if (options.outWidth > 0 && options.outHeight > 0) options.outWidth to options.outHeight else null
+    private suspend fun processExplicitPipelineWithBitmapRegionFirstPass(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        bitmapRegionProcessor: NativeBitmapRegionProcessor,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        val passes = params.pipelinePasses
+        val firstPass = passes.firstOrNull() ?: return bitmapRegionProcessor.processBitmapRegion(params, bitmap, onProgress)
+
+        val firstResult = bitmapRegionProcessor.processBitmapRegion(firstPass, bitmap) { progress ->
+            onProgress(progress.asChainedProgress(0, passes.size))
+        }
+        if (!firstResult.success) {
+            return firstResult.copy(taskId = params.taskId)
+        }
+
+        passes.drop(1).forEachIndexed { index, pass ->
+            val result = processSingleOrChainedPass(pass) { progress ->
+                onProgress(progress.asChainedProgress(index + 1, passes.size))
+            }
+            if (!result.success) {
+                return result.copy(taskId = params.taskId)
+            }
+        }
+
+        val message = params.pipelineLabel ?: "Pipeline native inference complete"
+        onProgress(params.progress(UpscaleStage.DONE, message, 1f))
+        return UpscaleResult(
+            taskId = params.taskId,
+            stage = UpscaleStage.DONE,
+            outputPath = params.outputPath,
+            success = true,
+            message = message
+        )
     }
 
-    private fun writeRegionPpm(decoder: BitmapRegionDecoder, tile: ExtremeExportTileSpec, output: File): Boolean {
+    private fun UpscaleParams.buildNativeScalePipelinePasses(
+        regionInputPath: String,
+        rawOutputPath: String,
+        tile: ExtremeExportTileSpec,
+        accelerationMode: AccelerationMode,
+        retryCount: Int
+    ): List<UpscaleParams> {
+        val scalePlan = nativeScalePlan()
+        if (scalePlan.size <= 1) {
+            return emptyList()
+        }
+
+        val parent = File(rawOutputPath).parentFile
+        var currentInput = regionInputPath
+        return scalePlan.mapIndexed { index, passScale ->
+            val isLast = index == scalePlan.lastIndex
+            val outputPath = if (isLast) {
+                rawOutputPath
+            } else {
+                File(parent, "${taskId}_extreme_${tile.index}_scale_pass_$index.png").absolutePath
+            }
+            val pass = if (isLast) {
+                asFinalRaw(
+                    input = currentInput,
+                    output = outputPath,
+                    tile = tile,
+                    passScale = passScale,
+                    accelerationMode = accelerationMode,
+                    retryCount = retryCount
+                )
+            } else {
+                copy(
+                    inputPath = currentInput,
+                    outputPath = outputPath,
+                    scale = passScale,
+                    accelerationMode = accelerationMode,
+                    retryCount = retryCount,
+                    regionIndex = tile.index,
+                    exportMode = ExportMode.SAFE_IMAGE,
+                    outputMode = NativeOutputMode.PNG_IMAGE,
+                    outputCropLeft = 0,
+                    outputCropTop = 0,
+                    outputCropWidth = 0,
+                    outputCropHeight = 0,
+                    pipelinePasses = emptyList()
+                )
+            }
+            currentInput = outputPath
+            pass
+        }
+    }
+
+    private fun UpscaleParams.asFinalRaw(
+        input: String,
+        output: String,
+        tile: ExtremeExportTileSpec,
+        passScale: Int = scale,
+        accelerationMode: AccelerationMode,
+        retryCount: Int
+    ): UpscaleParams = copy(
+        inputPath = input,
+        outputPath = output,
+        scale = passScale,
+        accelerationMode = accelerationMode,
+        retryCount = retryCount,
+        regionIndex = tile.index,
+        exportMode = ExportMode.SAFE_IMAGE,
+        outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
+        outputCropLeft = tile.outputCropLeft,
+        outputCropTop = tile.outputCropTop,
+        outputCropWidth = tile.outputCropWidth,
+        outputCropHeight = tile.outputCropHeight,
+        pipelinePasses = emptyList()
+    )
+
+    private fun writeRegionPpm(regionSource: ExtremeRegionSource, tile: ExtremeExportTileSpec, output: File): Boolean {
         return runCatching {
             output.parentFile?.mkdirs()
-            val bitmap = decoder.decodeRegion(
-                Rect(tile.regionX, tile.regionY, tile.regionX + tile.regionW, tile.regionY + tile.regionH),
-                BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-            ) ?: return@runCatching false
+            val bitmap = regionSource.decode(tile) ?: return@runCatching false
             try {
                 val width = bitmap.width
                 val height = bitmap.height
@@ -387,23 +585,34 @@ class HybridSuperResProcessor(
         accelerationMode: AccelerationMode,
         retryCount: Int
     ): UpscaleParams {
-        fun UpscaleParams.asFinalRaw(input: String, output: String): UpscaleParams = copy(
-            inputPath = input,
-            outputPath = output,
-            accelerationMode = accelerationMode,
-            retryCount = retryCount,
-            regionIndex = tile.index,
-            exportMode = ExportMode.SAFE_IMAGE,
-            outputMode = NativeOutputMode.RAW_CROPPED_RGB_TILE,
-            outputCropLeft = tile.outputCropLeft,
-            outputCropTop = tile.outputCropTop,
-            outputCropWidth = tile.outputCropWidth,
-            outputCropHeight = tile.outputCropHeight,
-            pipelinePasses = emptyList()
-        )
-
         if (pipelinePasses.isEmpty()) {
-            return asFinalRaw(regionInputPath, rawOutputPath)
+            val scalePipelinePasses = buildNativeScalePipelinePasses(
+                regionInputPath = regionInputPath,
+                rawOutputPath = rawOutputPath,
+                tile = tile,
+                accelerationMode = accelerationMode,
+                retryCount = retryCount
+            )
+            if (scalePipelinePasses.isNotEmpty()) {
+                return scalePipelinePasses.last().copy(
+                    inputPath = regionInputPath,
+                    outputPath = rawOutputPath,
+                    scale = scale,
+                    accelerationMode = accelerationMode,
+                    retryCount = retryCount,
+                    regionIndex = tile.index,
+                    exportMode = ExportMode.SAFE_IMAGE,
+                    pipelinePasses = scalePipelinePasses,
+                    pipelineLabel = pipelineLabel
+                )
+            }
+            return asFinalRaw(
+                input = regionInputPath,
+                output = rawOutputPath,
+                tile = tile,
+                accelerationMode = accelerationMode,
+                retryCount = retryCount
+            )
         }
 
         val parent = File(rawOutputPath).parentFile
@@ -416,7 +625,13 @@ class HybridSuperResProcessor(
                 File(parent, "${taskId}_extreme_${tile.index}_pass_$index.png").absolutePath
             }
             val mappedPass = if (isLast) {
-                pass.asFinalRaw(currentInput, outputPath)
+                pass.asFinalRaw(
+                    input = currentInput,
+                    output = outputPath,
+                    tile = tile,
+                    accelerationMode = accelerationMode,
+                    retryCount = retryCount
+                )
             } else {
                 pass.copy(
                     inputPath = currentInput,
@@ -451,6 +666,41 @@ class HybridSuperResProcessor(
     private companion object {
         private const val LOG_TAG = "LumaSRPerformance"
         private const val REGION_IO_BUFFER_BYTES = 256 * 1024
+    }
+}
+
+private object AndroidExtremeRegionSourceFactory : ExtremeRegionSourceFactory {
+    override fun open(path: String): ExtremeRegionSource? {
+        return runCatching {
+            val input = File(path).inputStream()
+            val decoder = BitmapRegionDecoder.newInstance(input, false)
+            if (decoder == null) {
+                input.close()
+                null
+            } else {
+                AndroidExtremeRegionSource(input, decoder)
+            }
+        }.getOrNull()
+    }
+}
+
+private class AndroidExtremeRegionSource(
+    private val input: InputStream,
+    private val decoder: BitmapRegionDecoder
+) : ExtremeRegionSource {
+    override val width: Int = decoder.width
+    override val height: Int = decoder.height
+
+    override fun decode(tile: ExtremeExportTileSpec): Bitmap? {
+        return decoder.decodeRegion(
+            Rect(tile.regionX, tile.regionY, tile.regionX + tile.regionW, tile.regionY + tile.regionH),
+            BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        )
+    }
+
+    override fun close() {
+        decoder.recycle()
+        input.close()
     }
 }
 
