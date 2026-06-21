@@ -97,3 +97,9 @@ SuperResNativeCode merge_raw_tiles_to_png(
     int outputHeight,
     const std::vector<SuperResRawTile>& tiles
 );
+SuperResNativeCode merge_raw_tiles_to_png_streaming(
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    const std::vector<SuperResRawTile>& tiles
+);
