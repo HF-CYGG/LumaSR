@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,14 @@ using SuperResProgressCallback = std::function<void(
 
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress
+);
+SuperResNativeCode process_superres_rgb(
+    const SuperResNativeParams& params,
+    int width,
+    int height,
+    const unsigned char* rgb,
+    size_t rgbSize,
     const SuperResProgressCallback& onProgress
 );
 void cancel_superres(const std::string& taskId);

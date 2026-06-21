@@ -1,5 +1,7 @@
 #include "superres_engine.h"
 
+#include <android/bitmap.h>
+#include <cstdint>
 #include <jni.h>
 #include <string>
 #include <vector>
@@ -68,6 +70,54 @@ void emit_progress(
     );
     env->DeleteLocalRef(j_message);
 }
+
+bool bitmap_to_rgb(JNIEnv* env, jobject bitmap, std::vector<unsigned char>& rgb, int& width, int& height) {
+    if (bitmap == nullptr) {
+        return false;
+    }
+    AndroidBitmapInfo info{};
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.width <= 0 || info.height <= 0) {
+        return false;
+    }
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 &&
+        info.format != ANDROID_BITMAP_FORMAT_RGB_565) {
+        return false;
+    }
+
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    try {
+        width = static_cast<int>(info.width);
+        height = static_cast<int>(info.height);
+        rgb.resize(static_cast<size_t>(width) * height * 3);
+        for (int y = 0; y < height; ++y) {
+            const unsigned char* src = static_cast<const unsigned char*>(pixels) + static_cast<size_t>(y) * info.stride;
+            for (int x = 0; x < width; ++x) {
+                const size_t dst = (static_cast<size_t>(y) * width + x) * 3;
+                if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
+                    const unsigned char* px = src + static_cast<size_t>(x) * 4;
+                    rgb[dst] = px[0];
+                    rgb[dst + 1] = px[1];
+                    rgb[dst + 2] = px[2];
+                } else {
+                    const uint16_t value = reinterpret_cast<const uint16_t*>(src)[x];
+                    rgb[dst] = static_cast<unsigned char>(((value >> 11) & 0x1f) * 255 / 31);
+                    rgb[dst + 1] = static_cast<unsigned char>(((value >> 5) & 0x3f) * 255 / 63);
+                    rgb[dst + 2] = static_cast<unsigned char>((value & 0x1f) * 255 / 31);
+                }
+            }
+        }
+    } catch (...) {
+        ok = false;
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return ok;
+}
 }
 
 extern "C"
@@ -119,6 +169,79 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
     };
     return static_cast<jint>(process_superres(
         params,
+        [env, progress_sink](
+            SuperResNativeStage stage,
+            int current_tile,
+            int total_tiles,
+            float progress,
+            const std::string& message,
+            const SuperResNativePerformance& performance
+        ) {
+            emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
+        }
+    ));
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
+    JNIEnv* env,
+    jobject,
+    jstring task_id,
+    jobject bitmap,
+    jstring output_path,
+    jint engine_type,
+    jstring model_dir,
+    jstring model_file_base,
+    jint scale,
+    jint noise,
+    jint tile_size,
+    jint gpu_headroom_percent,
+    jint acceleration_mode,
+    jboolean tta,
+    jint output_mode,
+    jint output_crop_left,
+    jint output_crop_top,
+    jint output_crop_width,
+    jint output_crop_height,
+    jint retry_count,
+    jint region_index,
+    jobject progress_sink
+) {
+    std::vector<unsigned char> rgb;
+    int width = 0;
+    int height = 0;
+    if (!bitmap_to_rgb(env, bitmap, rgb, width, height)) {
+        return static_cast<jint>(SuperResNativeCode::InvalidParams);
+    }
+
+    SuperResNativeParams params{
+        to_string(env, task_id),
+        "",
+        to_string(env, output_path),
+        static_cast<int>(engine_type),
+        to_string(env, model_dir),
+        to_string(env, model_file_base),
+        static_cast<int>(scale),
+        static_cast<int>(noise),
+        static_cast<int>(tile_size),
+        static_cast<int>(gpu_headroom_percent),
+        static_cast<int>(acceleration_mode),
+        tta == JNI_TRUE,
+        static_cast<int>(output_mode),
+        static_cast<int>(output_crop_left),
+        static_cast<int>(output_crop_top),
+        static_cast<int>(output_crop_width),
+        static_cast<int>(output_crop_height),
+        static_cast<int>(retry_count),
+        static_cast<int>(region_index)
+    };
+    return static_cast<jint>(process_superres_rgb(
+        params,
+        width,
+        height,
+        rgb.data(),
+        rgb.size(),
         [env, progress_sink](
             SuperResNativeStage stage,
             int current_tile,

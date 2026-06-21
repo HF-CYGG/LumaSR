@@ -473,14 +473,21 @@ bool copy_output_tile(
     const ncnn::Mat& tile,
     std::vector<unsigned char>& output,
     long long& coveredPixels,
-    int outputW,
-    int outputH,
+    int bufferW,
+    int bufferH,
+    int fullOutputW,
+    int fullOutputH,
     int srcX,
     int srcY,
     int dstX,
     int dstY,
     int requestedCopyW,
     int requestedCopyH,
+    bool useCroppedOutput,
+    int cropLeft,
+    int cropTop,
+    int cropWidth,
+    int cropHeight,
     bool useOriginOutputWindow
 ) {
     if (tile.empty() || tile.elempack != 1 || tile.elembits() != 32 ||
@@ -500,42 +507,68 @@ bool copy_output_tile(
         requestedCopyW <= 0 || requestedCopyH <= 0 ||
         srcX + requestedCopyW > tile.w ||
         srcY + requestedCopyH > tile.h ||
-        dstX + requestedCopyW > outputW ||
-        dstY + requestedCopyH > outputH) {
+        dstX + requestedCopyW > fullOutputW ||
+        dstY + requestedCopyH > fullOutputH) {
+        return false;
+    }
+
+    CroppedCopyWindow window{
+        true,
+        srcX,
+        srcY,
+        dstX,
+        dstY,
+        requestedCopyW,
+        requestedCopyH
+    };
+    if (useCroppedOutput) {
+        window = resolve_cropped_copy_window(
+            srcX,
+            srcY,
+            dstX,
+            dstY,
+            requestedCopyW,
+            requestedCopyH,
+            cropLeft,
+            cropTop,
+            cropWidth,
+            cropHeight
+        );
+        if (!window.valid) {
+            return true;
+        }
+    }
+    if (window.dstX < 0 || window.dstY < 0 ||
+        window.copyW <= 0 || window.copyH <= 0 ||
+        window.dstX + window.copyW > bufferW ||
+        window.dstY + window.copyH > bufferH) {
         return false;
     }
 
     for (int c = 0; c < 3; ++c) {
         const ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < requestedCopyH; ++y) {
-            const float* row = channel.row(srcY + y);
-            for (int x = 0; x < requestedCopyW; ++x) {
-                const size_t offset = (static_cast<size_t>(dstY + y) * outputW + dstX + x) * 3 + c;
-                output[offset] = to_u8(clamp01(row[srcX + x]));
+        for (int y = 0; y < window.copyH; ++y) {
+            const float* row = channel.row(window.srcY + y);
+            for (int x = 0; x < window.copyW; ++x) {
+                const size_t offset = (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX + x) * 3 + c;
+                output[offset] = to_u8(clamp01(row[window.srcX + x]));
             }
         }
     }
-    coveredPixels += static_cast<long long>(requestedCopyW) * requestedCopyH;
+    coveredPixels += static_cast<long long>(window.copyW) * window.copyH;
     return true;
 }
 
 bool write_cropped_raw_rgb_tile(
     const std::string& outputPath,
     const std::vector<unsigned char>& output,
-    int outputW,
-    int outputH,
-    int cropLeft,
-    int cropTop,
     int cropWidth,
     int cropHeight
 ) {
-    if (outputPath.empty() || outputW <= 0 || outputH <= 0 ||
-        cropLeft < 0 || cropTop < 0 || cropWidth <= 0 || cropHeight <= 0 ||
-        cropLeft + cropWidth > outputW ||
-        cropTop + cropHeight > outputH) {
+    if (outputPath.empty() || cropWidth <= 0 || cropHeight <= 0) {
         return false;
     }
-    const size_t expectedBytes = static_cast<size_t>(outputW) * outputH * 3;
+    const size_t expectedBytes = static_cast<size_t>(cropWidth) * cropHeight * 3;
     if (output.size() < expectedBytes) {
         return false;
     }
@@ -544,12 +577,7 @@ bool write_cropped_raw_rgb_tile(
     if (file == nullptr) {
         return false;
     }
-    const size_t rowBytes = static_cast<size_t>(cropWidth) * 3;
-    bool ok = true;
-    for (int y = 0; y < cropHeight && ok; ++y) {
-        const size_t offset = (static_cast<size_t>(cropTop + y) * outputW + cropLeft) * 3;
-        ok = std::fwrite(output.data() + offset, 1, rowBytes, file) == rowBytes;
-    }
+    bool ok = std::fwrite(output.data(), 1, expectedBytes, file) == expectedBytes;
     ok = std::fclose(file) == 0 && ok;
     return ok;
 }
@@ -644,14 +672,17 @@ void log_tile_output_mismatch(
     );
 }
 
-SuperResNativeCode run_ncnn(
+SuperResNativeCode run_ncnn_image(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
-    bool useVulkan
+    bool useVulkan,
+    const LoadedImage& image,
+    long long decodeMs
 ) {
     const auto totalStart = std::chrono::steady_clock::now();
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
+    performance.decodeMs = decodeMs;
 
     const ModelFiles files = select_model_files(params);
     if (!is_regular_file(files.paramPath) || !is_regular_file(files.binPath)) {
@@ -670,10 +701,6 @@ SuperResNativeCode run_ncnn(
         return SuperResNativeCode::OutOfMemory;
     }
 
-    emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
-    const auto decodeStart = std::chrono::steady_clock::now();
-    LoadedImage image = load_rgb_image(params.inputPath);
-    performance.decodeMs = elapsed_ms(decodeStart);
     if (image.rgb.empty()) {
         return SuperResNativeCode::Unsupported;
     }
@@ -726,10 +753,20 @@ SuperResNativeCode run_ncnn(
     const int totalTiles = tilesX * tilesY;
     const int outputW = image.width * params.scale;
     const int outputH = image.height * params.scale;
+    const bool useCroppedOutput = params.outputMode == kNativeOutputRawCroppedRgbTile;
+    if (useCroppedOutput &&
+        (params.outputCropLeft < 0 || params.outputCropTop < 0 ||
+            params.outputCropWidth <= 0 || params.outputCropHeight <= 0 ||
+            params.outputCropLeft + params.outputCropWidth > outputW ||
+            params.outputCropTop + params.outputCropHeight > outputH)) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    const int bufferW = useCroppedOutput ? params.outputCropWidth : outputW;
+    const int bufferH = useCroppedOutput ? params.outputCropHeight : outputH;
 
     std::vector<unsigned char> output;
     try {
-        output.resize(static_cast<size_t>(outputW) * outputH * 3);
+        output.resize(static_cast<size_t>(bufferW) * bufferH * 3);
     } catch (...) {
         return SuperResNativeCode::OutOfMemory;
     }
@@ -799,6 +836,8 @@ SuperResNativeCode run_ncnn(
                     copySource,
                     output,
                     coveredPixels,
+                    bufferW,
+                    bufferH,
                     outputW,
                     outputH,
                     region.cropX,
@@ -807,6 +846,11 @@ SuperResNativeCode run_ncnn(
                     region.dstY,
                     region.copyW,
                     region.copyH,
+                    useCroppedOutput,
+                    params.outputCropLeft,
+                    params.outputCropTop,
+                    params.outputCropWidth,
+                    params.outputCropHeight,
                     params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan
                 )) {
                 log_tile_output_mismatch(
@@ -852,18 +896,22 @@ SuperResNativeCode run_ncnn(
     }
 
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
-    if (coveredPixels != static_cast<long long>(outputW) * outputH) {
+    const long long expectedCoveredPixels = static_cast<long long>(bufferW) * bufferH;
+    if (coveredPixels != expectedCoveredPixels) {
         __android_log_print(
             ANDROID_LOG_WARN,
             kLogTag,
-            "TileOutputMismatch reason=coverage engine=%d scale=%d noise=%d accel=%s output=%dx%d covered=%lld",
+            "TileOutputMismatch reason=coverage engine=%d scale=%d noise=%d accel=%s output=%dx%d buffer=%dx%d covered=%lld expected=%lld",
             params.engineType,
             params.scale,
             params.noise,
             acceleration_name(useVulkan),
             outputW,
             outputH,
-            coveredPixels
+            bufferW,
+            bufferH,
+            coveredPixels,
+            expectedCoveredPixels
         );
         return SuperResNativeCode::TileOutputMismatch;
     }
@@ -873,10 +921,6 @@ SuperResNativeCode run_ncnn(
         if (!write_cropped_raw_rgb_tile(
                 params.outputPath,
                 output,
-                outputW,
-                outputH,
-                params.outputCropLeft,
-                params.outputCropTop,
                 params.outputCropWidth,
                 params.outputCropHeight
             )) {
@@ -914,6 +958,43 @@ SuperResNativeCode run_ncnn(
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);
 
     return is_cancelled(params.taskId) ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+}
+
+SuperResNativeCode run_ncnn(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    bool useVulkan
+) {
+    emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
+    const auto decodeStart = std::chrono::steady_clock::now();
+    LoadedImage image = load_rgb_image(params.inputPath);
+    const long long decodeMs = elapsed_ms(decodeStart);
+    return run_ncnn_image(params, onProgress, useVulkan, image, decodeMs);
+}
+
+SuperResNativeCode run_ncnn_rgb(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    bool useVulkan,
+    int width,
+    int height,
+    const unsigned char* rgb,
+    size_t rgbSize
+) {
+    emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Reading bitmap region");
+    if (width <= 0 || height <= 0 || rgb == nullptr ||
+        rgbSize != static_cast<size_t>(width) * height * 3) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    LoadedImage image;
+    image.width = width;
+    image.height = height;
+    try {
+        image.rgb.assign(rgb, rgb + rgbSize);
+    } catch (...) {
+        return SuperResNativeCode::OutOfMemory;
+    }
+    return run_ncnn_image(params, onProgress, useVulkan, image, 0);
 }
 
 bool write_all(FILE* file, const void* data, size_t size) {
@@ -985,17 +1066,28 @@ bool deflate_png_bytes(
 }
 }
 
-SuperResNativeCode process_superres(
+using RunNcnnFunction = std::function<SuperResNativeCode(
+    const SuperResNativeParams&,
+    const SuperResProgressCallback&,
+    bool
+)>;
+
+SuperResNativeCode process_superres_internal(
     const SuperResNativeParams& params,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    bool requireInputPath,
+    const RunNcnnFunction& runNcnn
 ) {
     {
         std::lock_guard<std::mutex> lock(cancel_mutex);
         cancelled_tasks.erase(params.taskId);
     }
 
-    if (params.taskId.empty() || params.inputPath.empty() || params.outputPath.empty() ||
+    if (params.taskId.empty() || params.outputPath.empty() ||
         params.modelDir.empty() || params.scale <= 0 || params.tileSize <= 0) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    if (requireInputPath && params.inputPath.empty()) {
         return SuperResNativeCode::InvalidParams;
     }
     if (params.outputMode != kNativeOutputPng && params.outputMode != kNativeOutputRawCroppedRgbTile) {
@@ -1016,7 +1108,7 @@ SuperResNativeCode process_superres(
         return SuperResNativeCode::Unsupported;
     }
 
-    if (!is_regular_file(params.inputPath)) {
+    if (requireInputPath && !is_regular_file(params.inputPath)) {
         return SuperResNativeCode::InputMissing;
     }
 
@@ -1034,9 +1126,9 @@ SuperResNativeCode process_superres(
                 params.accelerationMode
             );
             emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Using CPU for this model");
-            return run_ncnn(params, onProgress, false);
+            return runNcnn(params, onProgress, false);
         }
-        SuperResNativeCode code = run_ncnn(params, onProgress, true);
+        SuperResNativeCode code = runNcnn(params, onProgress, true);
         const bool canRetryCpu = should_retry_cpu_after_gpu_code(
             params.accelerationMode,
             static_cast<int>(code)
@@ -1056,7 +1148,47 @@ SuperResNativeCode process_superres(
         emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "GPU failed; retrying on CPU");
     }
 
-    return run_ncnn(params, onProgress, false);
+    return runNcnn(params, onProgress, false);
+}
+
+SuperResNativeCode process_superres(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress
+) {
+    return process_superres_internal(
+        params,
+        onProgress,
+        true,
+        [](const SuperResNativeParams& request, const SuperResProgressCallback& progress, bool useVulkan) {
+            return run_ncnn(request, progress, useVulkan);
+        }
+    );
+}
+
+SuperResNativeCode process_superres_rgb(
+    const SuperResNativeParams& params,
+    int width,
+    int height,
+    const unsigned char* rgb,
+    size_t rgbSize,
+    const SuperResProgressCallback& onProgress
+) {
+    if (width <= 0 || height <= 0 || rgb == nullptr ||
+        rgbSize != static_cast<size_t>(width) * height * 3) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    return process_superres_internal(
+        params,
+        onProgress,
+        false,
+        [width, height, rgb, rgbSize](
+            const SuperResNativeParams& request,
+            const SuperResProgressCallback& progress,
+            bool useVulkan
+        ) {
+            return run_ncnn_rgb(request, progress, useVulkan, width, height, rgb, rgbSize);
+        }
+    );
 }
 
 void cancel_superres(const std::string& taskId) {
