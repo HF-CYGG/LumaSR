@@ -7,7 +7,7 @@ import java.io.File
 class NativeProguardRulesTest {
     @Test
     fun keepsAllNativeProgressSinkMembersForJniCallbackSignatures() {
-        val rules = File("proguard-rules.pro").readText()
+        val rules = File("proguard-rules.pro").readText().replace("\r\n", "\n")
 
         assertTrue(
             "NativeProgressSink is called from JNI and all callback signatures must survive R8.",
