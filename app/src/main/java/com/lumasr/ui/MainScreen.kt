@@ -216,6 +216,12 @@ internal fun noticeToneForMessage(message: String): NoticeTone {
     }
 }
 
+internal fun shouldShowTopNoticeEvent(
+    message: String?,
+    eventId: Long,
+    consumedEventId: Long?
+): Boolean = !message.isNullOrBlank() && consumedEventId != eventId
+
 @Composable
 private fun TopNoticeHost(
     message: String?,
@@ -224,6 +230,7 @@ private fun TopNoticeHost(
 ) {
     var visibleMessage by remember { mutableStateOf<String?>(null) }
     var isNoticeVisible by remember { mutableStateOf(false) }
+    var consumedEventId by remember { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(message, eventId) {
         if (message.isNullOrBlank()) {
@@ -232,6 +239,10 @@ private fun TopNoticeHost(
             visibleMessage = null
             return@LaunchedEffect
         }
+        if (!shouldShowTopNoticeEvent(message, eventId, consumedEventId)) {
+            return@LaunchedEffect
+        }
+        consumedEventId = eventId
         visibleMessage = message
         isNoticeVisible = true
         delay(TopNoticeVisibleDurationMillis)

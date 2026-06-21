@@ -108,6 +108,14 @@ constexpr int min_int(int left, int right) {
     return left < right ? left : right;
 }
 
+constexpr int realcugan_4x_residual_source_coord(int outputCoord, int inputSize) {
+    if (inputSize <= 0) {
+        return 0;
+    }
+    const int sourceCoord = outputCoord / 4;
+    return min_int(max_int(sourceCoord, 0), inputSize - 1);
+}
+
 constexpr CroppedCopyWindow resolve_cropped_copy_window(
     int srcX,
     int srcY,

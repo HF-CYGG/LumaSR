@@ -460,7 +460,11 @@ class NativeSuperResProcessor(
             onProgress(params.progress(UpscaleStage.CANCELLED, UpscaleErrorMapper.userMessage(UpscaleErrorCode.CANCELLED), 0f))
             return UpscaleResult(params.taskId, UpscaleStage.CANCELLED, null, false, UpscaleErrorMapper.userMessage(UpscaleErrorCode.CANCELLED))
         }
-        val message = UpscaleErrorMapper.userMessage(toErrorCode())
+        val message = if (this == NativeProcessCode.MODEL_MISSING) {
+            params.modelMissingMessage()
+        } else {
+            UpscaleErrorMapper.userMessage(toErrorCode())
+        }
         onProgress(params.progress(UpscaleStage.FAILED, message, 0f))
         return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, message)
     }
@@ -478,6 +482,25 @@ class NativeSuperResProcessor(
             NativeProcessCode.VULKAN_FAILED -> UpscaleErrorCode.VULKAN_RUNTIME_FAILED
             NativeProcessCode.TILE_OUTPUT_MISMATCH -> UpscaleErrorCode.TILE_OUTPUT_MISMATCH
         }
+    }
+
+    private fun UpscaleParams.modelMissingMessage(): String {
+        val files = runCatching {
+            NativeModelFileSelector.select(
+                engine = engine,
+                modelDir = modelDir,
+                scale = scale,
+                noise = noise,
+                modelFileBase = modelFileBase
+            )
+        }.getOrNull()
+        val expected = if (files == null) {
+            "unknown native model files"
+        } else {
+            "${files.paramPath}, ${files.binPath}"
+        }
+        return UpscaleErrorMapper.userMessage(UpscaleErrorCode.MODEL_NOT_FOUND) +
+            " Expected: $expected; scale=$scale noise=$noise modelDir=$modelDir"
     }
 
     companion object {

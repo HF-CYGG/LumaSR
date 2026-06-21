@@ -187,6 +187,25 @@ class UpscaleParamsFactoryTest {
     }
 
     @Test
+    fun singlePassProcessorParamsDoNotExposeExplicitPipeline() {
+        val plan = UpscaleParamsFactory.createPipeline(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realCuganStandardModel(),
+            resolvedModelDir = "cache/models/realcugan-standard",
+            scale = 8,
+            noise = 0,
+            exportMode = ExportMode.EXTREME_SINGLE_PNG
+        )
+
+        assertEquals(1, plan.passes.size)
+        assertEquals(8, plan.processorParams.scale)
+        assertEquals(listOf(2, 3, 4), plan.processorParams.modelScales)
+        assertEquals(emptyList<UpscaleParams>(), plan.processorParams.pipelinePasses)
+    }
+
+    @Test
     fun realEsrganWithDenoiseCreatesCunetPrepassThenFinalPass() {
         val plan = UpscaleParamsFactory.createPipeline(
             taskId = "task-1",
@@ -307,6 +326,33 @@ class UpscaleParamsFactoryTest {
         defaultScale = 2,
         defaultNoise = 1,
         speedLevel = "slow",
+        qualityLevel = "high"
+    )
+
+    private fun realCuganStandardModel() = ModelPack(
+        id = "realcugan-standard",
+        displayName = "Standard",
+        engine = SuperResEngine.REAL_CUGAN,
+        modelDir = "models-se",
+        assetPath = "models/realcugan/models-se",
+        isBuiltIn = true,
+        requiredFiles = listOf(
+            "up2x-no-denoise.param",
+            "up2x-no-denoise.bin",
+            "up3x-no-denoise.param",
+            "up3x-no-denoise.bin",
+            "up4x-no-denoise.param",
+            "up4x-no-denoise.bin"
+        ),
+        assetBytes = null,
+        description = "Balanced illustration model.",
+        scenes = listOf("illustration"),
+        scales = listOf(2, 3, 4),
+        denoise = listOf(0),
+        supportsTta = true,
+        defaultScale = 2,
+        defaultNoise = 0,
+        speedLevel = "medium",
         qualityLevel = "high"
     )
 }

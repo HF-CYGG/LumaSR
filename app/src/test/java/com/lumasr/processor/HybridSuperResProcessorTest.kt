@@ -195,6 +195,40 @@ class HybridSuperResProcessorTest {
     }
 
     @Test
+    fun extremeExportExpandsNativeScalePlanBeforeBitmapRegionInference() = runBlocking {
+        val outputDir = temporaryFolder.newFolder("extreme-output-chain")
+        val nativeProcessor = RecordingBitmapRegionProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true },
+            supportedAbisProvider = { listOf("arm64-v8a") },
+            regionSourceFactory = ExtremeRegionSourceFactory {
+                FakeExtremeRegionSource(width = 256, height = 128)
+            }
+        )
+
+        val result = processor.process(
+            defaultParams().copy(
+                taskId = "extreme-task",
+                inputPath = "input-does-not-need-to-exist.png",
+                outputPath = File(outputDir, "output.png").absolutePath,
+                exportMode = ExportMode.EXTREME_SINGLE_PNG,
+                scale = 8,
+                modelScales = listOf(2, 4)
+            )
+        ) {}
+
+        assertTrue(result.success)
+        assertEquals(1, nativeProcessor.bitmapRegionCalls.size)
+        assertEquals(1, nativeProcessor.pathProcessCallCount)
+        assertEquals(4, nativeProcessor.bitmapRegionCalls.single().scale)
+        assertEquals(NativeOutputMode.PNG_IMAGE, nativeProcessor.bitmapRegionCalls.single().outputMode)
+        assertEquals(2, nativeProcessor.pathProcessCalls.single().scale)
+        assertEquals(NativeOutputMode.RAW_CROPPED_RGB_TILE, nativeProcessor.pathProcessCalls.single().outputMode)
+        assertTrue(outputDir.listFiles().orEmpty().none { it.name.contains("_extreme_region_") })
+    }
+
+    @Test
     fun cancelClearsNativeCacheWhenNativeProcessorOwnsCache() {
         val nativeProcessor = RecordingCacheProcessor()
         val processor = HybridSuperResProcessor(
@@ -283,6 +317,7 @@ private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
 
 private class RecordingBitmapRegionProcessor : SuperResProcessor, NativeBitmapRegionProcessor, NativeRawTileMerger {
     val bitmapRegionCalls = mutableListOf<UpscaleParams>()
+    val pathProcessCalls = mutableListOf<UpscaleParams>()
     var pathProcessCallCount = 0
         private set
 
@@ -291,7 +326,8 @@ private class RecordingBitmapRegionProcessor : SuperResProcessor, NativeBitmapRe
         onProgress: (UpscaleProgress) -> Unit
     ): UpscaleResult {
         pathProcessCallCount += 1
-        return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "path process should not be used")
+        pathProcessCalls += params
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
     }
 
     override suspend fun processBitmapRegion(

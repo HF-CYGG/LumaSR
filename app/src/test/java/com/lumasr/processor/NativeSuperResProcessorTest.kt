@@ -27,7 +27,9 @@ class NativeSuperResProcessorTest {
 
         assertFalse(result.success)
         assertEquals(UpscaleStage.FAILED, result.stage)
-        assertEquals("The selected model files are missing.", result.message)
+        assertTrue(result.message.contains("The selected model files are missing."))
+        assertTrue(result.message.contains("cache/models/waifu2x-cunet/noise1_scale2.0x_model.param"))
+        assertTrue(result.message.contains("cache/models/waifu2x-cunet/noise1_scale2.0x_model.bin"))
     }
 
     @Test

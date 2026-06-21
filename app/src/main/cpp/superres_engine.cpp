@@ -473,6 +473,7 @@ bool copy_output_tile(
     const ncnn::Mat& tile,
     std::vector<unsigned char>& output,
     long long& coveredPixels,
+    const LoadedImage* residualBaseImage,
     int bufferW,
     int bufferH,
     int fullOutputW,
@@ -488,7 +489,8 @@ bool copy_output_tile(
     int cropTop,
     int cropWidth,
     int cropHeight,
-    bool useOriginOutputWindow
+    bool useOriginOutputWindow,
+    bool addRealCugan4xResidualBase
 ) {
     if (tile.empty() || tile.elempack != 1 || tile.elembits() != 32 ||
         !tile_output_has_rgb_channels(tile.c, tile.elempack)) {
@@ -544,6 +546,14 @@ bool copy_output_tile(
         window.dstY + window.copyH > bufferH) {
         return false;
     }
+    if (addRealCugan4xResidualBase &&
+        (residualBaseImage == nullptr || residualBaseImage->rgb.empty() ||
+            residualBaseImage->width <= 0 || residualBaseImage->height <= 0)) {
+        return false;
+    }
+
+    const int fullDstBaseX = useCroppedOutput ? cropLeft + window.dstX : window.dstX;
+    const int fullDstBaseY = useCroppedOutput ? cropTop + window.dstY : window.dstY;
 
     for (int c = 0; c < 3; ++c) {
         const ncnn::Mat channel = tile.channel(c);
@@ -551,7 +561,14 @@ bool copy_output_tile(
             const float* row = channel.row(window.srcY + y);
             for (int x = 0; x < window.copyW; ++x) {
                 const size_t offset = (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX + x) * 3 + c;
-                output[offset] = to_u8(clamp01(row[window.srcX + x]));
+                float value = row[window.srcX + x];
+                if (addRealCugan4xResidualBase) {
+                    const int baseX = realcugan_4x_residual_source_coord(fullDstBaseX + x, residualBaseImage->width);
+                    const int baseY = realcugan_4x_residual_source_coord(fullDstBaseY + y, residualBaseImage->height);
+                    const size_t baseOffset = (static_cast<size_t>(baseY) * residualBaseImage->width + baseX) * 3 + c;
+                    value += static_cast<float>(residualBaseImage->rgb[baseOffset]) / 255.0f;
+                }
+                output[offset] = to_u8(clamp01(value));
             }
         }
     }
@@ -836,6 +853,7 @@ SuperResNativeCode run_ncnn_image(
                     copySource,
                     output,
                     coveredPixels,
+                    params.engineType == kEngineRealCugan && params.scale == 4 ? &image : nullptr,
                     bufferW,
                     bufferH,
                     outputW,
@@ -851,7 +869,8 @@ SuperResNativeCode run_ncnn_image(
                     params.outputCropTop,
                     params.outputCropWidth,
                     params.outputCropHeight,
-                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan
+                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
+                    params.engineType == kEngineRealCugan && params.scale == 4
                 )) {
                 log_tile_output_mismatch(
                     params,

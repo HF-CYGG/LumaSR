@@ -23,6 +23,7 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 
@@ -43,6 +44,7 @@ android {
     val uploadStorePassword = providers.environmentVariable("LUMASR_UPLOAD_STORE_PASSWORD")
     val uploadKeyAlias = providers.environmentVariable("LUMASR_UPLOAD_KEY_ALIAS")
     val uploadKeyPassword = providers.environmentVariable("LUMASR_UPLOAD_KEY_PASSWORD")
+    val crashOnProcessingFailure = providers.gradleProperty("lumasr.crashOnProcessingFailure").orElse("true")
     val hasUploadSigningConfig = listOf(
         uploadStoreFile,
         uploadStorePassword,
@@ -63,11 +65,13 @@ android {
 
     buildTypes {
         debug {
+            buildConfigField("boolean", "LUMASR_CRASH_ON_PROCESSING_FAILURE", crashOnProcessingFailure.get())
             ndk {
                 abiFilters += listOf("arm64-v8a", "x86_64")
             }
         }
         release {
+            buildConfigField("boolean", "LUMASR_CRASH_ON_PROCESSING_FAILURE", crashOnProcessingFailure.get())
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

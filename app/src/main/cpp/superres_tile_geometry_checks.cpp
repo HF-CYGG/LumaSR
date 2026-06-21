@@ -142,6 +142,10 @@ static_assert(resolve_tile_output_crop(1098, 1024, 36) == 36);
 static_assert(resolve_tile_output_crop(1024, 1024, 36) == 0);
 static_assert(resolve_tile_output_crop(1030, 1024, 36) == 6);
 static_assert(resolve_tile_output_crop(1000, 1024, 36) == -1);
+static_assert(realcugan_4x_residual_source_coord(0, 16) == 0);
+static_assert(realcugan_4x_residual_source_coord(3, 16) == 0);
+static_assert(realcugan_4x_residual_source_coord(4, 16) == 1);
+static_assert(realcugan_4x_residual_source_coord(67, 16) == 15);
 
 constexpr CroppedCopyWindow kInteriorCropWindow = resolve_cropped_copy_window(
     10,

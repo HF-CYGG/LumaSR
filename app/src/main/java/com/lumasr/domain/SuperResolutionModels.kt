@@ -92,7 +92,7 @@ data class UpscalePipelinePlan(
             val finalPass = passes.last()
             return finalPass.copy(
                 inputPath = passes.first().inputPath,
-                pipelinePasses = passes,
+                pipelinePasses = if (passes.size > 1) passes else emptyList(),
                 pipelineLabel = label
             )
         }
