@@ -25,6 +25,7 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ScrollState
@@ -420,12 +421,12 @@ private fun ParameterSheet(
                 state.models.modelChoiceGroups().firstOrNull { it.containsModel(state.selectedModelId) }
             }
             val scales = selectedModelGroup?.scales ?: state.selectedModel?.scales.orEmpty().ifEmpty { listOf(2) }
-            SectionLabel("放大倍率")
+            ParameterHeader(title = "放大倍率", value = scaleOptionLabel(state.scale))
             ParameterMorphContainer(morphKey = scales) {
                 AnimatedSegmentedSelector(
                     items = scales,
                     selected = state.scale.takeIf { it in scales } ?: scales.first(),
-                    itemLabel = { "${it}x" },
+                    itemLabel = ::scaleOptionLabel,
                     onSelected = { scale ->
                         val scaleModel = selectedModelGroup?.modelForScale(scale)
                         if (scaleModel != null && scaleModel.id != state.selectedModelId) {
@@ -440,11 +441,6 @@ private fun ParameterSheet(
                 ?.availableDenoiseForScale(state.scale)
                 .orEmpty()
                 .ifEmpty { listOf(0) }
-            LaunchedEffect(noises, state.noise) {
-                if (state.noise !in noises) {
-                    onNoiseChanged(nearestNoiseLevel(noises, state.noise.toFloat()))
-                }
-            }
             when (denoiseControlType(noises)) {
                 DenoiseControlType.SLIDER -> {
                     ParameterMorphContainer(morphKey = noises) {
@@ -541,6 +537,27 @@ private fun SectionLabel(text: String) {
     )
 }
 
+@Composable
+private fun ParameterHeader(
+    title: String,
+    value: String
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+        Spacer(modifier = Modifier.weight(1f))
+        AnimatedContent(
+            targetState = value,
+            transitionSpec = {
+                (slideInVertically(tween(180)) { it } + fadeIn(tween(140))) togetherWith
+                    (slideOutVertically(tween(140)) { -it } + fadeOut(tween(100)))
+            },
+            label = "parameterHeaderValue"
+        ) { text ->
+            Text(text, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
 private fun LumaUiState.parameterSubtitle(): String {
     return when {
         selectedImageCount > 1 -> "已选择 $selectedImageCount 张图片，将按当前参数批量处理"
@@ -582,6 +599,8 @@ private fun ParameterMorphContainer(
 
 internal fun nearestNoiseLevel(options: List<Int>, raw: Float): Int =
     options.sorted().ifEmpty { listOf(0) }.minBy { abs(it - raw) }
+
+internal fun scaleOptionLabel(scale: Int): String = "${scale}x"
 
 internal fun denoiseControlType(options: List<Int>): DenoiseControlType {
     val safeOptions = options.distinct().sorted()
@@ -627,8 +646,8 @@ private fun NoiseSliderRow(
         label = "noiseSliderValue"
     )
 
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("降噪等级", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ParameterHeader(title = "降噪等级", value = denoiseOptionLabel(safeValue))
         Slider(
             value = animatedValue.coerceIn(rangeStart, rangeEnd),
             onValueChange = { raw ->
@@ -638,18 +657,8 @@ private fun NoiseSliderRow(
             },
             valueRange = rangeStart..rangeEnd,
             steps = if (safeOptions.first() == safeOptions.last()) 0 else (safeOptions.last() - safeOptions.first() - 1).coerceAtLeast(0),
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.fillMaxWidth()
         )
-        AnimatedContent(
-            targetState = safeValue,
-            transitionSpec = {
-                (slideInVertically(tween(180)) { it } + fadeIn(tween(140))) togetherWith
-                    (slideOutVertically(tween(140)) { -it } + fadeOut(tween(100)))
-            },
-            label = "noiseNumber"
-        ) { number ->
-            Text(number.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        }
     }
 }
 
@@ -662,20 +671,7 @@ private fun DenoiseSegmentedRow(
     val safeOptions = options.distinct().sorted().ifEmpty { listOf(0) }
     val safeValue = nearestNoiseLevel(safeOptions, value.toFloat())
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("降噪等级", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-            Spacer(modifier = Modifier.weight(1f))
-            AnimatedContent(
-                targetState = safeValue,
-                transitionSpec = {
-                    (slideInVertically(tween(180)) { it } + fadeIn(tween(140))) togetherWith
-                        (slideOutVertically(tween(140)) { -it } + fadeOut(tween(100)))
-                },
-                label = "denoiseSegmentedValue"
-            ) { number ->
-                Text(denoiseOptionLabel(number), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            }
-        }
+        ParameterHeader(title = "降噪等级", value = denoiseOptionLabel(safeValue))
         AnimatedSegmentedSelector(
             items = safeOptions,
             selected = safeValue,
@@ -687,26 +683,21 @@ private fun DenoiseSegmentedRow(
 
 @Composable
 private fun DenoiseUnavailableRow() {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.52f)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ParameterHeader(title = "降噪等级", value = denoiseOptionLabel(0))
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.52f)
         ) {
-            Text("降噪等级", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             Text(
                 text = "该模型没有独立降噪档位",
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Text("0", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -927,13 +918,17 @@ private fun <T> AnimatedSegmentedSelector(
     height: Dp = 52.dp
 ) {
     if (items.isEmpty()) return
+    val darkTheme = isSystemInDarkTheme()
+    val visualSpec = segmentedSelectorVisualSpec(darkTheme = darkTheme)
+    val activeContentColor = if (darkTheme) Color.White else MaterialTheme.colorScheme.onSurface
+    val inactiveContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = visualSpec.inactiveContentAlpha)
 
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
             .height(height)
             .clip(RoundedCornerShape(999.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .background(visualSpec.track)
     ) {
         val itemWidth = maxWidth / items.size.toFloat()
         val selectedIndex = items.indexOf(selected).coerceAtLeast(0)
@@ -950,9 +945,10 @@ private fun <T> AnimatedSegmentedSelector(
                 .fillMaxHeight()
                 .padding(4.dp),
             shape = RoundedCornerShape(999.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 2.dp,
-            shadowElevation = 2.dp
+            color = visualSpec.selectedContainer,
+            border = BorderStroke(1.dp, visualSpec.selectedBorder),
+            tonalElevation = if (darkTheme) 0.dp else 2.dp,
+            shadowElevation = if (darkTheme) 5.dp else 2.dp
         ) {}
 
         Row(modifier = Modifier.fillMaxSize()) {
@@ -972,7 +968,7 @@ private fun <T> AnimatedSegmentedSelector(
                 ) {
                     Text(
                         text = itemLabel(item),
-                        color = if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (active) activeContentColor else inactiveContentColor,
                         fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -980,6 +976,31 @@ private fun <T> AnimatedSegmentedSelector(
                 }
             }
         }
+    }
+}
+
+internal data class SegmentedSelectorVisualSpec(
+    val track: Color,
+    val selectedContainer: Color,
+    val selectedBorder: Color,
+    val inactiveContentAlpha: Float
+)
+
+internal fun segmentedSelectorVisualSpec(darkTheme: Boolean): SegmentedSelectorVisualSpec {
+    return if (darkTheme) {
+        SegmentedSelectorVisualSpec(
+            track = Color(0xFF2A2A2D),
+            selectedContainer = Color(0xFF3A3A3D),
+            selectedBorder = Color.White.copy(alpha = 0.18f),
+            inactiveContentAlpha = 0.72f
+        )
+    } else {
+        SegmentedSelectorVisualSpec(
+            track = Color(0xFFF1F1F2),
+            selectedContainer = Color.White,
+            selectedBorder = Color.Black.copy(alpha = 0.06f),
+            inactiveContentAlpha = 0.72f
+        )
     }
 }
 

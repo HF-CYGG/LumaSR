@@ -31,6 +31,15 @@ class ModelCapabilitiesTest {
     }
 
     @Test
+    fun realCuganScaleChangeSanitizesNoiseWithoutUiSideEffect() {
+        val model = realCuganStandard()
+
+        assertEquals(1, model.sanitizeDenoiseForScale(targetScale = 2, noise = 1))
+        assertEquals(0, model.sanitizeDenoiseForScale(targetScale = 3, noise = 1))
+        assertEquals(3, model.sanitizeDenoiseForScale(targetScale = 3, noise = 3))
+    }
+
+    @Test
     fun bundledManifestRunnableCombinationsResolveExistingNativeModelFiles() {
         val manifest = bundledManifest()
 

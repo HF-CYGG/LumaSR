@@ -76,6 +76,15 @@ class ProcessScreenV2Test {
     }
 
     @Test
+    fun classifiesTopNoticeToneByMessageIntent() {
+        assertEquals(NoticeTone.Info, noticeToneForMessage("已自动降低资源占用以避免卡顿"))
+        assertEquals(NoticeTone.Success, noticeToneForMessage("Saved to Pictures/LocalSR"))
+        assertEquals(NoticeTone.Error, noticeToneForMessage("Save failed: missing output"))
+        assertEquals(NoticeTone.Error, noticeToneForMessage("Cannot read selected image"))
+        assertEquals(NoticeTone.Error, noticeToneForMessage("Native inference failed"))
+    }
+
+    @Test
     fun usesSegmentedDenoiseControlForSparseRealCuganOptions() {
         assertEquals(DenoiseControlType.SEGMENTED, denoiseControlType(listOf(-1, 0, 3)))
         assertEquals("保守", denoiseOptionLabel(-1))
@@ -87,5 +96,20 @@ class ProcessScreenV2Test {
     fun keepsSliderForContiguousDenoiseOptions() {
         assertEquals(DenoiseControlType.SLIDER, denoiseControlType(listOf(0, 1, 2, 3)))
         assertEquals(DenoiseControlType.UNAVAILABLE, denoiseControlType(listOf(0)))
+    }
+
+    @Test
+    fun formatsCurrentScaleValueForParameterHeader() {
+        assertEquals("4x", scaleOptionLabel(4))
+        assertEquals("16x", scaleOptionLabel(16))
+    }
+
+    @Test
+    fun darkSegmentedSelectorSelectionHasVisibleContrast() {
+        val colors = segmentedSelectorVisualSpec(darkTheme = true)
+
+        assertTrue(colors.selectedContainer != colors.track)
+        assertTrue(colors.selectedBorder.alpha > 0f)
+        assertTrue(colors.inactiveContentAlpha < 1f)
     }
 }

@@ -14,14 +14,17 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -29,15 +32,20 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.FormatListBulleted
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -59,6 +67,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -181,6 +190,28 @@ internal fun topNoticeMessage(
         ?.takeIf { it.isNotEmpty() }
 }
 
+internal enum class NoticeTone {
+    Info,
+    Success,
+    Error
+}
+
+internal fun noticeToneForMessage(message: String): NoticeTone {
+    val normalized = message.lowercase()
+    return when {
+        normalized.contains("failed") ||
+            normalized.contains("cannot ") ||
+            normalized.contains("error") ||
+            normalized.contains("模型文件缺失") ||
+            normalized.contains("输出尺寸异常") ||
+            normalized.contains("失败") -> NoticeTone.Error
+        normalized.contains("saved") ||
+            normalized.contains("已保存") ||
+            normalized.contains("处理完成") -> NoticeTone.Success
+        else -> NoticeTone.Info
+    }
+}
+
 @Composable
 private fun TopNoticeHost(
     message: String?,
@@ -202,26 +233,64 @@ private fun TopNoticeHost(
 
     AnimatedVisibility(
         visible = !visibleMessage.isNullOrBlank(),
-        enter = slideInVertically(animationSpec = tween(220)) { -it / 2 } + fadeIn(tween(180)),
-        exit = slideOutVertically(animationSpec = tween(180)) { -it / 2 } + fadeOut(tween(140)),
+        enter = slideInVertically(animationSpec = tween(220)) { -it / 2 } +
+            fadeIn(tween(180)) +
+            scaleIn(initialScale = 0.96f, animationSpec = tween(220)),
+        exit = slideOutVertically(animationSpec = tween(170)) { -it / 2 } + fadeOut(tween(140)),
         modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .padding(start = 24.dp, top = 14.dp, end = 24.dp)
+            .padding(start = 24.dp, top = 12.dp, end = 24.dp)
     ) {
         visibleMessage?.let { notice ->
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.86f),
-                tonalElevation = 4.dp,
-                shadowElevation = 10.dp
+            TopNoticeCard(notice = notice)
+        }
+    }
+}
+
+@Composable
+private fun TopNoticeCard(notice: String) {
+    val tone = noticeToneForMessage(notice)
+    val colors = noticeVisuals(tone)
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp),
+            shape = RoundedCornerShape(999.dp),
+            color = colors.container,
+            border = BorderStroke(0.8.dp, colors.border),
+            tonalElevation = 6.dp,
+            shadowElevation = 14.dp
+        ) {
+            Row(
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .padding(start = 8.dp, top = 7.dp, end = 16.dp, bottom = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Surface(
+                    modifier = Modifier.size(34.dp),
+                    shape = RoundedCornerShape(999.dp),
+                    color = colors.iconContainer
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = noticeIcon(tone),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = colors.icon
+                        )
+                    }
+                }
                 Text(
                     text = notice,
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    modifier = Modifier.weight(1f),
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    color = colors.content,
+                    fontWeight = FontWeight.Medium,
+                    textAlign = TextAlign.Start,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -229,6 +298,51 @@ private fun TopNoticeHost(
         }
     }
 }
+
+@Composable
+private fun noticeVisuals(tone: NoticeTone): NoticeVisuals {
+    val colorScheme = MaterialTheme.colorScheme
+    val darkTheme = isSystemInDarkTheme()
+    return when (tone) {
+        NoticeTone.Info -> NoticeVisuals(
+            container = colorScheme.surface.copy(alpha = if (darkTheme) 0.90f else 0.92f),
+            content = colorScheme.onSurface,
+            icon = colorScheme.primary,
+            iconContainer = colorScheme.primary.copy(alpha = if (darkTheme) 0.18f else 0.12f),
+            border = colorScheme.outline.copy(alpha = if (darkTheme) 0.34f else 0.18f)
+        )
+        NoticeTone.Success -> NoticeVisuals(
+            container = colorScheme.primaryContainer.copy(alpha = if (darkTheme) 0.88f else 0.94f),
+            content = colorScheme.onPrimaryContainer,
+            icon = colorScheme.primary,
+            iconContainer = colorScheme.primary.copy(alpha = if (darkTheme) 0.22f else 0.14f),
+            border = colorScheme.primary.copy(alpha = if (darkTheme) 0.32f else 0.18f)
+        )
+        NoticeTone.Error -> NoticeVisuals(
+            container = colorScheme.errorContainer.copy(alpha = if (darkTheme) 0.90f else 0.94f),
+            content = colorScheme.onErrorContainer,
+            icon = colorScheme.error,
+            iconContainer = colorScheme.error.copy(alpha = if (darkTheme) 0.22f else 0.14f),
+            border = colorScheme.error.copy(alpha = if (darkTheme) 0.38f else 0.22f)
+        )
+    }
+}
+
+private fun noticeIcon(tone: NoticeTone): ImageVector {
+    return when (tone) {
+        NoticeTone.Info -> Icons.Rounded.Memory
+        NoticeTone.Success -> Icons.Rounded.CheckCircle
+        NoticeTone.Error -> Icons.Rounded.ErrorOutline
+    }
+}
+
+private data class NoticeVisuals(
+    val container: Color,
+    val content: Color,
+    val icon: Color,
+    val iconContainer: Color,
+    val border: Color
+)
 
 @Composable
 private fun LumaNavHost(
