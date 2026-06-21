@@ -196,6 +196,9 @@ internal enum class NoticeTone {
     Error
 }
 
+internal const val TopNoticeVisibleDurationMillis = 3_000L
+internal const val TopNoticeExitHoldMillis = 220L
+
 internal fun noticeToneForMessage(message: String): NoticeTone {
     val normalized = message.lowercase()
     return when {
@@ -218,25 +221,34 @@ private fun TopNoticeHost(
     modifier: Modifier = Modifier
 ) {
     var visibleMessage by remember { mutableStateOf<String?>(null) }
+    var isNoticeVisible by remember { mutableStateOf(false) }
 
     LaunchedEffect(message) {
         if (message.isNullOrBlank()) {
+            isNoticeVisible = false
+            delay(TopNoticeExitHoldMillis)
             visibleMessage = null
             return@LaunchedEffect
         }
         visibleMessage = message
-        delay(2_500)
+        isNoticeVisible = true
+        delay(TopNoticeVisibleDurationMillis)
         if (visibleMessage == message) {
-            visibleMessage = null
+            isNoticeVisible = false
+            delay(TopNoticeExitHoldMillis)
+            if (visibleMessage == message) {
+                visibleMessage = null
+            }
         }
     }
 
     AnimatedVisibility(
-        visible = !visibleMessage.isNullOrBlank(),
+        visible = isNoticeVisible && !visibleMessage.isNullOrBlank(),
         enter = slideInVertically(animationSpec = tween(220)) { -it / 2 } +
             fadeIn(tween(180)) +
             scaleIn(initialScale = 0.96f, animationSpec = tween(220)),
-        exit = slideOutVertically(animationSpec = tween(170)) { -it / 2 } + fadeOut(tween(140)),
+        exit = slideOutVertically(animationSpec = tween(TopNoticeExitHoldMillis.toInt())) { -it / 2 } +
+            fadeOut(tween(TopNoticeExitHoldMillis.toInt())),
         modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()

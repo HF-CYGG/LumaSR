@@ -85,6 +85,13 @@ class ProcessScreenV2Test {
     }
 
     @Test
+    fun topNoticeUsesShortAutoDismissTimingWithExitAnimationHold() {
+        assertEquals(3_000L, TopNoticeVisibleDurationMillis)
+        assertTrue(TopNoticeExitHoldMillis >= 180L)
+        assertTrue(TopNoticeExitHoldMillis < TopNoticeVisibleDurationMillis)
+    }
+
+    @Test
     fun usesSegmentedDenoiseControlForSparseRealCuganOptions() {
         assertEquals(DenoiseControlType.SEGMENTED, denoiseControlType(listOf(-1, 0, 3)))
         assertEquals("保守", denoiseOptionLabel(-1))
