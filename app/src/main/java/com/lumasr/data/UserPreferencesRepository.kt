@@ -30,6 +30,33 @@ class UserPreferencesRepository(
             .apply()
     }
 
+    fun isExtremeGpuDisabled(modelKey: String): Boolean {
+        if (modelKey.isBlank()) return false
+        return preferences.getStringSet(KEY_DISABLED_EXTREME_GPU_KEYS, emptySet()).orEmpty().contains(modelKey)
+    }
+
+    fun markExtremeGpuDisabled(modelKey: String) {
+        if (modelKey.isBlank()) return
+        val updated = preferences.getStringSet(KEY_DISABLED_EXTREME_GPU_KEYS, emptySet())
+            .orEmpty()
+            .toMutableSet()
+            .apply { add(modelKey) }
+        preferences.edit()
+            .putStringSet(KEY_DISABLED_EXTREME_GPU_KEYS, updated)
+            .apply()
+    }
+
+    fun clearExtremeGpuDisabled(modelKey: String) {
+        if (modelKey.isBlank()) return
+        val updated = preferences.getStringSet(KEY_DISABLED_EXTREME_GPU_KEYS, emptySet())
+            .orEmpty()
+            .toMutableSet()
+            .apply { remove(modelKey) }
+        preferences.edit()
+            .putStringSet(KEY_DISABLED_EXTREME_GPU_KEYS, updated)
+            .apply()
+    }
+
     private fun Int.sanitizeTileSize(): Int = UpscaleParamsFactory.sanitizeTileSize(this)
 
     companion object {
@@ -37,6 +64,7 @@ class UserPreferencesRepository(
         private const val KEY_TILE_SIZE_MODE = "tile_size_mode"
         private const val KEY_MANUAL_TILE_SIZE = "manual_tile_size"
         private const val KEY_LAST_AUTO_TILE_SIZE = "last_auto_tile_size"
+        private const val KEY_DISABLED_EXTREME_GPU_KEYS = "disabled_extreme_gpu_keys"
 
         fun fromContext(context: Context): UserPreferencesRepository {
             return UserPreferencesRepository(
