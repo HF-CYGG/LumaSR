@@ -1,6 +1,7 @@
 package com.lumasr.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -42,5 +43,49 @@ class ProcessScreenV2Test {
         )
 
         assertEquals(ResultSaveCardPhase.Ready, phase)
+    }
+
+    @Test
+    fun createsTopNoticeForProcessRouteMessages() {
+        assertEquals(
+            "已自动降低资源占用以避免卡顿",
+            topNoticeMessage(
+                resultMessage = "已自动降低资源占用以避免卡顿",
+                screen = LumaScreen.EDITING,
+                route = BottomNavItem.Process.route
+            )
+        )
+    }
+
+    @Test
+    fun hidesTopNoticeOutsideProcessRouteOrCompareScreen() {
+        assertNull(
+            topNoticeMessage(
+                resultMessage = "已自动降低资源占用以避免卡顿",
+                screen = LumaScreen.EDITING,
+                route = BottomNavItem.Settings.route
+            )
+        )
+        assertNull(
+            topNoticeMessage(
+                resultMessage = "已自动降低资源占用以避免卡顿",
+                screen = LumaScreen.COMPARE,
+                route = BottomNavItem.Process.route
+            )
+        )
+    }
+
+    @Test
+    fun usesSegmentedDenoiseControlForSparseRealCuganOptions() {
+        assertEquals(DenoiseControlType.SEGMENTED, denoiseControlType(listOf(-1, 0, 3)))
+        assertEquals("保守", denoiseOptionLabel(-1))
+        assertEquals("关闭", denoiseOptionLabel(0))
+        assertEquals("强", denoiseOptionLabel(3))
+    }
+
+    @Test
+    fun keepsSliderForContiguousDenoiseOptions() {
+        assertEquals(DenoiseControlType.SLIDER, denoiseControlType(listOf(0, 1, 2, 3)))
+        assertEquals(DenoiseControlType.UNAVAILABLE, denoiseControlType(listOf(0)))
     }
 }

@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -58,8 +59,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
@@ -67,6 +70,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import kotlinx.coroutines.delay
 
 /**
  * 底部主导航项。保留路由值，避免影响现有 Navigation Compose 状态。
@@ -80,7 +84,14 @@ sealed class BottomNavItem(val route: String, val title: String, val icon: Image
 fun MainScreen(viewModel: LumaViewModel) {
     val navController = rememberNavController()
     val state by viewModel.uiState.collectAsState()
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route ?: BottomNavItem.Process.route
     val showBottomBar = state.screen == LumaScreen.EDITING
+    val noticeMessage = topNoticeMessage(
+        resultMessage = state.resultMessage,
+        screen = state.screen,
+        route = currentRoute
+    )
     var hasShownEditingBottomBar by remember { mutableStateOf(false) }
     val bottomBarEnterTransition = if (shouldAnimateBottomBarEnter(hasShownEditingBottomBar, showBottomBar)) {
         slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160))
@@ -140,6 +151,13 @@ fun MainScreen(viewModel: LumaViewModel) {
                     navController = navController
                 )
             }
+
+            TopNoticeHost(
+                message = noticeMessage,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .zIndex(2f)
+            )
         }
     }
 }
@@ -148,6 +166,69 @@ internal fun shouldAnimateBottomBarEnter(
     hasShownEditingBottomBar: Boolean,
     showBottomBar: Boolean
 ): Boolean = hasShownEditingBottomBar && showBottomBar
+
+internal fun topNoticeMessage(
+    resultMessage: String?,
+    screen: LumaScreen,
+    route: String?
+): String? {
+    if (screen == LumaScreen.COMPARE) return null
+    val currentRoute = route ?: BottomNavItem.Process.route
+    if (currentRoute != BottomNavItem.Process.route) return null
+    return resultMessage
+        ?.toReadableProgressMessage()
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+}
+
+@Composable
+private fun TopNoticeHost(
+    message: String?,
+    modifier: Modifier = Modifier
+) {
+    var visibleMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(message) {
+        if (message.isNullOrBlank()) {
+            visibleMessage = null
+            return@LaunchedEffect
+        }
+        visibleMessage = message
+        delay(2_500)
+        if (visibleMessage == message) {
+            visibleMessage = null
+        }
+    }
+
+    AnimatedVisibility(
+        visible = !visibleMessage.isNullOrBlank(),
+        enter = slideInVertically(animationSpec = tween(220)) { -it / 2 } + fadeIn(tween(180)),
+        exit = slideOutVertically(animationSpec = tween(180)) { -it / 2 } + fadeOut(tween(140)),
+        modifier = modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(start = 24.dp, top = 14.dp, end = 24.dp)
+    ) {
+        visibleMessage?.let { notice ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.86f),
+                tonalElevation = 4.dp,
+                shadowElevation = 10.dp
+            ) {
+                Text(
+                    text = notice,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun LumaNavHost(
@@ -174,6 +255,7 @@ private fun LumaNavHost(
                 onNoiseChanged = viewModel::setNoise,
                 onAccelerationChanged = viewModel::setAccelerationMode,
                 onTileSizeChanged = viewModel::setTileSize,
+                onTileSizeAutoSelected = viewModel::setTileSizeAuto,
                 onTtaChanged = viewModel::setTta,
                 onStart = viewModel::startProcessing,
                 onClearImage = viewModel::clearSelectedImage,
@@ -184,7 +266,8 @@ private fun LumaNavHost(
             SettingsScreenV2(
                 state = state,
                 onAccelerationChanged = viewModel::setAccelerationMode,
-                onTileSizeChanged = viewModel::setTileSize
+                onTileSizeChanged = viewModel::setTileSize,
+                onTileSizeAutoSelected = viewModel::setTileSizeAuto
             )
         }
     }

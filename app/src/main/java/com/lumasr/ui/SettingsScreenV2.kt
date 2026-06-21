@@ -46,6 +46,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.SuperResEngine
+import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.availableTargetScales
 
 internal const val SettingsFooterBottomSpacerDp = 128
@@ -56,6 +57,7 @@ fun SettingsScreenV2(
     state: LumaUiState,
     onAccelerationChanged: (AccelerationMode) -> Unit,
     onTileSizeChanged: (Int) -> Unit,
+    onTileSizeAutoSelected: () -> Unit,
     appVersionLabel: String? = null
 ) {
     var notifications by remember { mutableStateOf(true) }
@@ -98,11 +100,17 @@ fun SettingsScreenV2(
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
                 title = "分块大小",
-                subtitle = "${state.tileSize} px"
+                subtitle = if (state.tileSizeMode == TileSizeMode.AUTO) {
+                    "自动 · 当前 ${state.tileSize} px"
+                } else {
+                    "${state.tileSize} px"
+                }
             )
             SettingsTileSizeSelector(
+                selectedMode = state.tileSizeMode,
                 selectedTileSize = state.tileSize,
-                onTileSizeChanged = onTileSizeChanged
+                onTileSizeChanged = onTileSizeChanged,
+                onTileSizeAutoSelected = onTileSizeAutoSelected
             )
             SettingsSwitchRowV2(
                 icon = Icons.Rounded.Memory,
@@ -157,8 +165,10 @@ internal fun formatSettingsVersion(versionName: String, versionCode: Long): Stri
 
 @Composable
 private fun SettingsTileSizeSelector(
+    selectedMode: TileSizeMode,
     selectedTileSize: Int,
-    onTileSizeChanged: (Int) -> Unit
+    onTileSizeChanged: (Int) -> Unit,
+    onTileSizeAutoSelected: () -> Unit
 ) {
     val selected = sanitizeTileSize(selectedTileSize)
     Row(
@@ -167,13 +177,17 @@ private fun SettingsTileSizeSelector(
             .padding(horizontal = 20.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        TileSizeOptions.forEach { tileSize ->
-            val active = tileSize == selected
+        TileSizeChoices.forEach { choice ->
+            val active = if (choice.value == null) {
+                selectedMode == TileSizeMode.AUTO
+            } else {
+                selectedMode == TileSizeMode.MANUAL && choice.value == selected
+            }
             Surface(
                 modifier = Modifier
                     .weight(1f)
                     .height(38.dp)
-                    .clickable { onTileSizeChanged(tileSize) },
+                    .clickable { choice.value?.let(onTileSizeChanged) ?: onTileSizeAutoSelected() },
                 shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
                 color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
             ) {
@@ -183,7 +197,7 @@ private fun SettingsTileSizeSelector(
                     horizontalArrangement = Arrangement.Center
                 ) {
                     Text(
-                        text = tileSize.toString(),
+                        text = choice.label,
                         style = MaterialTheme.typography.labelMedium,
                         color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1

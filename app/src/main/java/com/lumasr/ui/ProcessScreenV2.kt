@@ -103,6 +103,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ModelPack
+import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import com.lumasr.domain.availableNativePassScales
@@ -130,6 +131,21 @@ internal enum class ResultSaveCardPhase {
     SavedFlash,
     SavedSettled
 }
+
+internal enum class DenoiseControlType {
+    UNAVAILABLE,
+    SLIDER,
+    SEGMENTED
+}
+
+internal data class TileSizeChoice(
+    val value: Int?,
+    val label: String
+)
+
+internal val TileSizeChoices: List<TileSizeChoice> =
+    listOf(TileSizeChoice(value = null, label = "自动")) +
+        TileSizeOptions.map { tileSize -> TileSizeChoice(value = tileSize, label = tileSize.toString()) }
 
 internal fun initialResultSaveCardPhase(savedCount: Int): ResultSaveCardPhase =
     if (savedCount > 0) ResultSaveCardPhase.SavedSettled else ResultSaveCardPhase.Ready
@@ -161,6 +177,7 @@ fun ProcessTabV2(
     onNoiseChanged: (Int) -> Unit,
     onAccelerationChanged: (AccelerationMode) -> Unit,
     onTileSizeChanged: (Int) -> Unit,
+    onTileSizeAutoSelected: () -> Unit,
     onTtaChanged: (Boolean) -> Unit,
     onStart: () -> Unit,
     onClearImage: () -> Unit,
@@ -255,6 +272,7 @@ fun ProcessTabV2(
                 onNoiseChanged = onNoiseChanged,
                 onAccelerationChanged = onAccelerationChanged,
                 onTileSizeChanged = onTileSizeChanged,
+                onTileSizeAutoSelected = onTileSizeAutoSelected,
                 onTtaChanged = onTtaChanged,
                 onClearImage = onClearImage,
                 onStart = onStart,
@@ -292,6 +310,7 @@ private fun ParameterSheet(
     onNoiseChanged: (Int) -> Unit,
     onAccelerationChanged: (AccelerationMode) -> Unit,
     onTileSizeChanged: (Int) -> Unit,
+    onTileSizeAutoSelected: () -> Unit,
     onTtaChanged: (Boolean) -> Unit,
     onClearImage: () -> Unit,
     onStart: () -> Unit,
@@ -368,29 +387,6 @@ private fun ParameterSheet(
                 }
             }
 
-            AnimatedVisibility(
-                visible = !state.resultMessage.isNullOrBlank(),
-                enter = fadeIn(tween(160)) + slideInVertically(tween(180)) { it / 3 },
-                exit = fadeOut(tween(120)) + slideOutVertically(tween(140)) { -it / 3 }
-            ) {
-                state.resultMessage?.let { message ->
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f)
-                    ) {
-                        Text(
-                            text = message.toReadableProgress(),
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-            }
-
             if (state.models.isNotEmpty()) {
                 SectionLabel("模型")
                 ModelCapsules(
@@ -449,16 +445,26 @@ private fun ParameterSheet(
                     onNoiseChanged(nearestNoiseLevel(noises, state.noise.toFloat()))
                 }
             }
-            if (noises.distinct().size > 1) {
-                ParameterMorphContainer(morphKey = noises) {
-                    NoiseSliderRow(
-                        value = state.noise,
-                        options = noises,
-                        onNoiseChanged = onNoiseChanged
-                    )
+            when (denoiseControlType(noises)) {
+                DenoiseControlType.SLIDER -> {
+                    ParameterMorphContainer(morphKey = noises) {
+                        NoiseSliderRow(
+                            value = state.noise,
+                            options = noises,
+                            onNoiseChanged = onNoiseChanged
+                        )
+                    }
                 }
-            } else {
-                DenoiseUnavailableRow()
+                DenoiseControlType.SEGMENTED -> {
+                    ParameterMorphContainer(morphKey = noises) {
+                        DenoiseSegmentedRow(
+                            value = state.noise,
+                            options = noises,
+                            onNoiseChanged = onNoiseChanged
+                        )
+                    }
+                }
+                DenoiseControlType.UNAVAILABLE -> DenoiseUnavailableRow()
             }
 
             SectionLabel("加速模式")
@@ -470,11 +476,18 @@ private fun ParameterSheet(
             )
 
             SectionLabel("分块大小")
+            val selectedTileChoice = if (state.tileSizeMode == TileSizeMode.AUTO) {
+                TileSizeChoices.first()
+            } else {
+                TileSizeChoices.firstOrNull { it.value == sanitizeTileSize(state.tileSize) } ?: TileSizeChoices.first()
+            }
             AnimatedSegmentedSelector(
-                items = TileSizeOptions,
-                selected = sanitizeTileSize(state.tileSize),
-                itemLabel = { it.toString() },
-                onSelected = onTileSizeChanged
+                items = TileSizeChoices,
+                selected = selectedTileChoice,
+                itemLabel = { it.label },
+                onSelected = { choice ->
+                    choice.value?.let(onTileSizeChanged) ?: onTileSizeAutoSelected()
+                }
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -570,6 +583,26 @@ private fun ParameterMorphContainer(
 internal fun nearestNoiseLevel(options: List<Int>, raw: Float): Int =
     options.sorted().ifEmpty { listOf(0) }.minBy { abs(it - raw) }
 
+internal fun denoiseControlType(options: List<Int>): DenoiseControlType {
+    val safeOptions = options.distinct().sorted()
+    if (safeOptions.size <= 1) return DenoiseControlType.UNAVAILABLE
+    val contiguous = safeOptions.zipWithNext().all { (left, right) -> right - left == 1 }
+    return if (contiguous && safeOptions.first() >= 0) {
+        DenoiseControlType.SLIDER
+    } else {
+        DenoiseControlType.SEGMENTED
+    }
+}
+
+internal fun denoiseOptionLabel(value: Int): String {
+    return when (value) {
+        -1 -> "保守"
+        0 -> "关闭"
+        3 -> "强"
+        else -> value.toString()
+    }
+}
+
 @Composable
 private fun NoiseSliderRow(
     value: Int,
@@ -617,6 +650,38 @@ private fun NoiseSliderRow(
         ) { number ->
             Text(number.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         }
+    }
+}
+
+@Composable
+private fun DenoiseSegmentedRow(
+    value: Int,
+    options: List<Int>,
+    onNoiseChanged: (Int) -> Unit
+) {
+    val safeOptions = options.distinct().sorted().ifEmpty { listOf(0) }
+    val safeValue = nearestNoiseLevel(safeOptions, value.toFloat())
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("降噪等级", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Spacer(modifier = Modifier.weight(1f))
+            AnimatedContent(
+                targetState = safeValue,
+                transitionSpec = {
+                    (slideInVertically(tween(180)) { it } + fadeIn(tween(140))) togetherWith
+                        (slideOutVertically(tween(140)) { -it } + fadeOut(tween(100)))
+                },
+                label = "denoiseSegmentedValue"
+            ) { number ->
+                Text(denoiseOptionLabel(number), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            }
+        }
+        AnimatedSegmentedSelector(
+            items = safeOptions,
+            selected = safeValue,
+            itemLabel = ::denoiseOptionLabel,
+            onSelected = onNoiseChanged
+        )
     }
 }
 
@@ -1318,7 +1383,7 @@ private fun RenderStatusStrip(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        progress.message.toReadableProgress(),
+                        progress.message.toReadableProgressMessage(),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -1838,7 +1903,7 @@ private fun UpscaleStage.stageLabel(): String {
     }
 }
 
-private fun String.toReadableProgress(): String {
+internal fun String.toReadableProgressMessage(): String {
     return when {
         contains("Native inference complete", ignoreCase = true) -> "本地推理完成"
         contains("Saved to Pictures", ignoreCase = true) -> "已保存到 Pictures/LocalSR"

@@ -15,16 +15,22 @@ import com.lumasr.data.GalleryRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ModelAssetRepository
 import com.lumasr.data.ModelManifestRepository
+import com.lumasr.data.UserPreferencesRepository
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.AutoTileSizePolicy
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ResourceBudgetPolicy
+import com.lumasr.domain.TileSizeMode
+import com.lumasr.domain.TileSizePreferences
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleParamsFactory
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
+import com.lumasr.domain.sanitizeDenoiseForScale
+import com.lumasr.domain.sanitizeTargetScale
 import com.lumasr.processor.HybridSuperResProcessor
 import com.lumasr.domain.SuperResProcessor
 import kotlinx.coroutines.CoroutineDispatcher
@@ -46,6 +52,7 @@ class LumaViewModel(
     private val imageCacheRepository: ImageCacheRepository = ImageCacheRepository(application),
     private val modelAssetRepository: ModelAssetRepository = ModelAssetRepository.fromContext(application),
     private val galleryRepository: GalleryRepository = GalleryRepository(application),
+    private val userPreferencesRepository: UserPreferencesRepository = UserPreferencesRepository.fromContext(application),
     private val processor: SuperResProcessor = HybridSuperResProcessor(),
     private val modelRuntimePolicy: ModelRuntimePolicy = ModelRuntimePolicy(Build.SUPPORTED_ABIS.toList()),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
@@ -57,6 +64,7 @@ class LumaViewModel(
     private var currentTaskId: String? = null
 
     init {
+        _uiState.update { it.withTileSizePreferences(userPreferencesRepository.loadTileSizePreferences()) }
         loadManifest()
     }
 
@@ -78,8 +86,9 @@ class LumaViewModel(
                         savedOutputUri = null,
                         savedOutputUris = emptyList(),
                         resultMessage = null
-                    )
+                    ).withAutoTileSizeForCurrentSelection()
                 }
+                persistTileSizePreferences(_uiState.value)
             }.onFailure { error ->
                 _uiState.update { it.copy(resultMessage = "Cannot read selected image: ${error.message}") }
             }
@@ -107,8 +116,9 @@ class LumaViewModel(
                         savedOutputUri = null,
                         savedOutputUris = emptyList(),
                         resultMessage = null
-                    )
+                    ).withAutoTileSizeForCurrentSelection()
                 }
+                persistTileSizePreferences(_uiState.value)
             }.onFailure { error ->
                 _uiState.update { it.copy(resultMessage = "Cannot read selected images: ${error.message}") }
             }
@@ -123,22 +133,38 @@ class LumaViewModel(
     fun selectModel(modelId: String) {
         val model = _uiState.value.models.firstOrNull { it.id == modelId } ?: return
         _uiState.update {
+            val scale = model.defaultScale
             it.copy(
                 selectedModelId = modelId,
-                scale = model.defaultScale,
-                noise = model.defaultNoise,
+                scale = scale,
+                noise = model.sanitizeDenoiseForScale(scale, model.defaultNoise),
                 accelerationMode = modelRuntimePolicy.sanitizeAccelerationMode(model, it.accelerationMode),
                 tta = false
-            )
+            ).withAutoTileSizeForCurrentSelection(model = model, scale = scale)
         }
+        persistTileSizePreferences(_uiState.value)
     }
 
     fun setScale(scale: Int) {
-        _uiState.update { it.copy(scale = scale) }
+        _uiState.update { state ->
+            val model = state.selectedModel
+            val resolvedScale = model?.sanitizeTargetScale(scale) ?: scale
+            val resolvedNoise = model?.sanitizeDenoiseForScale(resolvedScale, state.noise) ?: state.noise
+            state.copy(
+                scale = resolvedScale,
+                noise = resolvedNoise
+            ).withAutoTileSizeForCurrentSelection(model = model, scale = resolvedScale)
+        }
+        persistTileSizePreferences(_uiState.value)
     }
 
     fun setNoise(noise: Int) {
-        _uiState.update { it.copy(noise = noise) }
+        _uiState.update { state ->
+            val model = state.selectedModel
+            state.copy(
+                noise = model?.sanitizeDenoiseForScale(state.scale, noise) ?: noise
+            )
+        }
     }
 
     fun setAccelerationMode(mode: AccelerationMode) {
@@ -155,7 +181,23 @@ class LumaViewModel(
     }
 
     fun setTileSize(tileSize: Int) {
-        _uiState.update { it.copy(tileSize = sanitizeTileSize(tileSize)) }
+        val sanitized = sanitizeTileSize(tileSize)
+        _uiState.update {
+            it.copy(
+                tileSizeMode = TileSizeMode.MANUAL,
+                manualTileSize = sanitized,
+                tileSize = sanitized
+            )
+        }
+        persistTileSizePreferences(_uiState.value)
+    }
+
+    fun setTileSizeAuto() {
+        _uiState.update {
+            it.copy(tileSizeMode = TileSizeMode.AUTO)
+                .withAutoTileSizeForCurrentSelection()
+        }
+        persistTileSizePreferences(_uiState.value)
     }
 
     fun setTta(enabled: Boolean) {
@@ -175,12 +217,13 @@ class LumaViewModel(
         if (images.isEmpty()) return
         val model = state.selectedModel ?: return
         val rejectedImage = images.firstNotNullOfOrNull { image ->
+            val requestedTileSize = state.tileSizeFor(image, model, state.scale)
             val decision = ResourceBudgetPolicy.evaluate(
                 imageWidth = image.width,
                 imageHeight = image.height,
                 model = model,
                 scale = state.scale,
-                tileSize = state.tileSize,
+                tileSize = requestedTileSize,
                 gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                 accelerationMode = state.accelerationMode,
                 tta = state.tta
@@ -226,16 +269,25 @@ class LumaViewModel(
             for ((index, image) in images.withIndex()) {
                 if (!isActive) break
 
+                val requestedTileSize = state.tileSizeFor(image, model, state.scale)
                 val budgetDecision = ResourceBudgetPolicy.evaluate(
                     imageWidth = image.width,
                     imageHeight = image.height,
                     model = model,
                     scale = state.scale,
-                    tileSize = state.tileSize,
+                    tileSize = requestedTileSize,
                     gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
                     accelerationMode = state.accelerationMode,
                     tta = state.tta
                 )
+                if (state.tileSizeMode == TileSizeMode.AUTO) {
+                    persistTileSizePreferences(
+                        state.copy(
+                            tileSize = budgetDecision.tileSize,
+                            lastAutoTileSize = budgetDecision.tileSize
+                        )
+                    )
+                }
                 val taskId = UUID.randomUUID().toString()
                 currentTaskId = taskId
                 _uiState.update {
@@ -373,6 +425,10 @@ class LumaViewModel(
         }
     }
 
+    private fun persistTileSizePreferences(state: LumaUiState) {
+        userPreferencesRepository.saveTileSizePreferences(state.toTileSizePreferences())
+    }
+
     fun cancelProcessing() {
         currentTaskId?.let(processor::cancel)
     }
@@ -486,6 +542,9 @@ data class LumaUiState(
     val selectedImages: List<SelectedImageInfo> = emptyList(),
     val scale: Int = 2,
     val noise: Int = 1,
+    val tileSizeMode: TileSizeMode = TileSizeMode.AUTO,
+    val manualTileSize: Int = DEFAULT_TILE_SIZE,
+    val lastAutoTileSize: Int = DEFAULT_TILE_SIZE,
     val tileSize: Int = DEFAULT_TILE_SIZE,
     val accelerationMode: AccelerationMode = AccelerationMode.AUTO,
     val tta: Boolean = false,
@@ -614,12 +673,70 @@ fun LumaUiState.clearImageSelection(): LumaUiState {
 fun LumaUiState.withLoadedManifest(manifest: ModelManifest): LumaUiState {
     val defaultModel = manifest.models.firstOrNull { it.id == DEFAULT_MODEL_ID }
         ?: manifest.models.firstOrNull()
+    val resolvedScale = defaultModel?.defaultScale ?: scale
     return copy(
         models = manifest.models,
         selectedModelId = defaultModel?.id,
-        scale = defaultModel?.defaultScale ?: scale,
-        noise = defaultModel?.defaultNoise ?: noise
+        scale = resolvedScale,
+        noise = defaultModel?.sanitizeDenoiseForScale(resolvedScale, defaultModel.defaultNoise) ?: noise
+    ).withAutoTileSizeForCurrentSelection(model = defaultModel, scale = resolvedScale)
+}
+
+fun LumaUiState.withTileSizePreferences(preferences: TileSizePreferences): LumaUiState {
+    val manual = sanitizeTileSize(preferences.manualTileSize)
+    val lastAuto = sanitizeTileSize(preferences.lastAutoTileSize)
+    return copy(
+        tileSizeMode = preferences.mode,
+        manualTileSize = manual,
+        lastAutoTileSize = lastAuto,
+        tileSize = if (preferences.mode == TileSizeMode.MANUAL) manual else lastAuto
     )
+}
+
+fun LumaUiState.toTileSizePreferences(): TileSizePreferences {
+    return TileSizePreferences(
+        mode = tileSizeMode,
+        manualTileSize = sanitizeTileSize(manualTileSize),
+        lastAutoTileSize = sanitizeTileSize(lastAutoTileSize)
+    )
+}
+
+fun LumaUiState.withAutoTileSizeForCurrentSelection(
+    model: ModelPack? = selectedModel,
+    scale: Int = this.scale
+): LumaUiState {
+    if (tileSizeMode != TileSizeMode.AUTO) {
+        return copy(tileSize = sanitizeTileSize(manualTileSize))
+    }
+    val autoTileSize = autoTileSizeForCurrentSelection(model = model, scale = scale)
+    return copy(tileSize = autoTileSize, lastAutoTileSize = autoTileSize)
+}
+
+fun LumaUiState.autoTileSizeForCurrentSelection(
+    model: ModelPack? = selectedModel,
+    scale: Int = this.scale
+): Int {
+    val images = selectedImages.ifEmpty { selectedImage?.let(::listOf).orEmpty() }
+    if (images.isEmpty()) {
+        return sanitizeTileSize(tileSize)
+    }
+    return images
+        .map { image -> AutoTileSizePolicy.resolve(image.width, image.height, model, scale) }
+        .minOrNull()
+        ?.let(::sanitizeTileSize)
+        ?: DEFAULT_TILE_SIZE
+}
+
+private fun LumaUiState.tileSizeFor(
+    image: SelectedImageInfo,
+    model: ModelPack,
+    scale: Int
+): Int {
+    return if (tileSizeMode == TileSizeMode.AUTO) {
+        AutoTileSizePolicy.resolve(image.width, image.height, model, scale)
+    } else {
+        manualTileSize
+    }.let(::sanitizeTileSize)
 }
 
 private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {

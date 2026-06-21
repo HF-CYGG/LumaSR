@@ -1,5 +1,7 @@
 package com.lumasr.domain
 
+import kotlin.math.abs
+
 fun ModelPack.availableTargetScales(): List<Int> {
     val nativeScales = availableNativePassScales()
     if (nativeScales.isEmpty()) {
@@ -32,6 +34,12 @@ fun ModelPack.availableDenoiseForScale(targetScale: Int): List<Int> {
         .sorted()
 
     return available.ifEmpty { denoise.sorted() }
+}
+
+fun ModelPack.sanitizeDenoiseForScale(targetScale: Int, noise: Int): Int {
+    return availableDenoiseForScale(targetScale)
+        .ifEmpty { listOf(defaultNoise) }
+        .minBy { abs(it - noise) }
 }
 
 fun ModelPack.sanitizeTargetScale(targetScale: Int): Int {

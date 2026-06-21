@@ -21,9 +21,7 @@ object UpscaleParamsFactory {
         outputFormat: OutputFormat = OutputFormat.PNG
     ): UpscaleParams {
         val resolvedScale = model.sanitizeTargetScale(scale)
-        val resolvedNoise = model.availableDenoiseForScale(resolvedScale)
-            .ifEmpty { listOf(model.defaultNoise) }
-            .minBy { kotlin.math.abs(it - noise) }
+        val resolvedNoise = model.sanitizeDenoiseForScale(resolvedScale, noise)
 
         return UpscaleParams(
             taskId = taskId,

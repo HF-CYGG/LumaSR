@@ -3,6 +3,8 @@ package com.lumasr.ui
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.SuperResEngine
+import com.lumasr.domain.TileSizeMode
+import com.lumasr.domain.TileSizePreferences
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import org.junit.Assert.assertEquals
@@ -112,7 +114,38 @@ class LumaUiStateSelectionTest {
     fun defaultTileSizeUsesBalancedPerformancePreset() {
         val state = LumaUiState()
 
+        assertEquals(TileSizeMode.AUTO, state.tileSizeMode)
         assertEquals(512, state.tileSize)
+    }
+
+    @Test
+    fun appliesRememberedManualTileSizePreference() {
+        val state = LumaUiState().withTileSizePreferences(
+            TileSizePreferences(
+                mode = TileSizeMode.MANUAL,
+                manualTileSize = 768,
+                lastAutoTileSize = 256
+            )
+        )
+
+        assertEquals(TileSizeMode.MANUAL, state.tileSizeMode)
+        assertEquals(768, state.manualTileSize)
+        assertEquals(768, state.tileSize)
+    }
+
+    @Test
+    fun appliesRememberedAutoTileSizePreference() {
+        val state = LumaUiState().withTileSizePreferences(
+            TileSizePreferences(
+                mode = TileSizeMode.AUTO,
+                manualTileSize = 1024,
+                lastAutoTileSize = 256
+            )
+        )
+
+        assertEquals(TileSizeMode.AUTO, state.tileSizeMode)
+        assertEquals(1024, state.manualTileSize)
+        assertEquals(256, state.tileSize)
     }
 
     @Test
