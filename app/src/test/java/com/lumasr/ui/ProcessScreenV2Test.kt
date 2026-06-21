@@ -112,4 +112,22 @@ class ProcessScreenV2Test {
         assertTrue(colors.selectedBorder.alpha > 0f)
         assertTrue(colors.inactiveContentAlpha < 1f)
     }
+
+    @Test
+    fun visibleCarouselWindowKeepsCurrentAndNeighborPages() {
+        assertEquals(emptyList<Int>(), visibleCarouselPageIndexes(currentIndex = 0, totalCount = 0))
+        assertEquals(listOf(0), visibleCarouselPageIndexes(currentIndex = 0, totalCount = 1))
+        assertEquals(listOf(0, 1), visibleCarouselPageIndexes(currentIndex = 0, totalCount = 3))
+        assertEquals(listOf(0, 1, 2), visibleCarouselPageIndexes(currentIndex = 1, totalCount = 3))
+        assertEquals(listOf(1, 2), visibleCarouselPageIndexes(currentIndex = 2, totalCount = 3))
+    }
+
+    @Test
+    fun visibleCarouselWindowPreloadsNextTargetBeforeIndexChange() {
+        val beforeSwipe = visibleCarouselPageIndexes(currentIndex = 1, totalCount = 4)
+        val afterSwipe = visibleCarouselPageIndexes(currentIndex = 2, totalCount = 4)
+
+        assertTrue(2 in beforeSwipe)
+        assertTrue(2 in afterSwipe)
+    }
 }

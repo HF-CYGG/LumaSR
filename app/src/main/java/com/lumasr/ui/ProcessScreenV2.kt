@@ -72,6 +72,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -1097,11 +1098,11 @@ private fun PreviewImageCarousel(
                 if (images.isEmpty()) {
                     CleanImagePlaceholder()
                 } else {
-                    ((safeIndex - 1)..(safeIndex + 1))
-                        .filter { it in images.indices }
-                        .forEach { pageIndex ->
+                    visibleCarouselPageIndexes(safeIndex, images.size).forEach { pageIndex ->
+                        val image = images[pageIndex]
+                        key(image.sourceUri) {
                             PreviewImagePage(
-                                path = images[pageIndex].sourceUri,
+                                path = image.sourceUri,
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .offset {
@@ -1112,6 +1113,7 @@ private fun PreviewImageCarousel(
                                     }
                             )
                         }
+                    }
                 }
 
                 if (images.size > 1) {
@@ -1126,6 +1128,14 @@ private fun PreviewImageCarousel(
             }
         }
     }
+}
+
+internal fun visibleCarouselPageIndexes(currentIndex: Int, totalCount: Int): List<Int> {
+    if (totalCount <= 0) return emptyList()
+    val safeIndex = currentIndex.coerceIn(0, totalCount - 1)
+    val first = (safeIndex - 1).coerceAtLeast(0)
+    val last = (safeIndex + 1).coerceAtMost(totalCount - 1)
+    return (first..last).toList()
 }
 
 @Composable
@@ -1705,11 +1715,11 @@ private fun ResultPreviewCarousel(
                 if (results.isEmpty()) {
                     CleanImagePlaceholder()
                 } else {
-                    ((safeIndex - 1)..(safeIndex + 1))
-                        .filter { it in results.indices }
-                        .forEach { pageIndex ->
+                    visibleCarouselPageIndexes(safeIndex, results.size).forEach { pageIndex ->
+                        val result = results[pageIndex]
+                        key(result.carouselKey()) {
                             ResultPreviewPage(
-                                result = results[pageIndex],
+                                result = result,
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .offset {
@@ -1720,6 +1730,7 @@ private fun ResultPreviewCarousel(
                                     }
                             )
                         }
+                    }
                 }
 
                 if (results.size > 1) {
@@ -1735,6 +1746,9 @@ private fun ResultPreviewCarousel(
         }
     }
 }
+
+private fun RenderResultInfo.carouselKey(): String =
+    taskId.ifBlank { "$inputPath->$outputPath" }
 
 @Composable
 private fun ResultPreviewPage(
