@@ -121,7 +121,7 @@ private enum class ProcessVisualMode {
     Rendering
 }
 
-internal const val ProcessSheetBottomSpacerDp = 600
+internal const val ProcessSheetBottomSpacerDp = 128
 
 @Composable
 fun ProcessTabV2(

@@ -6,6 +6,6 @@ import org.junit.Test
 class ProcessScreenV2Test {
     @Test
     fun keepsStartButtonAboveFloatingBottomNavigationWhenScrolledToEnd() {
-        assertTrue(ProcessSheetBottomSpacerDp >= 560)
+        assertTrue(ProcessSheetBottomSpacerDp in 128..160)
     }
 }
