@@ -2,6 +2,10 @@
 
 namespace {
 
+static_assert(output_pixels_within_budget(589, 1280, 4));
+static_assert(!output_pixels_within_budget(589, 1280, 16));
+static_assert(!output_pixels_within_budget(2147483647, 2, 2));
+
 constexpr TileInputRegion kCunetInterior = make_waifu2x_tile_region(
     2,
     18,

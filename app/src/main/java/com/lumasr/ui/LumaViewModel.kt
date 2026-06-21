@@ -20,6 +20,7 @@ import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.ResourceBudgetPolicy
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleParamsFactory
 import com.lumasr.domain.UpscaleProgress
@@ -173,6 +174,30 @@ class LumaViewModel(
         val images = state.selectedImages.ifEmpty { state.selectedImage?.let(::listOf).orEmpty() }
         if (images.isEmpty()) return
         val model = state.selectedModel ?: return
+        val rejectedImage = images.firstNotNullOfOrNull { image ->
+            val decision = ResourceBudgetPolicy.evaluate(
+                imageWidth = image.width,
+                imageHeight = image.height,
+                model = model,
+                scale = state.scale,
+                tileSize = state.tileSize,
+                gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
+                accelerationMode = state.accelerationMode,
+                tta = state.tta
+            )
+            if (decision.allowed) null else image.displayName to decision.message
+        }
+        if (rejectedImage != null) {
+            _uiState.update {
+                it.copy(
+                    screen = LumaScreen.EDITING,
+                    selectedTab = LumaTab.PROCESS,
+                    progress = null,
+                    resultMessage = "${rejectedImage.first}: ${rejectedImage.second.orEmpty()}"
+                )
+            }
+            return
+        }
         currentJob?.cancel()
 
         // Batch state stays in the ViewModel so Compose can render the queue without owning task logic.
@@ -201,6 +226,16 @@ class LumaViewModel(
             for ((index, image) in images.withIndex()) {
                 if (!isActive) break
 
+                val budgetDecision = ResourceBudgetPolicy.evaluate(
+                    imageWidth = image.width,
+                    imageHeight = image.height,
+                    model = model,
+                    scale = state.scale,
+                    tileSize = state.tileSize,
+                    gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
+                    accelerationMode = state.accelerationMode,
+                    tta = state.tta
+                )
                 val taskId = UUID.randomUUID().toString()
                 currentTaskId = taskId
                 _uiState.update {
@@ -214,7 +249,11 @@ class LumaViewModel(
                         completedResults = emptyList(),
                         savedOutputUri = null,
                         savedOutputUris = emptyList(),
-                        resultMessage = null
+                        resultMessage = budgetDecision.message,
+                        scale = budgetDecision.scale,
+                        tileSize = budgetDecision.tileSize,
+                        accelerationMode = budgetDecision.accelerationMode,
+                        tta = budgetDecision.tta
                     )
                 }
 
@@ -227,13 +266,13 @@ class LumaViewModel(
                             outputPath = paths.outputFile.absolutePath,
                             model = model,
                             resolvedModelDir = modelDir,
-                            scale = state.scale,
+                            scale = budgetDecision.scale,
                             noise = state.noise,
-                            tileSize = state.tileSize,
-                            gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
-                            accelerationMode = state.accelerationMode,
+                            tileSize = budgetDecision.tileSize,
+                            gpuHeadroomPercent = budgetDecision.gpuHeadroomPercent,
+                            accelerationMode = budgetDecision.accelerationMode,
                             allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
-                            tta = state.tta,
+                            tta = budgetDecision.tta,
                             outputFormat = OutputFormat.PNG
                         )
                     }
@@ -321,7 +360,7 @@ class LumaViewModel(
             _uiState.update {
                 it.copy(
                     screen = if (lastSuccess) LumaScreen.COMPARE else LumaScreen.EDITING,
-                    resultMessage = lastResultMessage,
+                    resultMessage = if (lastSuccess) it.resultMessage ?: lastResultMessage else lastResultMessage,
                     progress = it.progress ?: finalTaskId?.let(::doneProgress),
                     activeBatchIndex = 0,
                     activeBatchSize = images.size,

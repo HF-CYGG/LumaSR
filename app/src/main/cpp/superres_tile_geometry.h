@@ -13,6 +13,26 @@ struct TileInputRegion {
     int copyH;
 };
 
+constexpr long long kMaxOutputPixels = 64000000LL;
+constexpr int kMaxIntDimension = 2147483647;
+
+constexpr bool safe_mul_leq(long long left, long long right, long long limit) {
+    return left >= 0 && right >= 0 && limit >= 0 && (left == 0 || right <= limit / left);
+}
+
+constexpr bool output_pixels_within_budget(int imageW, int imageH, int scale, long long maxPixels = kMaxOutputPixels) {
+    if (imageW <= 0 || imageH <= 0 || scale <= 0) {
+        return false;
+    }
+    if (!safe_mul_leq(imageW, scale, kMaxIntDimension) ||
+        !safe_mul_leq(imageH, scale, kMaxIntDimension)) {
+        return false;
+    }
+    const long long outputW = static_cast<long long>(imageW) * scale;
+    const long long outputH = static_cast<long long>(imageH) * scale;
+    return safe_mul_leq(outputW, outputH, maxPixels);
+}
+
 constexpr int align_delta(int value, int alignment) {
     if (alignment <= 1) {
         return 0;

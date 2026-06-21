@@ -26,7 +26,7 @@ object UpscaleErrorMapper {
             UpscaleErrorCode.MODEL_CHECKSUM_FAILED -> "The selected model files failed validation."
             UpscaleErrorCode.VULKAN_NOT_AVAILABLE -> "GPU acceleration is unavailable. Switched to CPU retry."
             UpscaleErrorCode.VULKAN_RUNTIME_FAILED -> "GPU acceleration failed. Switched to CPU retry."
-            UpscaleErrorCode.OUT_OF_MEMORY -> "Memory is insufficient. Try a smaller image or lower scale."
+            UpscaleErrorCode.OUT_OF_MEMORY -> "内存不足或输出尺寸过大，请降低倍率、减小分块或换用更小图片。"
             UpscaleErrorCode.OUTPUT_WRITE_FAILED -> "Output failed. Check storage space and retry."
             UpscaleErrorCode.TILE_OUTPUT_MISMATCH -> "Model output size was inconsistent. Processing stopped to avoid striped exports."
             UpscaleErrorCode.NATIVE_UNAVAILABLE -> "Native inference is not installed. Install the native runtime and built-in models."

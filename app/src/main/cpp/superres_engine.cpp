@@ -601,6 +601,19 @@ SuperResNativeCode run_ncnn(
         return SuperResNativeCode::Cancelled;
     }
 
+    if (!output_pixels_within_budget(image.width, image.height, params.scale)) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Rejecting output allocation image=%dx%d scale=%d maxPixels=%lld",
+            image.width,
+            image.height,
+            params.scale,
+            kMaxOutputPixels
+        );
+        return SuperResNativeCode::OutOfMemory;
+    }
+
     std::unique_lock<std::mutex> gpuLock(gpu_mutex, std::defer_lock);
     if (useVulkan) {
         gpuLock.lock();
@@ -625,9 +638,15 @@ SuperResNativeCode run_ncnn(
     const int outputW = image.width * params.scale;
     const int outputH = image.height * params.scale;
 
-    std::vector<unsigned char> output(static_cast<size_t>(outputW) * outputH * 3);
-    std::vector<unsigned char> coverage(static_cast<size_t>(outputW) * outputH);
-    if (output.empty()) {
+    std::vector<unsigned char> output;
+    std::vector<unsigned char> coverage;
+    try {
+        output.resize(static_cast<size_t>(outputW) * outputH * 3);
+        coverage.resize(static_cast<size_t>(outputW) * outputH);
+    } catch (...) {
+        return SuperResNativeCode::OutOfMemory;
+    }
+    if (output.empty() || coverage.empty()) {
         return SuperResNativeCode::OutOfMemory;
     }
 
