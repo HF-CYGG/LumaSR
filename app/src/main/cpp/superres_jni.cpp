@@ -195,7 +195,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_mergeRawTilesToPngNative(
         env->DeleteLocalRef(path);
     }
 
-    return static_cast<jint>(merge_raw_tiles_to_png(
+    return static_cast<jint>(merge_raw_tiles_to_png_streaming(
         to_string(env, output_path),
         static_cast<int>(output_width),
         static_cast<int>(output_height),
