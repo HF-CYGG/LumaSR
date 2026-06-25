@@ -107,7 +107,13 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ## 许可与来源
 
-项目代码遵循 [LICENSE](LICENSE)。ncnn、Waifu2x、RealCUGAN 及模型权重遵循各自上游项目许可；分发或二次打包前请确认对应模型来源、授权和署名要求。
+项目代码采用 [LumaSR Noncommercial License](LICENSE)，仅允许非商业目的使用、复制、修改和再分发。
+
+**不得用于任何商业行为。** 未经版权所有者事先书面授权，任何个人、团队、公司或平台均不得将本项目、修改版、构建产物、APK、模型整合包或衍生作品用于售卖、付费下载、付费分发、商业服务、广告变现、订阅收费、内购、商业产品捆绑、平台运营或其他任何营利目的。
+
+分发或转载时必须保留本许可声明和版权声明。历史上已经按 MIT License 获取的旧版本，仍可能受当时许可约束；本次更改适用于本仓库后续发布的代码版本。
+
+ncnn、Waifu2x、RealCUGAN 及模型权重遵循各自上游项目许可；分发或二次打包前请确认对应模型来源、授权和署名要求。
 ## Model Update: Real-ESRGAN
 
 LumaSR now exposes additional built-in Real-ESRGAN models through `model_manifest.json`:
