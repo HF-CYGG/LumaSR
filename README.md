@@ -11,6 +11,10 @@ LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与
 
 项目目标是把常见超分模型做成可直接在手机端运行的轻量工具：不上传图片、不依赖云端服务，并尽量保留清晰、可维护的 Android 与 Native 分层。
 
+## 界面预览
+
+<img src="docs/images/app-preview-v0.2.1.jpg" alt="LumaSR 应用处理参数界面预览" width="360">
+
 ## 功能特性
 
 - 本地离线推理：图片与模型均在设备端处理。
