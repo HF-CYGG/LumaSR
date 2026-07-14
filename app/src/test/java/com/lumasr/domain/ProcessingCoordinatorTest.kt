@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -423,6 +424,7 @@ class ProcessingCoordinatorTest {
             coordinator.enqueue(task("worker-exit"), spec("worker-exit"))
             withTimeout(5_000L) { failedFind.await() }
             coordinator.awaitWorkerStopped()
+            assertFalse(coordinator.isWorkerCancelled())
 
             coordinator.resumePersistedWork()
 
@@ -431,6 +433,144 @@ class ProcessingCoordinatorTest {
             coordinator.awaitState("worker-exit", ProcessingTaskState.COMPLETED)
             assertEquals(1, runner.startedIds.count { it == "worker-exit" })
             Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun runnerCancellationWithActiveParentRecoversRunningAndResumesOnce() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val attempts = AtomicInteger(0)
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult = if (attempts.incrementAndGet() == 1) {
+                throw CancellationException("runner cancelled itself")
+            } else {
+                ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("runner-cancel"), spec("runner-cancel"))
+            coordinator.awaitWorkerStopped()
+
+            assertFalse(coordinator.isWorkerCancelled())
+            assertEquals(ProcessingTaskState.QUEUED, tasks.find("runner-cancel")?.state)
+            assertEquals(ProcessingTaskState.QUEUED, coordinator.taskState("runner-cancel"))
+            assertEquals(1, attempts.get())
+            delay(50L)
+            assertEquals(1, attempts.get())
+
+            coordinator.resumePersistedWork()
+
+            coordinator.awaitState("runner-cancel", ProcessingTaskState.COMPLETED)
+            assertEquals(2, attempts.get())
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun recoverySaveFailureDropsStaleRunningMemoryUntilExplicitResume() = runBlocking {
+        val attempts = AtomicInteger(0)
+        val failRecoverySave = AtomicBoolean(true)
+        val tasks = InMemoryTaskRepository(
+            beforeSave = { saved ->
+                if (
+                    saved.id == "recovery-save" &&
+                    saved.state == ProcessingTaskState.QUEUED &&
+                    attempts.get() == 1 &&
+                    failRecoverySave.compareAndSet(true, false)
+                ) {
+                    throw IOException("recovery persistence unavailable")
+                }
+            }
+        )
+        val work = InMemoryWorkRepository()
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult = if (attempts.incrementAndGet() == 1) {
+                throw CancellationException("runner cancelled itself")
+            } else {
+                ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("recovery-save"), spec("recovery-save"))
+            coordinator.awaitWorkerStopped()
+
+            assertFalse(coordinator.isWorkerCancelled())
+            assertEquals(ProcessingTaskState.RUNNING, tasks.find("recovery-save")?.state)
+            assertEquals(null, coordinator.taskState("recovery-save"))
+            assertEquals(1, attempts.get())
+
+            coordinator.resumePersistedWork()
+
+            coordinator.awaitState("recovery-save", ProcessingTaskState.COMPLETED)
+            assertEquals(2, attempts.get())
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun terminalSaveReportedFailureAdoptsPersistedTerminalWithoutRerun() = runBlocking {
+        val attempts = AtomicInteger(0)
+        val failAfterTerminalWrite = AtomicBoolean(true)
+        val tasks = InMemoryTaskRepository(
+            afterSave = { saved ->
+                if (
+                    saved.id == "terminal-write" &&
+                    saved.state == ProcessingTaskState.COMPLETED &&
+                    failAfterTerminalWrite.compareAndSet(true, false)
+                ) {
+                    throw IOException("completion acknowledgement unavailable")
+                }
+            }
+        )
+        val work = InMemoryWorkRepository()
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult {
+                attempts.incrementAndGet()
+                return ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("terminal-write"), spec("terminal-write"))
+            coordinator.awaitWorkerStopped()
+
+            assertFalse(coordinator.isWorkerCancelled())
+            assertEquals(ProcessingTaskState.COMPLETED, tasks.find("terminal-write")?.state)
+            assertEquals(ProcessingTaskState.COMPLETED, coordinator.taskState("terminal-write"))
+            assertEquals(1, attempts.get())
+
+            coordinator.resumePersistedWork()
+            delay(50L)
+
+            assertEquals(1, attempts.get())
         } finally {
             coordinator.close()
         }
@@ -586,12 +726,22 @@ class ProcessingCoordinatorTest {
         }
     }
 
+    private fun ProcessingCoordinator.taskState(taskId: String): ProcessingTaskState? =
+        snapshots.value.firstOrNull { it.task.id == taskId }?.task?.state
+
     private suspend fun ProcessingCoordinator.awaitWorkerStopped() = withTimeout(5_000L) {
-        val field = ProcessingCoordinator::class.java.getDeclaredField("workerJob")
-        field.isAccessible = true
-        while ((field.get(this@awaitWorkerStopped) as? kotlinx.coroutines.Job)?.isCompleted != true) {
+        while (workerJobForTest()?.isCompleted != true) {
             delay(10L)
         }
+    }
+
+    private fun ProcessingCoordinator.isWorkerCancelled(): Boolean =
+        requireNotNull(workerJobForTest()).isCancelled
+
+    private fun ProcessingCoordinator.workerJobForTest(): kotlinx.coroutines.Job? {
+        val field = ProcessingCoordinator::class.java.getDeclaredField("workerJob")
+        field.isAccessible = true
+        return field.get(this) as? kotlinx.coroutines.Job
     }
 
     private fun task(
@@ -707,7 +857,8 @@ class ProcessingCoordinatorTest {
     }
 
     private class InMemoryTaskRepository(
-        private val afterSave: suspend (ProcessingTask) -> Unit = {}
+        private val afterSave: suspend (ProcessingTask) -> Unit = {},
+        private val beforeSave: suspend (ProcessingTask) -> Unit = {}
     ) : ProcessingTaskRepository {
         private val records = ConcurrentHashMap<String, ProcessingTask>()
         val saved = CopyOnWriteArrayList<ProcessingTask>()
@@ -717,6 +868,7 @@ class ProcessingCoordinatorTest {
         }
 
         override suspend fun save(task: ProcessingTask) {
+            beforeSave(task)
             records[task.id] = task
             saved += task
             afterSave(task)

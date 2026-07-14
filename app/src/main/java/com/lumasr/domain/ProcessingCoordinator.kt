@@ -230,16 +230,80 @@ class ProcessingCoordinator(
             try {
                 execute(taskId)
             } catch (failure: Throwable) {
+                val workerWasCancelled = !currentCoroutineContext().isActive
                 withContext(NonCancellable) {
-                    stateMutex.withLock {
-                        if (tasksById[taskId]?.state == ProcessingTaskState.QUEUED) {
-                            enqueuedTaskIds.remove(taskId)
-                        }
-                    }
+                    recoverAfterWorkerFailure(taskId)
                 }
-                throw failure
+                if (workerWasCancelled) throw failure
+                return
             }
         }
+    }
+
+    private suspend fun recoverAfterWorkerFailure(taskId: String) {
+        stateMutex.withLock {
+            val current = tasksById[taskId] ?: return
+            enqueuedTaskIds.remove(taskId)
+            if (
+                current.state == ProcessingTaskState.PAUSED ||
+                current.state == ProcessingTaskState.CANCELLED ||
+                current.state.isTerminal
+            ) {
+                return
+            }
+            val persistedResult = runCatching { taskRepository.find(taskId) }
+            if (persistedResult.isFailure) {
+                if (current.state == ProcessingTaskState.RUNNING) {
+                    dropFailedTaskVersion(taskId, current)
+                }
+                return
+            }
+            val persisted = persistedResult.getOrNull()
+            if (
+                persisted != null &&
+                persisted.updatedAtEpochMs >= current.updatedAtEpochMs &&
+                persisted.state != ProcessingTaskState.RUNNING
+            ) {
+                tasksById[taskId] = persisted
+                clearWorkerBookkeeping(taskId)
+                publishTask(persisted)
+                return
+            }
+            val running = persisted
+                ?.takeIf {
+                    it.state == ProcessingTaskState.RUNNING &&
+                        it.updatedAtEpochMs >= current.updatedAtEpochMs
+                }
+                ?: current.takeIf { it.state == ProcessingTaskState.RUNNING }
+                ?: return
+            val workSpec = runCatching { workSpecRepository.find(taskId) }.getOrNull()
+            val recovered = TaskRecoveryPolicy.recover(
+                task = running,
+                mode = recoveryMode(running, workSpec),
+                atEpochMs = safeNow(running)
+            )
+            if (runCatching { taskRepository.save(recovered) }.isFailure) {
+                dropFailedTaskVersion(taskId, current)
+                return
+            }
+            tasksById[taskId] = recovered
+            clearWorkerBookkeeping(taskId)
+            publishTask(recovered)
+        }
+    }
+
+    private fun dropFailedTaskVersion(taskId: String, failedVersion: ProcessingTask) {
+        if (tasksById[taskId] != failedVersion) return
+        tasksById.remove(taskId)
+        _snapshots.update { snapshots -> snapshots.filterNot { it.task.id == taskId } }
+        clearWorkerBookkeeping(taskId)
+    }
+
+    private fun clearWorkerBookkeeping(taskId: String) {
+        enqueuedTaskIds.remove(taskId)
+        if (activeExecution?.taskId == taskId) activeExecution = null
+        explicitlyCancelledTaskIds.remove(taskId)
+        clearProgressThrottle(taskId)
     }
 
     private suspend fun ensureWorker() {

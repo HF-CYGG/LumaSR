@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.annotation.RequiresApi
 import com.lumasr.R
 import com.lumasr.data.FileProcessingTaskRepository
@@ -28,6 +29,9 @@ import kotlinx.coroutines.launch
 class SuperResolutionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lifecycleGate = ProcessingServiceLifecycleGate()
+    private val failureBoundary = ProcessingServiceFailureBoundary { code ->
+        Log.e(LOG_TAG, code.stableCode)
+    }
     private lateinit var notificationManager: NotificationManager
     private lateinit var coordinator: ProcessingCoordinator
 
@@ -77,8 +81,13 @@ class SuperResolutionService : Service() {
     @RequiresApi(35)
     override fun onTimeout(startId: Int, fgsType: Int) {
         serviceScope.launch {
-            coordinator.pauseActive()
-            stopSelfResult(startId)
+            failureBoundary.run(ProcessingServiceFailureCode.TIMEOUT_FAILED) {
+                try {
+                    coordinator.pauseActive()
+                } finally {
+                    stopSelfResult(startId)
+                }
+            }
         }
     }
 
@@ -105,11 +114,13 @@ class SuperResolutionService : Service() {
         block: suspend () -> Unit
     ) {
         serviceScope.launch {
-            try {
-                block()
-            } finally {
-                lifecycleGate.completeOperation(operation)
-                stopIfIdle(coordinator.snapshots.value)
+            failureBoundary.run(ProcessingServiceFailureCode.OPERATION_FAILED) {
+                try {
+                    block()
+                } finally {
+                    lifecycleGate.completeOperation(operation)
+                    stopIfIdle(coordinator.snapshots.value)
+                }
             }
         }
     }
@@ -191,5 +202,6 @@ class SuperResolutionService : Service() {
         private const val TASK_DIRECTORY_NAME = "lumasr-tasks"
         private const val NOTIFICATION_CHANNEL_ID = "lumasr-processing"
         private const val NOTIFICATION_ID = 2001
+        private const val LOG_TAG = "LumaSRProcessing"
     }
 }
