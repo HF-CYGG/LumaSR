@@ -1,9 +1,9 @@
 package com.lumasr.data
 
+import com.lumasr.domain.UpscaleErrorCode
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -19,10 +19,10 @@ class DiagnosticRingBufferTest {
         val file = temporaryFolder.newFile("diagnostics.jsonl")
         val ring = DiagnosticRingBuffer(file)
 
-        ring.append(entry(errorCode = "VULKAN_OOM"))
+        ring.append(entry(errorCode = UpscaleErrorCode.OUT_OF_MEMORY))
 
         val json = file.readText()
-        assertTrue(json.contains("VULKAN_OOM"))
+        assertTrue(json.contains(UpscaleErrorCode.OUT_OF_MEMORY.name))
         assertTrue(json.contains("GPU_AVAILABLE"))
         assertTrue(json.contains("TOTAL"))
         assertFalse(json.contains("message"))
@@ -32,18 +32,10 @@ class DiagnosticRingBufferTest {
     }
 
     @Test
-    fun rejectsPathsUrisImageNamesAndArbitraryTextInErrorCodes() {
-        listOf(
-            "/storage/emulated/0/DCIM/private.png",
-            "C:\\Users\\me\\private.png",
-            "content://media/external/images/42",
-            "private.png",
-            "native failed while processing my holiday"
-        ).forEach { unsafeValue ->
-            assertThrows(IllegalArgumentException::class.java) {
-                entry(errorCode = unsafeValue)
-            }
-        }
+    fun errorCodeContractUsesClosedUpscaleEnum() {
+        val errorCodeField = DiagnosticEntry::class.java.getDeclaredField("errorCode")
+
+        assertEquals(UpscaleErrorCode::class.java, errorCodeField.type)
     }
 
     @Test
@@ -78,7 +70,7 @@ class DiagnosticRingBufferTest {
 
     private fun entry(
         timestampEpochMs: Long = 1_000L,
-        errorCode: String? = null
+        errorCode: UpscaleErrorCode? = null
     ) = DiagnosticEntry(
         timestampEpochMs = timestampEpochMs,
         event = DiagnosticEvent.PROCESSING_FINISHED,

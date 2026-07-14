@@ -1,5 +1,6 @@
 package com.lumasr.data
 
+import com.lumasr.domain.UpscaleErrorCode
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -56,19 +57,12 @@ data class DiagnosticEntry(
     val event: DiagnosticEvent,
     val capabilityBuckets: Set<DiagnosticCapabilityBucket> = emptySet(),
     val durationsMs: Map<DiagnosticDurationBucket, Long> = emptyMap(),
-    val errorCode: String? = null,
+    val errorCode: UpscaleErrorCode? = null,
     val fallbackReason: DiagnosticFallbackReason? = null
 ) {
     init {
         require(timestampEpochMs >= 0) { "Diagnostic timestamp must be non-negative" }
         require(durationsMs.values.all { it >= 0 }) { "Diagnostic durations must be non-negative" }
-        require(errorCode == null || SAFE_CODE.matches(errorCode)) {
-            "Diagnostics accept stable error codes only, never messages, names, URIs, or paths"
-        }
-    }
-
-    private companion object {
-        val SAFE_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
     }
 }
 
@@ -124,7 +118,7 @@ class DiagnosticRingBuffer(
                 put(bucket.name, durationMs)
             }
         })
-        put("errorCode", entry.errorCode)
+        put("errorCode", entry.errorCode?.name)
         put("fallbackReason", entry.fallbackReason?.name)
     }.toString()
 

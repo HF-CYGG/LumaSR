@@ -4,9 +4,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class ProcessingTaskTest {
+    @get:Rule
+    val temporaryFolder = TemporaryFolder()
+
     @Test
     fun rejectsContentUriAsCopiedInputLocation() {
         assertThrows(IllegalArgumentException::class.java) {
@@ -115,6 +120,44 @@ class ProcessingTaskTest {
     }
 
     @Test
+    fun pausedRecoveryRemainsPausedAndAppliesCheckpointMode() {
+        val paused = task(
+            state = ProcessingTaskState.PAUSED,
+            completedExtremeTileIndexes = setOf(1, 4),
+            updatedAtEpochMs = 2_000L
+        )
+
+        val recovered = TaskRecoveryPolicy.recover(
+            paused,
+            RecoveryMode.ORDINARY,
+            atEpochMs = 3_000L
+        )
+
+        assertEquals(ProcessingTaskState.PAUSED, recovered.state)
+        assertTrue(recovered.completedExtremeTileIndexes.isEmpty())
+        assertEquals(3_000L, recovered.updatedAtEpochMs)
+    }
+
+    @Test
+    fun queuedRecoveryRemainsQueuedAndAppliesCheckpointMode() {
+        val queued = task(
+            state = ProcessingTaskState.QUEUED,
+            completedExtremeTileIndexes = setOf(2, 5),
+            updatedAtEpochMs = 2_000L
+        )
+
+        val recovered = TaskRecoveryPolicy.recover(
+            queued,
+            RecoveryMode.EXTREME,
+            atEpochMs = 3_000L
+        )
+
+        assertEquals(ProcessingTaskState.QUEUED, recovered.state)
+        assertEquals(setOf(2, 5), recovered.completedExtremeTileIndexes)
+        assertEquals(3_000L, recovered.updatedAtEpochMs)
+    }
+
+    @Test
     fun cleanupPolicyRetainsActiveAndRecentCompletedTasks() {
         val now = TaskCleanupPolicy.COMPLETED_RETENTION_MS + 10_000L
         val active = task(state = ProcessingTaskState.RUNNING)
@@ -149,7 +192,7 @@ class ProcessingTaskTest {
     )
 
     private fun task(
-        copiedInputPath: String = "C:\\app-cache\\tasks\\task-1\\input.png",
+        copiedInputPath: String? = null,
         state: ProcessingTaskState = ProcessingTaskState.QUEUED,
         imageIndex: Int = 0,
         imageCount: Int = 1,
@@ -157,18 +200,21 @@ class ProcessingTaskTest {
         updatedAtEpochMs: Long = 1_000L,
         terminalAtEpochMs: Long? = null,
         retryableErrorCode: String? = null
-    ) = ProcessingTask(
-        id = "task-1",
-        copiedInputPath = copiedInputPath,
-        outputPath = "C:\\app-cache\\tasks\\task-1\\output.png",
-        state = state,
-        imageIndex = imageIndex,
-        imageCount = imageCount,
-        completedExtremeTileIndexes = completedExtremeTileIndexes,
-        createdAtEpochMs = 1_000L,
-        updatedAtEpochMs = updatedAtEpochMs,
-        terminalAtEpochMs = terminalAtEpochMs,
-        retryableErrorCode = retryableErrorCode,
-        executionProfileKey = "realcugan-x4-vulkan-128"
-    )
+    ): ProcessingTask {
+        val taskDirectory = temporaryFolder.root.resolve("tasks/task-1")
+        return ProcessingTask(
+            id = "task-1",
+            copiedInputPath = copiedInputPath ?: taskDirectory.resolve("input.png").absolutePath,
+            outputPath = taskDirectory.resolve("output.png").absolutePath,
+            state = state,
+            imageIndex = imageIndex,
+            imageCount = imageCount,
+            completedExtremeTileIndexes = completedExtremeTileIndexes,
+            createdAtEpochMs = 1_000L,
+            updatedAtEpochMs = updatedAtEpochMs,
+            terminalAtEpochMs = terminalAtEpochMs,
+            retryableErrorCode = retryableErrorCode,
+            executionProfileKey = "realcugan-x4-vulkan-128"
+        )
+    }
 }

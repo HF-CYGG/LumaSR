@@ -141,7 +141,14 @@ object TaskRecoveryPolicy {
         require(!task.state.isTerminal) { "Terminal tasks are not process-death recovery candidates" }
         require(atEpochMs >= task.updatedAtEpochMs) { "Recovery timestamp cannot move backwards" }
         return task.copy(
-            state = ProcessingTaskState.QUEUED,
+            state = when (task.state) {
+                ProcessingTaskState.RUNNING -> ProcessingTaskState.QUEUED
+                ProcessingTaskState.QUEUED,
+                ProcessingTaskState.PAUSED -> task.state
+                ProcessingTaskState.COMPLETED,
+                ProcessingTaskState.FAILED,
+                ProcessingTaskState.CANCELLED -> error("Terminal task passed recovery validation")
+            },
             completedExtremeTileIndexes = when (mode) {
                 RecoveryMode.EXTREME -> task.completedExtremeTileIndexes
                 RecoveryMode.ORDINARY,
