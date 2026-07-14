@@ -85,13 +85,19 @@ class ThermalSampler(
     private val source: ThermalSignalSource,
     private val clock: MonotonicClock = AndroidMonotonicClock
 ) {
+    private var lastStatusReadAtMs: Long? = null
+    private var lastValidLevel: ThermalLevel? = null
     private var lastHeadroomReadAtMs: Long? = null
     private var lastValidHeadroom: Float? = null
 
     @Synchronized
     fun sample(): ThermalSample {
-        val status = source.readStatus()
         val nowMs = clock.nowMs()
+        if (shouldRead(nowMs, lastStatusReadAtMs, MIN_STATUS_INTERVAL_MS)) {
+            lastStatusReadAtMs = nowMs
+            AndroidThermalStatusMapper.map(source.readStatus())
+                ?.let { lastValidLevel = it }
+        }
         if (shouldReadHeadroom(nowMs)) {
             lastHeadroomReadAtMs = nowMs
             source.readHeadroom()
@@ -99,7 +105,7 @@ class ThermalSampler(
                 ?.let { lastValidHeadroom = it }
         }
         return ThermalSample(
-            level = AndroidThermalStatusMapper.map(status),
+            level = lastValidLevel,
             headroom = lastValidHeadroom
         )
     }
@@ -107,13 +113,18 @@ class ThermalSampler(
     fun sampleLevel(): ThermalLevel? = sample().level
 
     private fun shouldReadHeadroom(nowMs: Long): Boolean {
-        val lastReadAtMs = lastHeadroomReadAtMs ?: return true
+        return shouldRead(nowMs, lastHeadroomReadAtMs, MIN_HEADROOM_INTERVAL_MS)
+    }
+
+    private fun shouldRead(nowMs: Long, lastReadAtMs: Long?, intervalMs: Long): Boolean {
+        lastReadAtMs ?: return true
         if (nowMs < lastReadAtMs) return false
         val elapsedMs = nowMs - lastReadAtMs
-        return elapsedMs < 0L || elapsedMs >= MIN_HEADROOM_INTERVAL_MS
+        return elapsedMs < 0L || elapsedMs >= intervalMs
     }
 
     companion object {
+        const val MIN_STATUS_INTERVAL_MS = 1_000L
         const val MIN_HEADROOM_INTERVAL_MS = 10_000L
     }
 }

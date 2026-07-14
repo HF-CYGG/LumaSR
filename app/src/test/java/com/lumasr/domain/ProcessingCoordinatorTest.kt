@@ -217,12 +217,12 @@ class ProcessingCoordinatorTest {
     fun pauseCheckpointsRunningTaskDuringPreExecutionRegistrationWindow() = runBlocking {
         val runningSaved = CompletableDeferred<Unit>()
         val releaseRunningSave = CompletableDeferred<Unit>()
-        val tasks = InMemoryTaskRepository { saved ->
+        val tasks = InMemoryTaskRepository(afterSave = { saved ->
             if (saved.state == ProcessingTaskState.RUNNING) {
                 runningSaved.complete(Unit)
                 releaseRunningSave.await()
             }
-        }
+        })
         val work = InMemoryWorkRepository()
         val runner = GateRunner()
         val coordinator = coordinator(tasks, work, runner)
@@ -231,19 +231,13 @@ class ProcessingCoordinatorTest {
             coordinator.enqueue(task("pause-window"), spec("pause-window"))
             withTimeout(5_000L) { runningSaved.await() }
 
-            val pauseAttempted = CompletableDeferred<Unit>()
-            val pause = async {
-                pauseAttempted.complete(Unit)
-                coordinator.pauseActive()
-            }
-            pauseAttempted.await()
-            delay(50L)
+            val pauseGeneration = coordinator.requestPause()
             releaseRunningSave.complete(Unit)
-            pause.await()
+            delay(100L)
 
             assertEquals(ProcessingTaskState.PAUSED, tasks.find("pause-window")?.state)
-            delay(50L)
             assertTrue(runner.startedIds.isEmpty())
+            coordinator.pauseActive(pauseGeneration)
         } finally {
             releaseRunningSave.complete(Unit)
             coordinator.close()
@@ -467,6 +461,94 @@ class ProcessingCoordinatorTest {
         } finally {
             releaseCancel.countDown()
             runner.completeIfStarted("blocking-cancel")
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun pauseInvalidatesAConcurrentWorkerRebuildUntilANewerResume() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(
+            tasks = tasks,
+            work = work,
+            runner = runner,
+            pauseJoinTimeoutMs = 50L
+        )
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("pause-lock"), spec("pause-lock"))
+            assertEquals("pause-lock", runner.awaitStarted())
+            coordinator.pauseActive()
+
+            val resume = async(Dispatchers.Default) { coordinator.resumePersistedWork() }
+            delay(50L)
+            assertFalse(resume.isCompleted)
+
+            withTimeout(1_000L) { coordinator.pauseActive() }
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("pause-lock")?.state)
+
+            runner.complete("pause-lock")
+            withTimeout(5_000L) { resume.await() }
+            delay(50L)
+            assertEquals(listOf("pause-lock"), runner.startedIds)
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("pause-lock")?.state)
+
+            coordinator.resumePersistedWork()
+            assertEquals("pause-lock", runner.awaitStarted())
+        } finally {
+            runner.completeIfStarted("pause-lock")
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun pauseGenerationRejectsEntriesFromARefreshThatWasAlreadySuspended() = runBlocking {
+        val refreshEntered = CompletableDeferred<Unit>()
+        val releaseRefresh = CompletableDeferred<Unit>()
+        val listCalls = AtomicInteger(0)
+        val tasks = InMemoryTaskRepository(
+            beforeList = {
+                if (listCalls.incrementAndGet() == 2) {
+                    refreshEntered.complete(Unit)
+                    releaseRefresh.await()
+                }
+            }
+        )
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks = tasks, work = work, runner = runner)
+        try {
+            coordinator.start()
+            tasks.seed(
+                task("stale-refresh-a", state = ProcessingTaskState.PAUSED),
+                task("stale-refresh-b", state = ProcessingTaskState.PAUSED)
+            )
+            work.seed(spec("stale-refresh-a"), spec("stale-refresh-b"))
+
+            val staleResume = async(Dispatchers.Default) { coordinator.resumePersistedWork() }
+            withTimeout(1_000L) { refreshEntered.await() }
+            val pauseGeneration = coordinator.requestPause()
+            val pause = async(Dispatchers.Default) { coordinator.pauseActive(pauseGeneration) }
+            releaseRefresh.complete(Unit)
+            withTimeout(5_000L) {
+                staleResume.await()
+                pause.await()
+            }
+
+            coordinator.start()
+            delay(100L)
+            assertTrue(runner.startedIds.isEmpty())
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("stale-refresh-a")?.state)
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("stale-refresh-b")?.state)
+
+            coordinator.resumePersistedWork()
+            val restarted = runner.awaitStarted()
+            assertTrue(restarted == "stale-refresh-a" || restarted == "stale-refresh-b")
+        } finally {
+            releaseRefresh.complete(Unit)
+            runner.startedIds.forEach(runner::completeIfStarted)
             coordinator.close()
         }
     }
@@ -1126,7 +1208,8 @@ class ProcessingCoordinatorTest {
 
     private class InMemoryTaskRepository(
         private val afterSave: suspend (ProcessingTask) -> Unit = {},
-        private val beforeSave: suspend (ProcessingTask) -> Unit = {}
+        private val beforeSave: suspend (ProcessingTask) -> Unit = {},
+        private val beforeList: suspend () -> Unit = {}
     ) : ProcessingTaskRepository {
         private val records = ConcurrentHashMap<String, ProcessingTask>()
         val saved = CopyOnWriteArrayList<ProcessingTask>()
@@ -1144,7 +1227,10 @@ class ProcessingCoordinatorTest {
 
         override suspend fun find(taskId: String): ProcessingTask? = records[taskId]
 
-        override suspend fun list(): List<ProcessingTask> = records.values.toList()
+        override suspend fun list(): List<ProcessingTask> {
+            beforeList()
+            return records.values.toList()
+        }
 
         override suspend fun delete(taskId: String): Boolean = records.remove(taskId) != null
     }

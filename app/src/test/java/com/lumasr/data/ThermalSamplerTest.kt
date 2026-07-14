@@ -68,7 +68,7 @@ class ThermalSamplerTest {
     }
 
     @Test
-    fun reportsStatusOnEverySampleWhileHeadroomRemainsGated() {
+    fun gatesStatusReadsToOnePerSecondWhileHeadroomRemainsMoreConservative() {
         val clock = FakeMonotonicClock()
         val source = FakeThermalSignalSource(
             statuses = listOf(
@@ -80,6 +80,10 @@ class ThermalSamplerTest {
         val sampler = ThermalSampler(source = source, clock = clock)
 
         assertEquals(ThermalLevel.LIGHT, sampler.sample().level)
+        clock.nowMs = 999L
+        assertEquals(ThermalLevel.LIGHT, sampler.sample().level)
+        assertEquals(1, source.statusReadCount)
+
         clock.nowMs = 1_000L
         assertEquals(ThermalLevel.SEVERE, sampler.sample().level)
         assertEquals(2, source.statusReadCount)

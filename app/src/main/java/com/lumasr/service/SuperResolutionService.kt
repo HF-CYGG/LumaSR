@@ -126,17 +126,19 @@ class SuperResolutionService : Service() {
 
     @RequiresApi(35)
     override fun onTimeout(startId: Int, fgsType: Int) {
-        serviceScope.launch {
-            failureBoundary.run(ProcessingServiceFailureCode.TIMEOUT_FAILED) {
-                try {
-                    ownerSession.runAfterPredecessorRelease {
-                        coordinator.pauseActive()
-                    }
-                } finally {
-                    stopSelfResult(startId)
+        val pauseGeneration = coordinator.requestPause()
+        serviceScope.launchWithForegroundDeadline(
+            timeoutMs = FOREGROUND_TIMEOUT_BUDGET_MS,
+            operation = {
+                failureBoundary.run(ProcessingServiceFailureCode.TIMEOUT_FAILED) {
+                    // Timeout shutdown must not queue behind normal service operations: the
+                    // coordinator owns its lifecycle serialization and invalidates old resumes.
+                    coordinator.pauseActive(pauseGeneration)
                 }
-            }
-        }
+            },
+            // Android 15 requires the timed-out FGS to stop even if a newer startId exists.
+            stopService = ::stopSelf
+        )
     }
 
     override fun onDestroy() {
@@ -250,6 +252,7 @@ class SuperResolutionService : Service() {
         private const val TASK_DIRECTORY_NAME = "lumasr-tasks"
         private const val NOTIFICATION_CHANNEL_ID = "lumasr-processing"
         private const val NOTIFICATION_ID = 2001
+        private const val FOREGROUND_TIMEOUT_BUDGET_MS = 4_500L
         private const val LOG_TAG = "LumaSRProcessing"
     }
 }

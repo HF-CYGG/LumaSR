@@ -2,6 +2,7 @@ package com.lumasr.domain
 
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -43,7 +44,7 @@ sealed interface ProcessingRunResult {
 
     data class Failed(val code: ProcessingFailureCode) : ProcessingRunResult
 
-    /** A recoverable environmental condition stopped work before native processing began. */
+    /** A recoverable environmental condition stopped work without terminalizing the task. */
     data class RetryLater(val code: ProcessingFailureCode) : ProcessingRunResult
 
     data object Cancelled : ProcessingRunResult
@@ -80,15 +81,17 @@ class ProcessingCoordinator(
     private val scope = CoroutineScope(coordinatorJob + dispatcher)
     private val stateMutex = Mutex()
     private val workerMutex = Mutex()
-    private val queue = Channel<String>(Channel.UNLIMITED)
+    private val queue = Channel<QueuedTask>(Channel.UNLIMITED)
     private val tasksById = linkedMapOf<String, ProcessingTask>()
-    private val enqueuedTaskIds = mutableSetOf<String>()
+    private val enqueuedTaskGenerations = mutableMapOf<String, Long>()
     private val explicitlyCancelledTaskIds = mutableSetOf<String>()
     private val progressLock = Any()
+    private val lifecycleLock = Any()
     private val lastProgressAtMs = mutableMapOf<String, Long>()
     private val lastProgressStage = mutableMapOf<String, UpscaleStage>()
     private val started = AtomicBoolean(false)
     private val relinquishing = AtomicBoolean(false)
+    private val lifecycleGeneration = AtomicLong(0L)
     private var workerJob: Job? = null
     private var activeExecution: ActiveExecution? = null
     private val _snapshots = MutableStateFlow<List<ProcessingTaskSnapshot>>(emptyList())
@@ -96,21 +99,37 @@ class ProcessingCoordinator(
     val snapshots: StateFlow<List<ProcessingTaskSnapshot>> = _snapshots.asStateFlow()
 
     suspend fun start() {
-        startIfNeeded(resumePaused = false)
+        val expectedGeneration = lifecycleGeneration.get()
+        if (startIfNeeded(
+            resumePaused = false,
+            expectedGeneration = expectedGeneration
+        )) return
+        if (!ensureWorker(expectedGeneration)) return
+        refreshQueue(resumePaused = false, expectedGeneration = expectedGeneration)
     }
 
     suspend fun resumePersistedWork() {
         check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
-        if (startIfNeeded(resumePaused = true)) return
-        ensureWorker()
-        refreshQueue(resumePaused = true)
+        val expectedGeneration = lifecycleGeneration.get()
+        if (startIfNeeded(resumePaused = true, expectedGeneration = expectedGeneration)) return
+        if (!ensureWorker(expectedGeneration)) return
+        refreshQueue(resumePaused = true, expectedGeneration = expectedGeneration)
     }
 
-    suspend fun refreshQueue(resumePaused: Boolean = false) {
+    suspend fun refreshQueue(
+        resumePaused: Boolean = false,
+        expectedGeneration: Long? = null
+    ) {
         check(started.get()) { "Coordinator must be started before refresh" }
-        val taskIdsToQueue = stateMutex.withLock {
+        val tasksToQueue = stateMutex.withLock {
+            if (expectedGeneration != null && lifecycleGeneration.get() != expectedGeneration) {
+                return@withLock emptyList()
+            }
             val persisted = taskRepository.list()
                 .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
+            if (expectedGeneration != null && lifecycleGeneration.get() != expectedGeneration) {
+                return@withLock emptyList()
+            }
             persisted.forEach { task ->
                 val current = tasksById[task.id]
                 val merged = when {
@@ -127,9 +146,14 @@ class ProcessingCoordinator(
                     isNewerExplicitRetry(current, task) -> task
                     else -> return@forEach
                 }
+                if (expectedGeneration != null && lifecycleGeneration.get() != expectedGeneration) {
+                    return@withLock emptyList()
+                }
                 tasksById[merged.id] = merged
                 publishTask(merged)
             }
+            val queueGeneration = expectedGeneration ?: lifecycleGeneration.get()
+            if (lifecycleGeneration.get() != queueGeneration) return@withLock emptyList()
             tasksById.values
                 .asSequence()
                 .filter {
@@ -137,11 +161,19 @@ class ProcessingCoordinator(
                         (resumePaused && it.state == ProcessingTaskState.PAUSED)
                 }
                 .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
-                .map(ProcessingTask::id)
-                .filter(enqueuedTaskIds::add)
+                .map { task -> QueuedTask(task.id, queueGeneration) }
+                .filter { queued ->
+                    val previousGeneration = enqueuedTaskGenerations[queued.taskId]
+                    if (previousGeneration != null && previousGeneration >= queueGeneration) {
+                        false
+                    } else {
+                        enqueuedTaskGenerations[queued.taskId] = queueGeneration
+                        true
+                    }
+                }
                 .toList()
         }
-        taskIdsToQueue.forEach { queue.send(it) }
+        tasksToQueue.forEach { queue.send(it) }
     }
 
     suspend fun enqueue(task: ProcessingTask, workSpec: ProcessingWorkSpec) {
@@ -150,7 +182,7 @@ class ProcessingCoordinator(
         require(task.id == workSpec.taskId) { "Task and work spec ids must match" }
         require(task.copiedInputPath == workSpec.params.inputPath) { "Task and work input paths must match" }
         require(task.outputPath == workSpec.params.outputPath) { "Task and work output paths must match" }
-        val shouldQueue = stateMutex.withLock {
+        val queued = stateMutex.withLock {
             require(tasksById[task.id] == null && taskRepository.find(task.id) == null) {
                 "Task ${task.id} already exists"
             }
@@ -158,9 +190,11 @@ class ProcessingCoordinator(
             taskRepository.save(task)
             tasksById[task.id] = task
             publishTask(task)
-            enqueuedTaskIds.add(task.id)
+            QueuedTask(task.id, lifecycleGeneration.get()).also {
+                enqueuedTaskGenerations[task.id] = it.generation
+            }
         }
-        if (shouldQueue) queue.send(task.id)
+        queue.send(queued)
     }
 
     suspend fun cancel(taskId: String) {
@@ -176,7 +210,7 @@ class ProcessingCoordinator(
             )
             taskRepository.save(cancelled)
             tasksById[taskId] = cancelled
-            enqueuedTaskIds.remove(taskId)
+            enqueuedTaskGenerations.remove(taskId)
             publishTask(cancelled)
             active
         }
@@ -186,37 +220,43 @@ class ProcessingCoordinator(
         }
     }
 
-    suspend fun pauseActive() {
-        workerMutex.withLock {
-            val pausedExecution = stateMutex.withLock pauseState@{
-                val current = activeExecution
-                val task = current
-                    ?.let { tasksById[it.taskId] }
-                    ?.takeIf { it.state == ProcessingTaskState.RUNNING }
-                    ?: tasksById.values.firstOrNull { it.state == ProcessingTaskState.RUNNING }
-                    ?: return@pauseState null
-                val paused = ProcessingTaskTransitions.transition(
-                    task = task,
-                    targetState = ProcessingTaskState.PAUSED,
-                    atEpochMs = safeNow(task)
-                )
-                taskRepository.save(paused)
-                tasksById[task.id] = paused
-                publishTask(paused)
-                PausedExecution(task.id, current?.takeIf { it.taskId == task.id })
-            }
-            val activeResult = pausedExecution?.active?.let {
-                it.result.cancel(CancellationException("Task paused by foreground-service timeout"))
-                it.result
-            }
-            val cancelSignal = pausedExecution?.active?.let {
-                scope.async(Dispatchers.IO) {
-                    runCatching { runner.cancel(pausedExecution.taskId) }
+    /** Invalidates lifecycle operations that began before a foreground-service timeout. */
+    fun requestPause(): Long = synchronized(lifecycleLock) {
+        lifecycleGeneration.incrementAndGet()
+    }
+
+    suspend fun pauseActive(pauseGeneration: Long = requestPause()) {
+        lifecycleGeneration.updateAndGet { current -> max(current, pauseGeneration) }
+        withTimeoutOrNull(pauseJoinTimeoutMs) {
+            workerMutex.withLock {
+                val pausedExecution = stateMutex.withLock pauseState@{
+                    val current = activeExecution
+                    val task = current
+                        ?.let { tasksById[it.taskId] }
+                        ?.takeIf { it.state == ProcessingTaskState.RUNNING }
+                        ?: tasksById.values.firstOrNull { it.state == ProcessingTaskState.RUNNING }
+                        ?: return@pauseState null
+                    val paused = ProcessingTaskTransitions.transition(
+                        task = task,
+                        targetState = ProcessingTaskState.PAUSED,
+                        atEpochMs = safeNow(task)
+                    )
+                    taskRepository.save(paused)
+                    tasksById[task.id] = paused
+                    publishTask(paused)
+                    PausedExecution(task.id, current?.takeIf { it.taskId == task.id })
                 }
-            }
-            val worker = workerJob
-            worker?.cancel(CancellationException("Foreground-service timeout"))
-            withTimeoutOrNull(pauseJoinTimeoutMs) {
+                val activeResult = pausedExecution?.active?.let {
+                    it.result.cancel(CancellationException("Task paused by foreground-service timeout"))
+                    it.result
+                }
+                val cancelSignal = pausedExecution?.active?.let {
+                    scope.async(Dispatchers.IO) {
+                        runCatching { runner.cancel(pausedExecution.taskId) }
+                    }
+                }
+                val worker = workerJob
+                worker?.cancel(CancellationException("Foreground-service timeout"))
                 cancelSignal?.await()
                 activeResult?.join()
                 worker?.join()
@@ -257,14 +297,14 @@ class ProcessingCoordinator(
     }
 
     private suspend fun consumeQueue() {
-        for (taskId in queue) {
+        for (queued in queue) {
             if (!scope.isActive) return
             try {
-                execute(taskId)
+                execute(queued)
             } catch (failure: Throwable) {
                 val workerWasCancelled = !currentCoroutineContext().isActive
                 withContext(NonCancellable) {
-                    recoverAfterWorkerFailure(taskId)
+                    recoverAfterWorkerFailure(queued)
                 }
                 if (workerWasCancelled) throw failure
                 return
@@ -272,10 +312,18 @@ class ProcessingCoordinator(
         }
     }
 
-    private suspend fun recoverAfterWorkerFailure(taskId: String) {
+    private suspend fun recoverAfterWorkerFailure(queued: QueuedTask) {
+        val taskId = queued.taskId
         stateMutex.withLock {
             val current = tasksById[taskId] ?: return
-            enqueuedTaskIds.remove(taskId)
+            removeEnqueuedIfCurrent(queued)
+            if (
+                queued.generation != lifecycleGeneration.get() &&
+                current.state == ProcessingTaskState.RUNNING
+            ) {
+                pauseStaleRunningTask(current)
+                return
+            }
             if (
                 current.state == ProcessingTaskState.PAUSED ||
                 current.state == ProcessingTaskState.CANCELLED ||
@@ -337,29 +385,65 @@ class ProcessingCoordinator(
     }
 
     private fun clearWorkerBookkeeping(taskId: String) {
-        enqueuedTaskIds.remove(taskId)
+        enqueuedTaskGenerations.remove(taskId)
         if (activeExecution?.taskId == taskId) activeExecution = null
         explicitlyCancelledTaskIds.remove(taskId)
         clearProgressThrottle(taskId)
     }
 
-    private suspend fun ensureWorker() {
-        workerMutex.withLock {
-            check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
-            val current = workerJob
-            if (current?.isActive == true) return@withLock
-            current?.join()
-            check(scope.isActive) { "Coordinator is closed" }
-            workerJob = scope.launch { consumeQueue() }
+    private suspend fun ensureWorker(expectedGeneration: Long): Boolean {
+        while (true) {
+            var workerToJoin: Job? = null
+            val workerAlreadyActive = workerMutex.withLock {
+                check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
+                if (lifecycleGeneration.get() != expectedGeneration) return@withLock null
+                val current = workerJob
+                if (current?.isActive == true) {
+                    true
+                } else {
+                    workerToJoin = current
+                    false
+                }
+            }
+            if (workerAlreadyActive == null) return false
+            if (workerAlreadyActive) return true
+
+            // A cancelled native call may unwind slowly. Never hold the lifecycle mutex while
+            // joining it, otherwise the foreground-service pause deadline cannot even start.
+            workerToJoin?.join()
+
+            val workerStartedOrObserved = workerMutex.withLock {
+                check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
+                check(scope.isActive) { "Coordinator is closed" }
+                if (lifecycleGeneration.get() != expectedGeneration) return@withLock null
+                val current = workerJob
+                when {
+                    current?.isActive == true -> true
+                    current !== workerToJoin -> false
+                    else -> {
+                        workerJob = scope.launch { consumeQueue() }
+                        true
+                    }
+                }
+            }
+            if (workerStartedOrObserved == null) return false
+            if (workerStartedOrObserved) return true
         }
     }
 
-    private suspend fun startIfNeeded(resumePaused: Boolean): Boolean {
+    private suspend fun startIfNeeded(
+        resumePaused: Boolean,
+        expectedGeneration: Long
+    ): Boolean {
         check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
         if (!started.compareAndSet(false, true)) return false
         try {
-            ensureWorker()
-            refreshQueue(resumePaused = resumePaused)
+            if (ensureWorker(expectedGeneration)) {
+                refreshQueue(
+                    resumePaused = resumePaused,
+                    expectedGeneration = expectedGeneration
+                )
+            }
             return true
         } catch (failure: Throwable) {
             workerJob?.cancel()
@@ -368,28 +452,42 @@ class ProcessingCoordinator(
         }
     }
 
-    private suspend fun execute(taskId: String) {
+    private suspend fun execute(queued: QueuedTask) {
+        val taskId = queued.taskId
+        if (queued.generation != lifecycleGeneration.get()) {
+            stateMutex.withLock { removeEnqueuedIfCurrent(queued) }
+            return
+        }
         val workSpec = workSpecRepository.find(taskId)
         val running = stateMutex.withLock {
+            if (queued.generation != lifecycleGeneration.get()) {
+                removeEnqueuedIfCurrent(queued)
+                return
+            }
             val task = tasksById[taskId] ?: taskRepository.find(taskId)
             if (
+                queued.generation != lifecycleGeneration.get() ||
                 relinquishing.get() ||
                 task == null ||
                 task.state !in setOf(ProcessingTaskState.QUEUED, ProcessingTaskState.PAUSED)
             ) {
-                enqueuedTaskIds.remove(taskId)
+                removeEnqueuedIfCurrent(queued)
                 return
             }
-            ProcessingTaskTransitions.transition(
+            val transitioned = ProcessingTaskTransitions.transition(
                 task = task,
                 targetState = ProcessingTaskState.RUNNING,
                 atEpochMs = safeNow(task)
-            ).also { transitioned ->
-                taskRepository.save(transitioned)
-                tasksById[taskId] = transitioned
-                enqueuedTaskIds.remove(taskId)
-                publishTask(transitioned)
+            )
+            taskRepository.save(transitioned)
+            tasksById[taskId] = transitioned
+            removeEnqueuedIfCurrent(queued)
+            if (queued.generation != lifecycleGeneration.get()) {
+                pauseStaleRunningTask(transitioned)
+                return
             }
+            publishTask(transitioned)
+            transitioned
         }
         if (workSpec == null) {
             finalizeResult(running, ProcessingRunResult.Failed(ProcessingFailureCode.WORK_SPEC_MISSING))
@@ -402,12 +500,18 @@ class ProcessingCoordinator(
             runner.run(running, workSpec) { progress -> forwardProgress(taskId, progress) }
         }
         val shouldStart = stateMutex.withLock {
-            if (tasksById[taskId]?.state == ProcessingTaskState.RUNNING) {
-                activeExecution = ActiveExecution(taskId, executionResult)
-                true
-            } else {
-                false
+            val current = tasksById[taskId]
+            if (current?.state != ProcessingTaskState.RUNNING) return@withLock false
+            val registered = synchronized(lifecycleLock) {
+                if (queued.generation == lifecycleGeneration.get()) {
+                    activeExecution = ActiveExecution(taskId, executionResult)
+                    true
+                } else {
+                    false
+                }
             }
+            if (!registered) pauseStaleRunningTask(current)
+            registered
         }
         if (!shouldStart) {
             executionResult.cancel()
@@ -585,6 +689,30 @@ class ProcessingCoordinator(
         val taskId: String?,
         val active: ActiveExecution?
     )
+
+    private data class QueuedTask(
+        val taskId: String,
+        val generation: Long
+    )
+
+    private fun removeEnqueuedIfCurrent(queued: QueuedTask) {
+        if (enqueuedTaskGenerations[queued.taskId] == queued.generation) {
+            enqueuedTaskGenerations.remove(queued.taskId)
+        }
+    }
+
+    /** Called only while [stateMutex] is held after a pause invalidates an old queue generation. */
+    private suspend fun pauseStaleRunningTask(running: ProcessingTask) {
+        val paused = ProcessingTaskTransitions.transition(
+            task = running,
+            targetState = ProcessingTaskState.PAUSED,
+            atEpochMs = safeNow(running)
+        )
+        taskRepository.save(paused)
+        tasksById[running.id] = paused
+        enqueuedTaskGenerations.remove(running.id)
+        publishTask(paused)
+    }
 
     private companion object {
         const val DEFAULT_PAUSE_JOIN_TIMEOUT_MS = 5_000L

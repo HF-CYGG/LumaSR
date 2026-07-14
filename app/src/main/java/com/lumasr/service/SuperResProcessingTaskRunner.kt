@@ -55,12 +55,25 @@ class SuperResProcessingTaskRunner(
             params = workSpec.toUpscaleParams(),
             nowEpochMs = clock.nowEpochMs()
         )
+        var stoppedForCriticalThermal = false
         val result = processor.process(
             currentParams.adjustForThermal(thermalLevel),
-            onProgress
+            onProgress = { progress ->
+                if (
+                    !stoppedForCriticalThermal &&
+                    progress.stage == UpscaleStage.PROCESSING_TILE &&
+                    (thermalLevelProvider() ?: ThermalLevel.NORMAL) == ThermalLevel.CRITICAL
+                ) {
+                    stoppedForCriticalThermal = true
+                    processor.cancel(currentParams.taskId)
+                }
+                onProgress(progress)
+            }
         )
         return when {
             result.success -> ProcessingRunResult.Completed
+            result.stage == UpscaleStage.CANCELLED && stoppedForCriticalThermal ->
+                ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL)
             result.stage == UpscaleStage.CANCELLED -> ProcessingRunResult.Cancelled
             else -> ProcessingRunResult.Failed(ProcessingFailureCode.PROCESSOR_FAILED)
         }

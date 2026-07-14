@@ -64,6 +64,55 @@ class SuperResProcessingTaskRunnerTest {
     }
 
     @Test
+    fun criticalThermalReachedAtTileBoundaryCancelsNativeAndPausesRetryably() = runBlocking {
+        val levels = ArrayDeque(listOf(ThermalLevel.NORMAL, ThermalLevel.CRITICAL))
+        var cancelledTaskId: String? = null
+        val processor = object : SuperResProcessor {
+            override suspend fun process(
+                params: UpscaleParams,
+                onProgress: (UpscaleProgress) -> Unit
+            ): UpscaleResult {
+                onProgress(
+                    UpscaleProgress(
+                        taskId = params.taskId,
+                        stage = UpscaleStage.PROCESSING_TILE,
+                        progress = 0.5f,
+                        currentTile = 2,
+                        totalTiles = 4,
+                        completedTiles = 1,
+                        message = "tile boundary",
+                        estimatedRemainingMs = null
+                    )
+                )
+                return UpscaleResult(
+                    taskId = params.taskId,
+                    stage = UpscaleStage.CANCELLED,
+                    outputPath = null,
+                    success = false,
+                    message = "cancelled"
+                )
+            }
+
+            override fun cancel(taskId: String) {
+                cancelledTaskId = taskId
+            }
+        }
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { levels.removeFirst() },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("thermal-boundary"), spec("thermal-boundary")) {}
+
+        assertEquals(
+            ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL),
+            result
+        )
+        assertEquals("thermal-boundary", cancelledTaskId)
+    }
+
+    @Test
     fun thermalAdjustmentCoversEveryPassWithoutChangingCalibratedBackend() = runBlocking {
         val processor = RecordingProcessor()
         val runner = SuperResProcessingTaskRunner(
