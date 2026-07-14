@@ -1,6 +1,7 @@
 package com.lumasr.data
 
 import com.lumasr.domain.BenchmarkIdentity
+import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
 import kotlinx.coroutines.runBlocking
@@ -64,13 +65,17 @@ class FileInferenceBenchmarkRepositoryTest {
             base,
             base.copy(schemaKey = "benchmark-v2"),
             base.copy(engineKey = "ncnn-v2"),
+            base.copy(
+                modelArtifactHash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ),
+            base.copy(runtimeBuildKey = "app-2:test:arm64-v8a"),
             base.copy(profileHash = "profile-b"),
             base.copy(deviceFingerprint = DEVICE_HASH_B),
             base.copy(gpuDriverVersion = "driver-v2")
         )
 
         identities.forEachIndexed { index, value ->
-            repository.save(result(value, batchSize = listOf(1, 2, 4, 8, 1, 2)[index]))
+            repository.save(result(value, batchSize = listOf(1, 2, 4, 8)[index % 4]))
         }
 
         assertEquals(identities.toSet(), repository.list().map { it.identity }.toSet())
@@ -119,6 +124,8 @@ class FileInferenceBenchmarkRepositoryTest {
     fun quarantinesWrongJsonScalarTypesAndNonCanonicalInfinity() = runBlocking {
         val validIdentity = """
             {"schemaKey":"benchmark-v1","engineKey":"ncnn-v1:realcugan-x4plus",
+             "modelArtifactHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "runtimeBuildKey":"app-1:test:arm64-v8a",
              "profileHash":"profile-a","deviceFingerprint":"$DEVICE_HASH_A",
              "gpuDriverVersion":"driver-v1"}
         """.trimIndent().replace("\n", "")
@@ -138,7 +145,7 @@ class FileInferenceBenchmarkRepositoryTest {
                 else -> "48.0"
             }
             File(root, "inference-benchmarks.json").writeText(
-                """{"schemaVersion":1,"results":[{"identity":$identityJson,"quality":{"ssim":$ssim,"psnrDb":$psnr,"p99ChannelError":1},"recommendedCommandBatchSize":4,"measuredAtEpochMs":1000,"validUntilEpochMs":2000}]}"""
+                """{"schemaVersion":2,"results":[{"identity":$identityJson,"quality":{"ssim":$ssim,"psnrDb":$psnr,"p99ChannelError":1},"recommendedCommandBatchSize":4,"measuredAtEpochMs":1000,"validUntilEpochMs":2000}]}"""
             )
 
             assertEquals(emptyList<InferenceBenchmarkResult>(), FileInferenceBenchmarkRepository(root).list())
@@ -160,6 +167,20 @@ class FileInferenceBenchmarkRepositoryTest {
         assertFalse(json.contains("DCIM"))
         assertFalse(json.contains("/storage/"))
         assertTrue(json.contains(DEVICE_HASH_A))
+    }
+
+    @Test
+    fun cancelledPublicationGateLeavesNoRecordOrTemporaryFile() = runBlocking {
+        val root = temporaryFolder.newFolder("cancelled-publication")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val gate = BenchmarkPublicationGate()
+        assertTrue(gate.cancel())
+
+        val published = repository.publish(result(identity()), gate)
+
+        assertFalse(published)
+        assertTrue(repository.list().isEmpty())
+        assertTrue(root.listFiles().orEmpty().isEmpty())
     }
 
     @Test
@@ -194,6 +215,8 @@ class FileInferenceBenchmarkRepositoryTest {
     ) = BenchmarkIdentity(
         schemaKey = "benchmark-v1",
         engineKey = "ncnn-v1:realcugan-x4plus",
+        modelArtifactHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        runtimeBuildKey = "app-1:test:arm64-v8a",
         profileHash = profileHash,
         deviceFingerprint = DEVICE_HASH_A,
         gpuDriverVersion = gpuDriverVersion

@@ -62,27 +62,40 @@ class InferenceExecutionProfileResolverTest {
 
     @Test
     fun buildsCompletePrivacySafeIdentityFromModelDeviceProfileAndDriver() {
+        val artifactHash = ModelArtifactIdentityFactory.create(model())
         val identity = BenchmarkIdentityFactory.create(
-            modelId = "waifu2x-cunet",
-            engine = SuperResEngine.WAIFU2X,
+            modelId = model().id,
+            engine = model().engine,
+            modelArtifactHash = artifactHash,
+            runtimeBuildKey = "app-1:release:arm64-v8a",
             device = device(),
             rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
         )
 
         assertEquals(BenchmarkIdentityFactory.SCHEMA_KEY, identity.schemaKey)
-        assertTrue(identity.engineKey.startsWith("ncnn-v1:WAIFU2X:"))
+        assertTrue(identity.engineKey.startsWith("ncnn:WAIFU2X:"))
         assertEquals(device().profileKey, identity.profileHash)
         assertTrue(identity.deviceFingerprint.matches(Regex("[0-9a-f]{64}")))
         assertFalse(identity.deviceFingerprint.contains("Xiaomi"))
         assertEquals("driver-v1", identity.gpuDriverVersion)
+        assertEquals(artifactHash, identity.modelArtifactHash)
+        assertEquals("app-1:release:arm64-v8a", identity.runtimeBuildKey)
         assertNotEquals(
-            identity.engineKey,
+            identity,
             BenchmarkIdentityFactory.create(
-                modelId = "another-model",
-                engine = SuperResEngine.WAIFU2X,
+                modelId = model().id,
+                engine = model().engine,
+                modelArtifactHash = ModelArtifactIdentityFactory.create(
+                    model().copy(assetBytes = model().assetBytes?.plus(1L))
+                ),
+                runtimeBuildKey = "app-1:release:arm64-v8a",
                 device = device(),
                 rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
-            ).engineKey
+            )
+        )
+        assertNotEquals(
+            identity,
+            identity.copy(runtimeBuildKey = "app-2:release:arm64-v8a")
         )
     }
 
@@ -179,14 +192,39 @@ class InferenceExecutionProfileResolverTest {
     ) = InferenceExecutionProfileResolver(
         repository = repository,
         device = device,
-        rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
+        rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys",
+        modelArtifactIdentities = mapOf("model-a" to ModelArtifactIdentityFactory.create(model())),
+        runtimeBuildKey = "app-1:test:arm64-v8a"
     )
 
     private fun identity(params: UpscaleParams) = BenchmarkIdentityFactory.create(
         modelId = "model-a",
         engine = params.engine,
+        modelArtifactHash = ModelArtifactIdentityFactory.create(model()),
+        runtimeBuildKey = "app-1:test:arm64-v8a",
         device = device(),
         rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
+    )
+
+    private fun model() = ModelPack(
+        id = "model-a",
+        displayName = "Model A",
+        engine = SuperResEngine.WAIFU2X,
+        modelDir = "models/model-a",
+        assetPath = "models/model-a.zip",
+        modelFileBase = null,
+        isBuiltIn = true,
+        requiredFiles = listOf("noise0_scale2.0x_model.bin", "noise0_scale2.0x_model.param"),
+        assetBytes = 1_024L,
+        description = "test",
+        scenes = listOf("anime"),
+        scales = listOf(2),
+        denoise = listOf(0),
+        supportsTta = true,
+        defaultScale = 2,
+        defaultNoise = 0,
+        speedLevel = "fast",
+        qualityLevel = "high"
     )
 
     private fun benchmark(
@@ -239,6 +277,11 @@ class InferenceExecutionProfileResolverTest {
         private val value: InferenceBenchmarkResult?
     ) : InferenceBenchmarkRepository {
         override suspend fun save(result: InferenceBenchmarkResult) = Unit
+
+        override suspend fun publish(
+            result: InferenceBenchmarkResult,
+            gate: BenchmarkPublicationGate
+        ): Boolean = gate.tryCommit {}
 
         override suspend fun list(): List<InferenceBenchmarkResult> = listOfNotNull(value)
 

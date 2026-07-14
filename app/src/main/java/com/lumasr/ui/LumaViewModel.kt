@@ -179,6 +179,7 @@ class LumaViewModel(
     }
 
     fun selectModel(modelId: String) {
+        if (!canChangeModel(_uiState.value)) return
         val model = _uiState.value.models.firstOrNull { it.id == modelId } ?: return
         _uiState.update {
             val scale = model.defaultScale

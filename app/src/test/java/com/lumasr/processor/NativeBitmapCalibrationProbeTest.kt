@@ -136,6 +136,25 @@ class NativeBitmapCalibrationProbeTest {
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
 
+    @Test
+    fun bitmapFactoryFailureStillDeletesTemporaryOutput() = runBlocking {
+        val root = temporaryFolder.newFolder("bitmap-factory-failure")
+        val probe = NativeBitmapCalibrationProbe(
+            processor = RecordingRegionProcessor(::successful),
+            cancelNative = {},
+            directory = root,
+            bitmapFactory = { error("bitmap allocation failed") },
+            outputDecoder = { null }
+        )
+
+        val failure = runCatching {
+            probe.run(RgbImage(1, 1, byteArrayOf(1, 2, 3)), params())
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
     private fun params() = UpscaleParams(
         taskId = "calibration-1",
         inputPath = File("build/calibration/input.png").absolutePath,

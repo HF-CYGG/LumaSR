@@ -1,8 +1,10 @@
 package com.lumasr.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 class SettingsScreenV2Test {
     @Test
@@ -23,5 +25,23 @@ class SettingsScreenV2Test {
         assertEquals("校准未通过，将继续使用兼容模式", calibrationStatusText(CalibrationUiStatus.FAILED))
         assertEquals("设备不支持安全加速校准", calibrationStatusText(CalibrationUiStatus.UNSUPPORTED))
         assertEquals("已跳过，将使用兼容模式", calibrationStatusText(CalibrationUiStatus.SKIPPED))
+    }
+
+    @Test
+    fun runningCalibrationDisablesModelChangesAndCalibrationAction() {
+        val state = LumaUiState(calibrationStatus = CalibrationUiStatus.RUNNING)
+
+        assertFalse(canChangeModel(state))
+        assertFalse(isCalibrationActionEnabled(state.calibrationStatus))
+        assertTrue(canChangeModel(state.copy(calibrationStatus = CalibrationUiStatus.READY)))
+        assertTrue(isCalibrationActionEnabled(CalibrationUiStatus.READY))
+    }
+
+    @Test
+    fun calibrationRowUsesComposeDisabledClickSemantics() {
+        val source = File("src/main/java/com/lumasr/ui/SettingsScreenV2.kt").readText()
+
+        assertTrue(source.contains("enabled = isCalibrationActionEnabled(state.calibrationStatus)"))
+        assertTrue(source.contains(".clickable(enabled = enabled, onClick = onClick)"))
     }
 }

@@ -110,6 +110,8 @@ class AdaptiveInferencePolicyTest {
         val cached = BenchmarkIdentity(
             schemaKey = "benchmark-v1",
             engineKey = "ncnn-20260526",
+            modelArtifactHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
             profileHash = "device-capability-v1:profile-a",
             deviceFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             gpuDriverVersion = "r42p0"
@@ -126,6 +128,21 @@ class AdaptiveInferencePolicyTest {
             AdaptiveInferencePolicy.isBenchmarkValid(
                 cached,
                 cached.copy(engineKey = "ncnn-20260701")
+            )
+        )
+        assertFalse(
+            AdaptiveInferencePolicy.isBenchmarkValid(
+                cached,
+                cached.copy(
+                    modelArtifactHash =
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                )
+            )
+        )
+        assertFalse(
+            AdaptiveInferencePolicy.isBenchmarkValid(
+                cached,
+                cached.copy(runtimeBuildKey = "app-2:test:arm64-v8a")
             )
         )
         assertFalse(
@@ -456,6 +473,34 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
+    fun incompleteGpuIdentityNeverSelectsOptimizedFp16() {
+        val identity = benchmarkIdentity()
+        val candidates = listOf(
+            device().copy(gpuVendor = null),
+            device().copy(gpuVendor = " "),
+            device().copy(gpuDevice = null),
+            device().copy(gpuDevice = ""),
+            device().copy(gpuDriverVersion = null),
+            device().copy(gpuDriverVersion = "  ")
+        )
+
+        candidates.forEach { candidate ->
+            val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+                device = candidate,
+                accelerationMode = AccelerationMode.VULKAN,
+                ttaEnabled = false,
+                benchmarkResult = benchmarkResult(identity),
+                currentBenchmarkIdentity = identity,
+                currentSafeTileSize = 256,
+                nowEpochMs = NOW_EPOCH_MS
+            )
+
+            assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+            assertEquals(InferencePrecision.FP32, selected.precision)
+        }
+    }
+
+    @Test
     fun cpuPreferenceAndMissingBenchmarkStayOnLegacyFp32() {
         val identity = benchmarkIdentity()
         val benchmark = benchmarkResult(identity)
@@ -640,6 +685,8 @@ class AdaptiveInferencePolicyTest {
     private fun benchmarkIdentity() = BenchmarkIdentity(
         schemaKey = "benchmark-v1",
         engineKey = "ncnn-test",
+        modelArtifactHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        runtimeBuildKey = "app-1:test:arm64-v8a",
         profileHash = "device-capability-v1:test-profile",
         deviceFingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         gpuDriverVersion = "driver-v1"

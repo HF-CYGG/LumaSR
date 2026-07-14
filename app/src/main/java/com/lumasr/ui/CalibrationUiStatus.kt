@@ -29,6 +29,12 @@ internal fun canStartCalibration(state: LumaUiState): Boolean =
         state.screen == LumaScreen.EDITING &&
         state.calibrationStatus != CalibrationUiStatus.RUNNING
 
+internal fun canChangeModel(state: LumaUiState): Boolean =
+    state.calibrationStatus != CalibrationUiStatus.RUNNING
+
+internal fun isCalibrationActionEnabled(status: CalibrationUiStatus): Boolean =
+    status != CalibrationUiStatus.RUNNING
+
 internal fun isCurrentCalibrationModel(
     measuredModelId: String,
     selectedModelId: String?

@@ -1,6 +1,7 @@
 package com.lumasr.data
 
 import com.lumasr.domain.BenchmarkIdentity
+import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
@@ -37,7 +38,16 @@ class FileInferenceBenchmarkRepository(
 ) : InferenceBenchmarkRepository {
     private val mutex = Mutex()
 
-    override suspend fun save(result: InferenceBenchmarkResult) = withContext(ioDispatcher) {
+    override suspend fun save(result: InferenceBenchmarkResult) {
+        check(publish(result, BenchmarkPublicationGate())) {
+            "Fresh benchmark publication was unexpectedly cancelled"
+        }
+    }
+
+    override suspend fun publish(
+        result: InferenceBenchmarkResult,
+        gate: BenchmarkPublicationGate
+    ): Boolean = withContext(ioDispatcher) {
         mutex.withLock {
             validateResult(result)
             ensureDirectory()
@@ -46,7 +56,14 @@ class FileInferenceBenchmarkRepository(
                 .plus(result)
                 .sortedWith(RESULT_ORDER)
             require(updated.size <= MAX_RESULT_COUNT) { "Too many benchmark results" }
-            writeAtomic(BenchmarkResultJson.encode(updated).toByteArray(Charsets.UTF_8))
+            prepareAtomic(BenchmarkResultJson.encode(updated).toByteArray(Charsets.UTF_8)).let {
+                temporary ->
+                try {
+                    gate.tryCommit { moveReplacing(temporary, recordFile()) }
+                } finally {
+                    temporary.delete()
+                }
+            }
         }
     }
 
@@ -109,7 +126,7 @@ class FileInferenceBenchmarkRepository(
         check(directory.isDirectory || directory.mkdirs()) { "Cannot create benchmark repository directory" }
     }
 
-    private fun writeAtomic(bytes: ByteArray) {
+    private fun prepareAtomic(bytes: ByteArray): File {
         require(bytes.size <= MAX_RECORD_BYTES) { "Benchmark record is too large" }
         val target = recordFile()
         val temporary = File.createTempFile(target.name, ".$TEMP_EXTENSION", directory)
@@ -118,9 +135,10 @@ class FileInferenceBenchmarkRepository(
                 stream.write(bytes)
                 stream.fd.sync()
             }
-            moveReplacing(temporary, target)
-        } finally {
+            return temporary
+        } catch (error: Exception) {
             temporary.delete()
+            throw error
         }
     }
 
@@ -163,6 +181,8 @@ class FileInferenceBenchmarkRepository(
         val RESULT_ORDER = compareBy<InferenceBenchmarkResult>(
             { it.identity.schemaKey },
             { it.identity.engineKey },
+            { it.identity.modelArtifactHash },
+            { it.identity.runtimeBuildKey },
             { it.identity.profileHash },
             { it.identity.deviceFingerprint },
             { it.identity.gpuDriverVersion.orEmpty() }
@@ -171,7 +191,7 @@ class FileInferenceBenchmarkRepository(
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -192,6 +212,8 @@ private object BenchmarkResultJson {
         put("identity", buildJsonObject {
             put("schemaKey", result.identity.schemaKey)
             put("engineKey", result.identity.engineKey)
+            put("modelArtifactHash", result.identity.modelArtifactHash)
+            put("runtimeBuildKey", result.identity.runtimeBuildKey)
             put("profileHash", result.identity.profileHash)
             put("deviceFingerprint", result.identity.deviceFingerprint)
             put("gpuDriverVersion", result.identity.gpuDriverVersion)
@@ -220,6 +242,8 @@ private object BenchmarkResultJson {
             identity = BenchmarkIdentity(
                 schemaKey = identity.requiredString("schemaKey"),
                 engineKey = identity.requiredString("engineKey"),
+                modelArtifactHash = identity.requiredString("modelArtifactHash"),
+                runtimeBuildKey = identity.requiredString("runtimeBuildKey"),
                 profileHash = identity.requiredString("profileHash"),
                 deviceFingerprint = identity.requiredString("deviceFingerprint"),
                 gpuDriverVersion = identity.optionalString("gpuDriverVersion")

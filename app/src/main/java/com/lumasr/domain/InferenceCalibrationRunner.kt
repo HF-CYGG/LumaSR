@@ -2,13 +2,18 @@ package com.lumasr.domain
 
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class CalibrationProbeOutput(
     val image: RgbImage,
@@ -61,44 +66,61 @@ class InferenceCalibrationRunner(
         if (!request.device.supportsVulkan ||
             !request.device.supportsFp16Storage ||
             !request.device.supportsFp16Arithmetic ||
+            !AdaptiveInferencePolicy.hasStableGpuIdentity(request.device) ||
             request.device.isLowRamDevice ||
             request.baseParams.pipelinePasses.isNotEmpty()
         ) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
         }
 
+        val executionLease = CalibrationExecutionGate.tryEnterCalibration()
+            ?: return CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         val taskId = "calibration-${UUID.randomUUID()}"
         return coroutineScope {
             val timedOut = AtomicBoolean(false)
             val finished = AtomicBoolean(false)
             val cancelSent = AtomicBoolean(false)
+            val publicationGate = BenchmarkPublicationGate()
             fun cancelNativeOnce() {
                 if (cancelSent.compareAndSet(false, true)) probe.cancel(taskId)
             }
+            val preparation = CalibrationProbeRuntime.scope.async {
+                runBounded(request, taskId)
+            }
+            preparation.invokeOnCompletion { executionLease.close() }
             val cancellationWatcher = launch(Dispatchers.Default) {
                 try {
                     awaitCancellation()
                 } finally {
-                    if (!finished.get()) cancelNativeOnce()
+                    if (!finished.get() && publicationGate.cancel()) {
+                        preparation.cancel()
+                        cancelNativeOnce()
+                    }
                 }
             }
             val deadlineWatcher = launch(Dispatchers.Default) {
                 delay(timeoutMs)
-                timedOut.set(true)
-                cancelNativeOnce()
+                if (publicationGate.cancel()) {
+                    timedOut.set(true)
+                    preparation.cancel()
+                    cancelNativeOnce()
+                }
             }
             try {
-                val prepared = runBounded(request, taskId, timedOut::get)
-                finished.set(true)
-                cancellationWatcher.cancelAndJoin()
-                deadlineWatcher.cancelAndJoin()
-                if (timedOut.get()) {
-                    CalibrationRunResult.TimedOut
-                } else {
-                    publish(prepared)
+                val prepared = withTimeoutOrNull(timeoutMs) { preparation.await() }
+                if (prepared == null) {
+                    if (publicationGate.cancel()) timedOut.set(true)
+                    preparation.cancel()
+                    cancelNativeOnce()
+                    return@coroutineScope CalibrationRunResult.TimedOut
                 }
+                if (timedOut.get()) return@coroutineScope CalibrationRunResult.TimedOut
+                publish(prepared, publicationGate, timedOut::get)
             } catch (cancelled: CancellationException) {
-                cancelNativeOnce()
+                if (publicationGate.cancel()) {
+                    preparation.cancel()
+                    cancelNativeOnce()
+                }
                 throw cancelled
             } catch (_: Exception) {
                 CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
@@ -112,8 +134,7 @@ class InferenceCalibrationRunner(
 
     private suspend fun runBounded(
         request: InferenceCalibrationRequest,
-        taskId: String,
-        deadlineReached: () -> Boolean
+        taskId: String
     ): CalibrationPreparation {
         val pattern = SyntheticCalibrationPattern.generate(
             width = PATTERN_WIDTH,
@@ -131,13 +152,14 @@ class InferenceCalibrationRunner(
         )
         val reference = probe.run(pattern, referenceParams)
             ?: return CalibrationPreparation.Failed(CalibrationFailureReason.PROBE_FAILED)
-        if (deadlineReached()) return CalibrationPreparation.DeadlineExceeded
+        currentCoroutineContext().ensureActive()
         if (!reference.hasExpectedShape(pattern, referenceParams.scale) || reference.durationNanos <= 0L) {
             return CalibrationPreparation.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
 
         val candidates = mutableListOf<CalibrationCandidate>()
-        for (batchSize in SUPPORTED_BATCH_SIZES) {
+        val measuredTileCount = estimatedTileCount(pattern, referenceParams.tileSize)
+        for (batchSize in SUPPORTED_BATCH_SIZES.filter { it <= measuredTileCount }) {
             val candidateParams = referenceParams.copy(
                 nativeBackend = NativeBackend.OPTIMIZED,
                 inferencePrecision = InferencePrecision.FP16,
@@ -146,7 +168,7 @@ class InferenceCalibrationRunner(
             )
             val candidate = probe.run(pattern, candidateParams)
                 ?: return CalibrationPreparation.Failed(CalibrationFailureReason.PROBE_FAILED)
-            if (deadlineReached()) return CalibrationPreparation.DeadlineExceeded
+            currentCoroutineContext().ensureActive()
             if (!candidate.hasSameShape(reference) || candidate.durationNanos <= 0L) {
                 return CalibrationPreparation.Failed(CalibrationFailureReason.INVALID_OUTPUT)
             }
@@ -173,13 +195,21 @@ class InferenceCalibrationRunner(
         return CalibrationPreparation.Ready(benchmark)
     }
 
-    private suspend fun publish(prepared: CalibrationPreparation): CalibrationRunResult {
+    private suspend fun publish(
+        prepared: CalibrationPreparation,
+        publicationGate: BenchmarkPublicationGate,
+        deadlineReached: () -> Boolean
+    ): CalibrationRunResult {
         return when (prepared) {
-            CalibrationPreparation.DeadlineExceeded -> CalibrationRunResult.TimedOut
             is CalibrationPreparation.Failed -> CalibrationRunResult.Failed(prepared.reason)
             is CalibrationPreparation.Ready -> try {
-                repository.save(prepared.benchmark)
-                CalibrationRunResult.Completed(prepared.benchmark)
+                if (repository.publish(prepared.benchmark, publicationGate)) {
+                    CalibrationRunResult.Completed(prepared.benchmark)
+                } else if (deadlineReached()) {
+                    CalibrationRunResult.TimedOut
+                } else {
+                    CalibrationRunResult.Failed(CalibrationFailureReason.PERSISTENCE_FAILED)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -201,11 +231,18 @@ class InferenceCalibrationRunner(
     private fun CalibrationProbeOutput.hasSameShape(other: CalibrationProbeOutput): Boolean =
         image.width == other.image.width && image.height == other.image.height
 
+    private fun estimatedTileCount(image: RgbImage, tileSize: Int): Int {
+        val safeTileSize = tileSize.coerceAtLeast(1)
+        val columns = (image.width + safeTileSize - 1) / safeTileSize
+        val rows = (image.height + safeTileSize - 1) / safeTileSize
+        return columns * rows
+    }
+
     companion object {
         const val DEFAULT_TIMEOUT_MS = 40_000L
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
-        private const val PATTERN_WIDTH = 64
-        private const val PATTERN_HEIGHT = 64
+        private const val PATTERN_WIDTH = 384
+        private const val PATTERN_HEIGHT = 384
         private const val PATTERN_SEED = 0x4c756d615352L
         private val SUPPORTED_BATCH_SIZES = listOf(1, 2, 4, 8)
     }
@@ -215,6 +252,9 @@ class InferenceCalibrationRunner(
 
         data class Failed(val reason: CalibrationFailureReason) : CalibrationPreparation
 
-        data object DeadlineExceeded : CalibrationPreparation
     }
+}
+
+private object CalibrationProbeRuntime {
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 }

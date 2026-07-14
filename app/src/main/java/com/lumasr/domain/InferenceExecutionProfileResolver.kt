@@ -17,23 +17,50 @@ object DeviceFingerprintHasher {
 }
 
 object BenchmarkIdentityFactory {
-    const val SCHEMA_KEY = "inference-benchmark-v1"
-    private const val ENGINE_SCHEMA_KEY = "ncnn-v1"
+    const val SCHEMA_KEY = "inference-benchmark-v2"
 
     fun create(
         modelId: String,
         engine: SuperResEngine,
+        modelArtifactHash: String,
+        runtimeBuildKey: String,
         device: DeviceCapabilityProfile,
         rawDeviceFingerprint: String
     ): BenchmarkIdentity {
         require(modelId.isNotBlank()) { "Calibration model id must not be blank" }
+        require(rawDeviceFingerprint.isNotBlank()) { "Device fingerprint must not be blank" }
         return BenchmarkIdentity(
             schemaKey = SCHEMA_KEY,
-            engineKey = "$ENGINE_SCHEMA_KEY:${engine.name}:${DeviceFingerprintHasher.sha256Hex(modelId)}",
+            engineKey = "ncnn:${engine.name}:${DeviceFingerprintHasher.sha256Hex(modelId)}",
+            modelArtifactHash = modelArtifactHash,
+            runtimeBuildKey = runtimeBuildKey,
             profileHash = device.profileKey,
             deviceFingerprint = DeviceFingerprintHasher.sha256(rawDeviceFingerprint),
             gpuDriverVersion = device.gpuDriverVersion
         )
+    }
+}
+
+object ModelArtifactIdentityFactory {
+    fun create(model: ModelPack): String = DeviceFingerprintHasher.sha256Hex(
+        buildString {
+            appendField(model.id)
+            appendField(model.engine.name)
+            appendField(model.modelDir)
+            appendField(model.assetPath)
+            appendField(model.modelFileBase.orEmpty())
+            appendField(model.requiredFiles.sorted().joinToString("\u0000"))
+            appendField(model.assetBytes?.toString().orEmpty())
+            appendField(model.scales.sorted().joinToString(","))
+            appendField(model.denoise.sorted().joinToString(","))
+            appendField(model.defaultScale.toString())
+            appendField(model.defaultNoise.toString())
+            appendField(model.supportsTta.toString())
+        }
+    )
+
+    private fun StringBuilder.appendField(value: String) {
+        append(value.length).append(':').append(value).append('|')
     }
 }
 
@@ -111,7 +138,9 @@ class LazyProcessingExecutionProfileResolver(
 class InferenceExecutionProfileResolver(
     private val repository: InferenceBenchmarkRepository,
     private val device: DeviceCapabilityProfile,
-    private val rawDeviceFingerprint: String
+    private val rawDeviceFingerprint: String,
+    private val modelArtifactIdentities: Map<String, String>,
+    private val runtimeBuildKey: String
 ) : ProcessingExecutionProfileResolver {
     override suspend fun resolve(
         modelId: String,
@@ -128,12 +157,18 @@ class InferenceExecutionProfileResolver(
             )
         }
 
-        val identity = BenchmarkIdentityFactory.create(
-            modelId = modelId,
-            engine = params.engine,
-            device = device,
-            rawDeviceFingerprint = rawDeviceFingerprint
-        )
+        val modelArtifactHash = modelArtifactIdentities[modelId]
+            ?: return selectAndApply(params, benchmark = null)
+        val identity = runCatching {
+            BenchmarkIdentityFactory.create(
+                modelId = modelId,
+                engine = params.engine,
+                modelArtifactHash = modelArtifactHash,
+                runtimeBuildKey = runtimeBuildKey,
+                device = device,
+                rawDeviceFingerprint = rawDeviceFingerprint
+            )
+        }.getOrNull() ?: return selectAndApply(params, benchmark = null)
         val benchmark = repository.findValid(identity, nowEpochMs)
         return selectAndApply(params, benchmark, identity, nowEpochMs)
     }

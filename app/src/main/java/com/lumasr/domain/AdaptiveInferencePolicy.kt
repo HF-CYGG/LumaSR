@@ -49,6 +49,8 @@ data class Fp16QualityMetrics(
 data class BenchmarkIdentity(
     val schemaKey: String,
     val engineKey: String,
+    val modelArtifactHash: String,
+    val runtimeBuildKey: String,
     val profileHash: String,
     val deviceFingerprint: String,
     val gpuDriverVersion: String?
@@ -56,6 +58,14 @@ data class BenchmarkIdentity(
     init {
         requireNormalizedIdentifier(schemaKey, "Benchmark schema key", MAX_SCHEMA_KEY_LENGTH)
         requireNormalizedIdentifier(engineKey, "Benchmark engine key", MAX_ENGINE_KEY_LENGTH)
+        require(ARTIFACT_HASH.matches(modelArtifactHash)) {
+            "Benchmark model artifact must be a lowercase SHA-256 hash"
+        }
+        requireNormalizedIdentifier(
+            runtimeBuildKey,
+            "Benchmark runtime build key",
+            MAX_RUNTIME_BUILD_KEY_LENGTH
+        )
         requireNormalizedIdentifier(profileHash, "Benchmark profile hash", MAX_PROFILE_HASH_LENGTH)
         require(DEVICE_FINGERPRINT_HASH.matches(deviceFingerprint)) {
             "Benchmark device fingerprint must be a lowercase SHA-256 hash"
@@ -68,9 +78,11 @@ data class BenchmarkIdentity(
     private companion object {
         const val MAX_SCHEMA_KEY_LENGTH = 64
         const val MAX_ENGINE_KEY_LENGTH = 256
+        const val MAX_RUNTIME_BUILD_KEY_LENGTH = 128
         const val MAX_PROFILE_HASH_LENGTH = 256
         const val MAX_GPU_DRIVER_LENGTH = 256
         val DEVICE_FINGERPRINT_HASH = Regex("[0-9a-f]{64}")
+        val ARTIFACT_HASH = Regex("[0-9a-f]{64}")
 
         fun requireNormalizedIdentifier(value: String, label: String, maxLength: Int) {
             require(value.isNotBlank()) { "$label must not be blank" }
@@ -116,12 +128,18 @@ object AdaptiveInferencePolicy {
         device: DeviceCapabilityProfile,
         quality: Fp16QualityMetrics
     ): Boolean {
-        return device.supportsFp16Storage &&
+        return hasStableGpuIdentity(device) &&
+            device.supportsFp16Storage &&
             device.supportsFp16Arithmetic &&
             quality.ssim >= 0.995 &&
             quality.psnrDb >= 40.0 &&
             quality.p99ChannelError <= 3
     }
+
+    fun hasStableGpuIdentity(device: DeviceCapabilityProfile): Boolean =
+        !device.gpuVendor.isNullOrBlank() &&
+            !device.gpuDevice.isNullOrBlank() &&
+            !device.gpuDriverVersion.isNullOrBlank()
 
     fun isBenchmarkValid(
         cached: BenchmarkIdentity,

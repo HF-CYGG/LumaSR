@@ -19,11 +19,15 @@ class OnDeviceCalibrationCoordinator(
     private val executor: CalibrationRequestExecutor,
     private val device: DeviceCapabilityProfile,
     private val rawDeviceFingerprint: String,
+    private val runtimeBuildKey: String,
     private val calibrationDirectory: File,
     private val clock: () -> Long = System::currentTimeMillis
 ) : DeviceCalibrationCoordinator {
     override val isSupported: Boolean
         get() = !device.isLowRamDevice &&
+            rawDeviceFingerprint.isNotBlank() &&
+            runtimeBuildKey.isNotBlank() &&
+            AdaptiveInferencePolicy.hasStableGpuIdentity(device) &&
             device.memoryBucketMb > 0 &&
             device.physicalCoreCount > 0 &&
             device.supportsVulkan &&
@@ -54,14 +58,19 @@ class OnDeviceCalibrationCoordinator(
     }
 
     override suspend fun hasValidCalibration(model: ModelPack): Boolean {
+        if (!isSupported) return false
         val now = clock()
         if (now < 0L) return false
-        return repository.findValid(identity(model), now) != null
+        val result = repository.findValid(identity(model), now) ?: return false
+        return result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES &&
+            AdaptiveInferencePolicy.isFp16Eligible(device, result.fp16Quality)
     }
 
     private fun identity(model: ModelPack): BenchmarkIdentity = BenchmarkIdentityFactory.create(
         modelId = model.id,
         engine = model.engine,
+        modelArtifactHash = ModelArtifactIdentityFactory.create(model),
+        runtimeBuildKey = runtimeBuildKey,
         device = device,
         rawDeviceFingerprint = rawDeviceFingerprint
     )
@@ -93,5 +102,6 @@ class OnDeviceCalibrationCoordinator(
 
     private companion object {
         const val CALIBRATION_TILE_SIZE = 128
+        val SUPPORTED_BATCH_SIZES = setOf(1, 2, 4, 8)
     }
 }

@@ -21,8 +21,9 @@ class NativeBitmapCalibrationProbe(
             "Cannot create local calibration directory"
         }
         val output = File.createTempFile("lumasr-calibration-", ".png", directory)
-        val bitmap = bitmapFactory(input)
+        var bitmap: Bitmap? = null
         return try {
+            bitmap = bitmapFactory(input)
             val startedAt = nanoTime()
             val result = processor.processBitmapRegion(
                 params = params.copy(outputPath = output.absolutePath),

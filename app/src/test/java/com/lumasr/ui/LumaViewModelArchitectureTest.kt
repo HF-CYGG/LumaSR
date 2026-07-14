@@ -41,4 +41,11 @@ class LumaViewModelArchitectureTest {
         assertTrue(source.contains("withContext(ioDispatcher)"))
         assertTrue(source.contains("calibrationCoordinator.run("))
     }
+
+    @Test
+    fun modelSelectionIsGuardedWhileCalibrationRuns() {
+        val source = File("src/main/java/com/lumasr/ui/LumaViewModel.kt").readText()
+
+        assertTrue(source.contains("if (!canChangeModel(_uiState.value)) return"))
+    }
 }

@@ -1,6 +1,7 @@
 package com.lumasr.domain
 
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +17,35 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InferenceCalibrationRunnerTest {
+    @Test
+    fun calibrationPatternCoversAtLeastNine128PixelTiles() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        var firstInput: RgbImage? = null
+        val durations = listOf(90L, 40L, 30L, 20L, 25L).iterator()
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (firstInput == null) firstInput = input
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        durations.next()
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository
+        )
+
+        runner.run(request(outputScale = 1))
+
+        assertTrue(requireNotNull(firstInput).width >= 384)
+        assertTrue(requireNotNull(firstInput).height >= 384)
+    }
+
     @Test
     fun publishesOnlyTheFastestQualifiedCandidateAfterAllProbesSucceed() = runBlocking {
         val repository = RecordingBenchmarkRepository()
@@ -122,6 +152,56 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
+    fun timeoutReturnsWhileBlockingProbeIgnoresNativeCancellation() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val release = CountDownLatch(1)
+        val cancelled = mutableListOf<String>()
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    release.await()
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        1L
+                    )
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelled += taskId
+                }
+            },
+            repository = repository,
+            timeoutMs = 25L
+        )
+        val safetyRelease = launch(Dispatchers.Default) {
+            delay(1_000L)
+            release.countDown()
+        }
+
+        try {
+            val startedAt = System.nanoTime()
+            val result = runner.run(request(outputScale = 1))
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+
+            assertTrue(result is CalibrationRunResult.TimedOut)
+            assertTrue("timeout must not wait for an unresponsive probe", elapsedMs < 750L)
+            assertEquals(1, cancelled.size)
+            assertTrue(repository.saved.isEmpty())
+        } finally {
+            release.countDown()
+            safetyRelease.cancel()
+            for (attempt in 0 until 100) {
+                if (!CalibrationExecutionGate.isCalibrationActive) break
+                delay(10L)
+            }
+            assertFalse(CalibrationExecutionGate.isCalibrationActive)
+        }
+    }
+
+    @Test
     fun candidatesSlowerThanLegacyReferenceNeverEnableOptimizedPath() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val durations = listOf(10L, 11L, 12L, 13L, 14L).iterator()
@@ -179,6 +259,59 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
+    fun callerCancellationWinningBeforeAtomicCommitLeavesNoBenchmark() = runBlocking {
+        val publishStarted = CompletableDeferred<Unit>()
+        val allowCommit = CompletableDeferred<Unit>()
+        val repository = object : InferenceBenchmarkRepository {
+            val saved = mutableListOf<InferenceBenchmarkResult>()
+
+            override suspend fun save(result: InferenceBenchmarkResult) {
+                saved += result
+            }
+
+            override suspend fun publish(
+                result: InferenceBenchmarkResult,
+                gate: BenchmarkPublicationGate
+            ): Boolean = withContext(NonCancellable) {
+                    publishStarted.complete(Unit)
+                    allowCommit.await()
+                    gate.tryCommit { saved += result }
+            }
+
+            override suspend fun list(): List<InferenceBenchmarkResult> = saved.toList()
+
+            override suspend fun findValid(
+                identity: BenchmarkIdentity,
+                nowEpochMs: Long
+            ): InferenceBenchmarkResult? = saved.lastOrNull { it.identity == identity }
+        }
+        val durations = listOf(90L, 40L, 30L, 20L, 25L).iterator()
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    durations.next()
+                )
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository
+        )
+        val job = async { runner.run(request(outputScale = 1)) }
+        publishStarted.await()
+
+        job.cancel()
+        allowCommit.complete(Unit)
+        val failure = runCatching { job.await() }.exceptionOrNull()
+
+        assertTrue(failure is CancellationException)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
     fun candidateBelowQualityThresholdLeavesLegacyPathActive() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         var attempt = 0
@@ -215,6 +348,8 @@ class InferenceCalibrationRunnerTest {
     private fun identity() = BenchmarkIdentity(
         schemaKey = "benchmark-v1",
         engineKey = "ncnn-v1:waifu2x:test-model",
+        modelArtifactHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        runtimeBuildKey = "app-1:test:arm64-v8a",
         profileHash = "device-capability-v1:test-profile",
         deviceFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         gpuDriverVersion = "driver-v1"
@@ -259,6 +394,11 @@ class InferenceCalibrationRunnerTest {
         override suspend fun save(result: InferenceBenchmarkResult) {
             saved += result
         }
+
+        override suspend fun publish(
+            result: InferenceBenchmarkResult,
+            gate: BenchmarkPublicationGate
+        ): Boolean = gate.tryCommit { saved += result }
 
         override suspend fun list(): List<InferenceBenchmarkResult> = saved.toList()
 

@@ -102,9 +102,8 @@ fun SettingsScreenV2(
                 icon = Icons.Rounded.Memory,
                 title = "本机性能校准",
                 subtitle = calibrationStatusText(state.calibrationStatus),
-                onClick = {
-                    if (state.calibrationStatus != CalibrationUiStatus.RUNNING) onRunCalibration()
-                }
+                enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                onClick = onRunCalibration
             )
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
@@ -241,13 +240,14 @@ private fun SettingsClickableRowV2(
     icon: ImageVector,
     title: String,
     subtitle: String,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     SettingsRowFrame(
         icon = icon,
         title = title,
         subtitle = subtitle,
-        modifier = Modifier.clickable(onClick = onClick)
+        modifier = Modifier.clickable(enabled = enabled, onClick = onClick)
     )
 }
 

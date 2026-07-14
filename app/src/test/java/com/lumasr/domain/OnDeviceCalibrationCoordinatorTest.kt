@@ -19,6 +19,7 @@ class OnDeviceCalibrationCoordinatorTest {
             },
             device = device(),
             rawDeviceFingerprint = "vivo/test/fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
             calibrationDirectory = File("build/on-device-calibration").absoluteFile,
             clock = { 1_234L }
         )
@@ -26,10 +27,12 @@ class OnDeviceCalibrationCoordinatorTest {
         coordinator.run(model(), File("build/models/waifu").absolutePath)
 
         val request = requireNotNull(captured)
-        assertTrue(request.identity.engineKey.startsWith("ncnn-v1:WAIFU2X:"))
+        assertTrue(request.identity.engineKey.startsWith("ncnn:WAIFU2X:"))
         assertEquals(device().profileKey, request.identity.profileHash)
         assertTrue(request.identity.deviceFingerprint.matches(Regex("[0-9a-f]{64}")))
         assertEquals("driver-v1", request.identity.gpuDriverVersion)
+        assertEquals(ModelArtifactIdentityFactory.create(model()), request.identity.modelArtifactHash)
+        assertEquals("app-1:test:arm64-v8a", request.identity.runtimeBuildKey)
         assertEquals(1_234L, request.measuredAtEpochMs)
         assertEquals(File("build/models/waifu").absolutePath, request.baseParams.modelDir)
         assertEquals(AccelerationMode.VULKAN, request.baseParams.accelerationMode)
@@ -44,12 +47,15 @@ class OnDeviceCalibrationCoordinatorTest {
             executor = CalibrationRequestExecutor { error("not used") },
             device = device(),
             rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
             calibrationDirectory = File("build/on-device-calibration").absoluteFile,
             clock = { 1_500L }
         )
         val identity = BenchmarkIdentityFactory.create(
             modelId = model().id,
             engine = model().engine,
+            modelArtifactHash = ModelArtifactIdentityFactory.create(model()),
+            runtimeBuildKey = "app-1:test:arm64-v8a",
             device = device(),
             rawDeviceFingerprint = "fingerprint"
         )
@@ -76,6 +82,7 @@ class OnDeviceCalibrationCoordinatorTest {
             },
             device = device().copy(supportsFp16Arithmetic = false),
             rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
             calibrationDirectory = File("build/on-device-calibration").absoluteFile
         )
 
@@ -88,6 +95,72 @@ class OnDeviceCalibrationCoordinatorTest {
         )
         assertFalse(invoked)
     }
+
+    @Test
+    fun unknownGpuOrDeviceFingerprintCannotRunCalibration() = runBlocking {
+        val unknownDevices = listOf(
+            device().copy(gpuVendor = null),
+            device().copy(gpuVendor = "  "),
+            device().copy(gpuDevice = null),
+            device().copy(gpuDevice = ""),
+            device().copy(gpuDriverVersion = null),
+            device().copy(gpuDriverVersion = " ")
+        )
+
+        unknownDevices.forEach { unknownDevice ->
+            val coordinator = coordinator(device = unknownDevice)
+            assertFalse(coordinator.isSupported)
+            assertEquals(
+                CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE),
+                coordinator.run(model(), File("build/models").absolutePath)
+            )
+        }
+        val missingFingerprint = coordinator(rawDeviceFingerprint = "  ")
+        assertFalse(missingFingerprint.isSupported)
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE),
+            missingFingerprint.run(model(), File("build/models").absolutePath)
+        )
+    }
+
+    @Test
+    fun validCalibrationRequiresFp16QualityEligibility() = runBlocking {
+        val repository = FakeRepository()
+        val coordinator = coordinator(repository = repository, clock = { 1_500L })
+        repository.value = InferenceBenchmarkResult(
+            identity = BenchmarkIdentityFactory.create(
+                modelId = model().id,
+                engine = model().engine,
+                modelArtifactHash = ModelArtifactIdentityFactory.create(model()),
+                runtimeBuildKey = "app-1:test:arm64-v8a",
+                device = device(),
+                rawDeviceFingerprint = "fingerprint"
+            ),
+            fp16Quality = Fp16QualityMetrics(0.99, 39.0, 4),
+            recommendedCommandBatchSize = 4,
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 2_000L
+        )
+
+        assertFalse(coordinator.hasValidCalibration(model()))
+    }
+
+    private fun coordinator(
+        repository: FakeRepository = FakeRepository(),
+        device: DeviceCapabilityProfile = device(),
+        rawDeviceFingerprint: String = "fingerprint",
+        clock: () -> Long = { 1_500L }
+    ) = OnDeviceCalibrationCoordinator(
+        repository = repository,
+        executor = CalibrationRequestExecutor {
+            error("unsupported calibration must not invoke executor")
+        },
+        device = device,
+        rawDeviceFingerprint = rawDeviceFingerprint,
+        runtimeBuildKey = "app-1:test:arm64-v8a",
+        calibrationDirectory = File("build/on-device-calibration").absoluteFile,
+        clock = clock
+    )
 
     private fun model() = ModelPack(
         id = "waifu2x-cunet",
@@ -134,6 +207,11 @@ class OnDeviceCalibrationCoordinatorTest {
         override suspend fun save(result: InferenceBenchmarkResult) {
             value = result
         }
+
+        override suspend fun publish(
+            result: InferenceBenchmarkResult,
+            gate: BenchmarkPublicationGate
+        ): Boolean = gate.tryCommit { value = result }
 
         override suspend fun list(): List<InferenceBenchmarkResult> = listOfNotNull(value)
 
