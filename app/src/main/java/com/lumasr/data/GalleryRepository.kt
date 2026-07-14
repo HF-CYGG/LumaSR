@@ -9,6 +9,10 @@ import com.lumasr.domain.MediaOutputNamer
 import com.lumasr.domain.OutputFormat
 import java.io.File
 
+internal fun OutputFormat.requireGalleryOutputSupported() {
+    require(this == OutputFormat.PNG) { "Only PNG gallery output is supported." }
+}
+
 class GalleryRepository(
     private val context: Context
 ) {
@@ -20,6 +24,7 @@ class GalleryRepository(
         timestampMillis: Long = System.currentTimeMillis()
     ): Uri {
         require(sourceFile.exists() && sourceFile.length() > 0L) { "Output file is missing." }
+        format.requireGalleryOutputSupported()
         require(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             "Saving to gallery requires Android 10+ in this MVP."
         }

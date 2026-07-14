@@ -1,13 +1,13 @@
 # LumaSR 本地 AI 图像超分工具
 
-![Android](https://img.shields.io/badge/Android-26%2B-3DDC84?logo=android&logoColor=white)
+![Android](https://img.shields.io/badge/Android-29%2B-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Kotlin-1.9.24-7F52FF?logo=kotlin&logoColor=white)
 ![Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285F4?logo=jetpackcompose&logoColor=white)
 ![ncnn](https://img.shields.io/badge/ncnn-20260526-black)
 ![Vulkan](https://img.shields.io/badge/Vulkan%2FCPU-Ready-A41E22?logo=vulkan&logoColor=white)
 ![Offline](https://img.shields.io/badge/Offline-Inference-2EA44F)
 
-LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与 Vulkan/CPU 加速实现离线推理，支持 Waifu2x、RealCUGAN、Real-ESRGAN 等模型，提供极简参数控制、实时分块处理预览与前后画质对比体验。
+LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与 Vulkan/CPU 加速实现离线推理，支持 Waifu2x、RealCUGAN、Real-ESRGAN 等模型，提供极简参数控制、实时分块处理预览与处理后结果预览体验。
 
 项目目标是把常见超分模型做成可直接在手机端运行的轻量工具：不上传图片、不依赖云端服务，并尽量保留清晰、可维护的 Android 与 Native 分层。
 
@@ -22,8 +22,8 @@ LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与
 - ncnn Native 引擎：通过 JNI 调用 C++ 推理层，支持 `.param/.bin` 模型加载。
 - Vulkan/CPU 模式：支持自动模式，GPU 不可用时可回退 CPU。
 - 分块处理进度：按 tile 推进并向 Compose UI 回传阶段、百分比与 tile 状态。
-- 前后对比：处理完成后显示输入与输出预览，可通过滑杆比较效果。
-- 结果保存与分享：结果可保存到系统相册目录，并在保存后调用系统分享。
+- 结果预览：处理完成后直接展示处理后的输出图片。
+- 结果保存与分享：PNG 结果可保存到系统相册目录，并在保存后调用系统分享。
 
 ## 技术栈
 
@@ -65,7 +65,7 @@ scripts/download-deps.ps1       国内镜像依赖与模型安装脚本
 ## 构建环境
 
 - JDK 17
-- Android SDK 34
+- Android SDK 35
 - Android NDK `27.2.12479018` 或更新版本
 - CMake 3.22.1
 - Gradle 缓存建议使用 `F:\Development\gradle`
@@ -100,7 +100,7 @@ app/build/outputs/apk/debug/app-debug.apk
 .\gradlew.bat -g F:\Development\gradle assembleDebug
 ```
 
-建议在真机或模拟器上手动验证：选择图片、切换模型与参数、开始处理、取消处理、完成后进入对比页、保存结果、深色模式下控件不遮挡。
+建议在 Android 10 或更新版本的真机/模拟器上手动验证：选择图片、切换模型与参数、开始处理、取消处理、完成后查看输出图片、保存并分享 PNG 结果、深色模式下控件不遮挡。
 
 ## 后续计划
 
