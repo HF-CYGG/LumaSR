@@ -73,6 +73,42 @@ class ForegroundProcessingRuntimeTest {
     }
 
     @Test
+    fun repeatedResumeRefreshesNewlyPersistedWorkInTheExistingSession() = runBlocking {
+        val bridge = ProcessingSnapshotBridge()
+        val taskRepository = InMemoryTaskRepository()
+        val workRepository = InMemoryWorkRepository()
+        val coordinatorCreations = AtomicInteger(0)
+        val runtime = ForegroundProcessingRuntime(
+            leaseAcquirer = bridge::acquire,
+            coordinatorFactory = {
+                coordinatorCreations.incrementAndGet()
+                ProcessingCoordinator(
+                    taskRepository = taskRepository,
+                    workSpecRepository = workRepository,
+                    runner = ImmediateRunner(),
+                    dispatcher = Dispatchers.Default
+                )
+            }
+        )
+        try {
+            assertTrue(runtime.resumePersistedWork())
+            taskRepository.save(task("late-persisted"))
+            workRepository.save(spec("late-persisted"))
+
+            assertTrue(runtime.resumePersistedWork())
+
+            withTimeout(5_000L) {
+                while (taskRepository.find("late-persisted")?.state != ProcessingTaskState.COMPLETED) {
+                    delay(10L)
+                }
+            }
+            assertEquals(1, coordinatorCreations.get())
+        } finally {
+            runtime.closeAndJoin()
+        }
+    }
+
+    @Test
     fun serviceBarrierReleasesOnlyAfterFallbackRunnerStopsAndTaskIsQueued() = runBlocking {
         val bridge = ProcessingSnapshotBridge()
         val taskRepository = InMemoryTaskRepository()

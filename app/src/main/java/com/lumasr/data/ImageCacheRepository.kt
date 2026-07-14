@@ -6,6 +6,8 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.lumasr.domain.TaskCachePaths
 import java.io.File
+import java.io.InputStream
+import java.net.URI
 
 class ImageCacheRepository(
     private val context: Context,
@@ -51,7 +53,9 @@ class ImageCacheRepository(
         stableRoot: File
     ): TaskCachePaths {
         return StableTaskFileCopier(stableRoot).copy(taskId, mimeType) {
-            context.contentResolver.openInputStream(uri)
+            openImageSource(uri.toString()) {
+                context.contentResolver.openInputStream(uri)
+            }
         }
     }
 
@@ -66,6 +70,18 @@ class ImageCacheRepository(
             )
         }
     }
+}
+
+internal fun openImageSource(
+    source: String,
+    contentOpener: (String) -> InputStream?
+): InputStream? {
+    val localFile = when {
+        source.startsWith("file:", ignoreCase = true) -> runCatching { File(URI(source)) }.getOrNull()
+        !source.contains("://") && File(source).isAbsolute -> File(source)
+        else -> null
+    }
+    return localFile?.inputStream() ?: contentOpener(source)
 }
 
 data class CachedImageInfo(

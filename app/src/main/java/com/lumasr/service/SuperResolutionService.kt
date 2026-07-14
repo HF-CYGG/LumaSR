@@ -29,6 +29,18 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
+internal enum class IncomingProcessingServiceCommand {
+    RESUME,
+    CANCEL,
+    RECOVER_ONLY
+}
+
+internal fun resolveIncomingProcessingServiceCommand(action: String?): IncomingProcessingServiceCommand = when (action) {
+    SuperResolutionService.ACTION_RESUME -> IncomingProcessingServiceCommand.RESUME
+    SuperResolutionService.ACTION_CANCEL -> IncomingProcessingServiceCommand.CANCEL
+    else -> IncomingProcessingServiceCommand.RECOVER_ONLY
+}
+
 class SuperResolutionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lifecycleGate = ProcessingServiceLifecycleGate()
@@ -73,14 +85,14 @@ class SuperResolutionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val operation = lifecycleGate.beginOperation(startId)
-        when (intent?.action) {
-            ACTION_RESUME -> launchOperation(operation) {
+        when (resolveIncomingProcessingServiceCommand(intent?.action)) {
+            IncomingProcessingServiceCommand.RESUME -> launchOperation(operation) {
                 ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
                     coordinator.resumePersistedWork()
                 }
             }
-            ACTION_CANCEL -> {
-                val taskId = intent.getStringExtra(EXTRA_TASK_ID)
+            IncomingProcessingServiceCommand.CANCEL -> {
+                val taskId = intent?.getStringExtra(EXTRA_TASK_ID)
                 if (!taskId.isNullOrBlank()) {
                     launchOperation(operation) {
                         ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
@@ -93,9 +105,9 @@ class SuperResolutionService : Service() {
                 }
             }
 
-            else -> launchOperation(operation) {
-                ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
-                    coordinator.resumePersistedWork()
+            IncomingProcessingServiceCommand.RECOVER_ONLY -> launchOperation(operation) {
+                ownerSession.runAfterPredecessorRelease {
+                    coordinator.start()
                 }
             }
         }

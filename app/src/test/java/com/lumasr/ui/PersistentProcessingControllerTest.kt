@@ -15,8 +15,10 @@ import com.lumasr.service.ForegroundFallbackReason
 import com.lumasr.service.ProcessingServiceStartResult
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -40,22 +42,50 @@ class PersistentProcessingControllerTest {
     }
 
     @Test
-    fun typedForegroundServiceRejectionStartsOneReusableFallbackAndExposesReason() = runBlocking {
+    fun repeatedForegroundServiceRejectionRefreshesTheReusableFallbackAndExposesReason() = runBlocking {
         val fixture = Fixture(
             submitResult = ProcessingServiceStartResult.ForegroundOnlyFallback(
                 ForegroundFallbackReason.START_NOT_ALLOWED
             )
         )
 
+        fixture.controller.onHostStarted()
         fixture.controller.submitBatch(listOf(submission("task-1")))
         fixture.controller.submitBatch(listOf(submission("task-2", batchId = "batch-2")))
 
-        assertEquals(1, fixture.fallback.resumeCount)
+        assertEquals(2, fixture.fallback.resumeCount)
         assertEquals(
             ForegroundFallbackReason.START_NOT_ALLOWED,
             fixture.controller.state.value.notice?.fallbackReason
         )
         assertTrue(fixture.controller.state.value.notice?.message.orEmpty().isNotBlank())
+    }
+
+    @Test
+    fun hostStopBeforeLateServiceRejectionPreventsBackgroundFallbackStart() = runBlocking {
+        val submissionReachedService = CompletableDeferred<Unit>()
+        val releaseServiceResult = CompletableDeferred<Unit>()
+        val fixture = Fixture(
+            submitResult = ProcessingServiceStartResult.ForegroundOnlyFallback(
+                ForegroundFallbackReason.START_NOT_ALLOWED
+            ),
+            beforeSubmitResult = {
+                submissionReachedService.complete(Unit)
+                releaseServiceResult.await()
+            }
+        )
+        fixture.controller.onHostStarted()
+
+        val submit = async {
+            fixture.controller.submitBatch(listOf(submission("late-task")))
+        }
+        submissionReachedService.await()
+        fixture.controller.onHostStopped()
+        releaseServiceResult.complete(Unit)
+        submit.await()
+
+        assertEquals(0, fixture.fallback.resumeCount)
+        assertEquals(1, fixture.fallback.stopCount)
     }
 
     @Test
@@ -140,6 +170,37 @@ class PersistentProcessingControllerTest {
                     .task
                     .state
             )
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun newerExplicitQueuedRetryCanAdvanceACancelledRecord() = runBlocking {
+        val fixture = Fixture()
+        fixture.tasks.save(task("retry", state = ProcessingTaskState.CANCELLED, updatedAt = 2_000L))
+        fixture.work.save(spec("retry"))
+        fixture.controller.restoreAndResume()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            fixture.controller.startObserving(scope)
+            withTimeout(2_000L) {
+                while (fixture.snapshots.subscriptionCount.value == 0) yield()
+            }
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(
+                    task = task("retry", state = ProcessingTaskState.QUEUED, updatedAt = 3_000L),
+                    progress = null
+                )
+            )
+            withTimeout(2_000L) {
+                while (
+                    fixture.controller.state.value.records.single { it.task.id == "retry" }
+                        .task.state != ProcessingTaskState.QUEUED
+                ) {
+                    yield()
+                }
+            }
         } finally {
             scope.cancel()
         }
@@ -234,7 +295,8 @@ class PersistentProcessingControllerTest {
     }
 
     private class Fixture(
-        submitResult: ProcessingServiceStartResult = ProcessingServiceStartResult.Started
+        submitResult: ProcessingServiceStartResult = ProcessingServiceStartResult.Started,
+        beforeSubmitResult: suspend () -> Unit = {}
     ) {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -249,6 +311,7 @@ class PersistentProcessingControllerTest {
                     work.save(it.workSpec)
                     tasks.save(it.task)
                 }
+                beforeSubmitResult()
                 submitResult
             },
             serviceGateway = service,

@@ -50,9 +50,9 @@ class ForegroundProcessingRuntime(
         get() = closed.get()
 
     suspend fun resumePersistedWork(): Boolean {
-        val newSession = sessionMutex.withLock {
+        val target = sessionMutex.withLock {
             check(!closed.get()) { "Foreground processing runtime is closed" }
-            if (session != null) return true
+            session?.let { return@withLock ResumeTarget(it, newlyCreated = false) }
             val lease = leaseAcquirer(ProcessingSnapshotOwner.FOREGROUND_FALLBACK)
                 ?: return false
             val coordinator = try {
@@ -61,20 +61,23 @@ class ForegroundProcessingRuntime(
                 lease.release()
                 throw failure
             }
-            Session(
+            val created = Session(
                 id = nextSessionId.incrementAndGet(),
                 lease = lease,
                 coordinator = coordinator
-            ).also { created ->
-                val job = scope.launch(start = CoroutineStart.LAZY) {
-                    runSession(created)
-                }
-                created.job = job
-                session = created
-                job.start()
+            )
+            val job = scope.launch(start = CoroutineStart.LAZY) { runSession(created) }
+            created.job = job
+            session = created
+            job.start()
+            ResumeTarget(created, newlyCreated = true)
+        }
+        if (!target.newlyCreated) {
+            target.session.operationMutex.withLock {
+                target.session.coordinator.resumePersistedWork()
             }
         }
-        return newSession.job.isActive || !newSession.job.isCompleted
+        return target.session.job.isActive || !target.session.job.isCompleted
     }
 
     suspend fun cancel(taskId: String): Boolean {
@@ -117,7 +120,9 @@ class ForegroundProcessingRuntime(
                     }
                 }
                 try {
-                    activeSession.coordinator.resumePersistedWork()
+                    activeSession.operationMutex.withLock {
+                        activeSession.coordinator.resumePersistedWork()
+                    }
                     // Foreground exit and Service takeover share the same fail-closed shutdown path.
                     awaitExitRequest(activeSession)
                 } finally {
@@ -129,17 +134,19 @@ class ForegroundProcessingRuntime(
         } finally {
             withContext(NonCancellable) {
                 var handoffResult: ProcessingOwnerHandoffResult = ProcessingOwnerHandoffResult.Released
-                try {
-                    activeSession.coordinator.relinquishForOwnerHandoff()
-                } catch (_: Exception) {
-                    sessionFailed = true
-                    handoffResult = ProcessingOwnerHandoffResult.Failed
-                }
-                try {
-                    activeSession.coordinator.close()
-                } catch (_: Exception) {
-                    sessionFailed = true
-                    handoffResult = ProcessingOwnerHandoffResult.Failed
+                activeSession.operationMutex.withLock {
+                    try {
+                        activeSession.coordinator.relinquishForOwnerHandoff()
+                    } catch (_: Exception) {
+                        sessionFailed = true
+                        handoffResult = ProcessingOwnerHandoffResult.Failed
+                    }
+                    try {
+                        activeSession.coordinator.close()
+                    } catch (_: Exception) {
+                        sessionFailed = true
+                        handoffResult = ProcessingOwnerHandoffResult.Failed
+                    }
                 }
                 when (handoffResult) {
                     ProcessingOwnerHandoffResult.Released -> activeSession.lease.release()
@@ -185,8 +192,14 @@ class ForegroundProcessingRuntime(
         val stopRequested: CompletableDeferred<Unit> = CompletableDeferred(),
         val completion: CompletableDeferred<ForegroundRuntimeStopResult> = CompletableDeferred()
     ) {
+        val operationMutex = Mutex()
         lateinit var job: Job
     }
+
+    private data class ResumeTarget(
+        val session: Session,
+        val newlyCreated: Boolean
+    )
 }
 
 object ApplicationForegroundProcessingRuntime {

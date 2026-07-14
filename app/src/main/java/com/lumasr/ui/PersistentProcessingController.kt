@@ -75,8 +75,10 @@ class PersistentProcessingController(
     private val snapshots: Flow<List<ProcessingTaskSnapshot>>
 ) {
     private val stateMutex = Mutex()
+    private val fallbackLifecycleMutex = Mutex()
     private val observationStarted = AtomicBoolean(false)
     private var foregroundFallbackActive = false
+    private var hostForeground = false
     private val stopRequestedTaskIds = mutableSetOf<String>()
     private val _state = MutableStateFlow(PersistentProcessingState())
 
@@ -151,14 +153,20 @@ class PersistentProcessingController(
     }
 
     suspend fun onHostStarted() {
+        fallbackLifecycleMutex.withLock {
+            stateMutex.withLock { hostForeground = true }
+        }
         restoreAndResume()
     }
 
     suspend fun onHostStopped() {
-        try {
-            foregroundRuntime.stopForForegroundExit()
-        } finally {
-            stateMutex.withLock { foregroundFallbackActive = false }
+        fallbackLifecycleMutex.withLock {
+            stateMutex.withLock { hostForeground = false }
+            try {
+                foregroundRuntime.stopForForegroundExit()
+            } finally {
+                stateMutex.withLock { foregroundFallbackActive = false }
+            }
         }
     }
 
@@ -231,21 +239,16 @@ class PersistentProcessingController(
 
     private suspend fun handleServiceStartResult(result: ProcessingServiceStartResult) {
         when (result) {
-            ProcessingServiceStartResult.Started -> stateMutex.withLock {
-                foregroundFallbackActive = false
-                _state.value = _state.value.copy(notice = null)
+            ProcessingServiceStartResult.Started -> fallbackLifecycleMutex.withLock {
+                stateMutex.withLock {
+                    foregroundFallbackActive = false
+                    _state.value = _state.value.copy(notice = null)
+                }
             }
 
-            is ProcessingServiceStartResult.ForegroundOnlyFallback -> {
-                val shouldResumeFallback = stateMutex.withLock {
-                    if (foregroundFallbackActive) {
-                        false
-                    } else {
-                        foregroundFallbackActive = true
-                        true
-                    }
-                }
-                val fallbackStarted = if (shouldResumeFallback) {
+            is ProcessingServiceStartResult.ForegroundOnlyFallback -> fallbackLifecycleMutex.withLock {
+                val canRunInForeground = stateMutex.withLock { hostForeground }
+                val fallbackStarted = if (canRunInForeground) {
                     try {
                         foregroundRuntime.resumePersistedWork()
                     } catch (cancelled: CancellationException) {
@@ -253,11 +256,9 @@ class PersistentProcessingController(
                     } catch (_: Exception) {
                         false
                     }
-                } else {
-                    true
-                }
+                } else false
                 stateMutex.withLock {
-                    if (!fallbackStarted) foregroundFallbackActive = false
+                    foregroundFallbackActive = fallbackStarted
                     _state.value = _state.value.copy(
                         notice = PersistentProcessingNotice(
                             message = fallbackMessage(result.reason, fallbackStarted),
@@ -296,7 +297,13 @@ class PersistentProcessingController(
 
     private fun chooseTask(previous: ProcessingTask?, candidate: ProcessingTask): ProcessingTask {
         if (previous == null) return candidate
-        if (previous.state == ProcessingTaskState.CANCELLED) return previous
+        if (
+            previous.state == ProcessingTaskState.CANCELLED &&
+            !(candidate.state == ProcessingTaskState.QUEUED &&
+                candidate.updatedAtEpochMs > previous.updatedAtEpochMs)
+        ) {
+            return previous
+        }
         if (candidate.updatedAtEpochMs > previous.updatedAtEpochMs) return candidate
         if (candidate.updatedAtEpochMs < previous.updatedAtEpochMs) return previous
         val previousRank = statePrecedence(previous.state)
