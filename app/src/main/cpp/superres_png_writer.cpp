@@ -104,6 +104,7 @@ struct StreamingPngWriter::Impl {
     int height = 0;
     int writtenRows = 0;
     size_t rowBytes = 0;
+    bool temporaryFinished = false;
     std::vector<unsigned char> compressed;
 
     StreamingPngStatus deflate_bytes(const unsigned char* bytes, size_t size, int flush) {
@@ -221,7 +222,7 @@ StreamingPngStatus StreamingPngWriter::write_rgb_rows(
     return StreamingPngStatus::Ok;
 }
 
-StreamingPngStatus StreamingPngWriter::finish() {
+StreamingPngStatus StreamingPngWriter::finish_temporary() {
     if (impl_->file == nullptr || !impl_->deflateInitialized ||
         impl_->writtenRows != impl_->height) {
         abort();
@@ -246,19 +247,42 @@ StreamingPngStatus StreamingPngWriter::finish() {
         status = StreamingPngStatus::IoError;
     }
     impl_->file = nullptr;
-    if (status == StreamingPngStatus::Ok &&
-        std::rename(impl_->temporaryPath.c_str(), impl_->outputPath.c_str()) != 0) {
-        status = StreamingPngStatus::IoError;
+    if (status != StreamingPngStatus::Ok) {
+        std::remove(impl_->temporaryPath.c_str());
+        abort();
+        return status;
     }
-    if (status == StreamingPngStatus::Ok && !sync_parent_directory(impl_->outputPath)) {
+    impl_->temporaryFinished = true;
+    return StreamingPngStatus::Ok;
+}
+
+StreamingPngStatus StreamingPngWriter::publish() {
+    if (!impl_->temporaryFinished || impl_->file != nullptr || impl_->deflateInitialized ||
+        impl_->temporaryPath.empty() || impl_->outputPath.empty()) {
+        return StreamingPngStatus::InvalidState;
+    }
+    StreamingPngStatus status = StreamingPngStatus::Ok;
+    if (std::rename(impl_->temporaryPath.c_str(), impl_->outputPath.c_str()) != 0) {
+        status = StreamingPngStatus::IoError;
+    } else if (!sync_parent_directory(impl_->outputPath)) {
         std::remove(impl_->outputPath.c_str());
         sync_parent_directory(impl_->outputPath);
         status = StreamingPngStatus::IoError;
     }
     if (status != StreamingPngStatus::Ok) {
-        std::remove(impl_->temporaryPath.c_str());
+        abort();
+        return status;
     }
-    return status;
+    impl_->compressed.clear();
+    impl_->outputPath.clear();
+    impl_->temporaryPath.clear();
+    impl_->width = 0;
+    impl_->height = 0;
+    impl_->writtenRows = 0;
+    impl_->rowBytes = 0;
+    impl_->temporaryFinished = false;
+    impl_->stream = z_stream{};
+    return StreamingPngStatus::Ok;
 }
 
 void StreamingPngWriter::abort() {
@@ -283,5 +307,6 @@ void StreamingPngWriter::abort() {
     impl_->height = 0;
     impl_->writtenRows = 0;
     impl_->rowBytes = 0;
+    impl_->temporaryFinished = false;
     impl_->stream = z_stream{};
 }

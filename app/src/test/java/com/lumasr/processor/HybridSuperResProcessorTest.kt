@@ -229,7 +229,7 @@ class HybridSuperResProcessorTest {
     }
 
     @Test
-    fun cancelClearsNativeCacheWhenNativeProcessorOwnsCache() {
+    fun cancelDoesNotSynchronouslyClearNativeCache() {
         val nativeProcessor = RecordingCacheProcessor()
         val processor = HybridSuperResProcessor(
             nativeProcessor = nativeProcessor,
@@ -239,7 +239,7 @@ class HybridSuperResProcessorTest {
         processor.cancel("task-1")
 
         assertEquals(listOf("task-1"), nativeProcessor.cancelledTaskIds)
-        assertEquals(1, nativeProcessor.clearCacheCount)
+        assertEquals(0, nativeProcessor.clearCacheCount)
     }
 
     @Test

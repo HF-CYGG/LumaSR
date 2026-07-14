@@ -205,6 +205,32 @@ constexpr CroppedCopyWindow kOutsideCropWindow = resolve_cropped_copy_window(
 );
 
 static_assert(!kOutsideCropWindow.valid);
+constexpr CroppedCopyWindow kOverflowingDestinationWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    2147483646,
+    2147483646,
+    4,
+    4,
+    0,
+    0,
+    64,
+    64
+);
+static_assert(!kOverflowingDestinationWindow.valid);
+constexpr CroppedCopyWindow kOverflowingCropWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    0,
+    0,
+    64,
+    64,
+    2147483646,
+    2147483646,
+    4,
+    4
+);
+static_assert(!kOverflowingCropWindow.valid);
 static_assert(should_retry_cpu_after_gpu_code(0, 8));
 static_assert(should_retry_cpu_after_gpu_code(0, 9));
 static_assert(!should_retry_cpu_after_gpu_code(1, 9));

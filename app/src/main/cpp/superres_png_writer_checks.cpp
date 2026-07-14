@@ -107,7 +107,10 @@ bool run_streaming_png_writer_runtime_checks(const char* outputPath) {
     if (writer.open(checkPath, width, height) != StreamingPngStatus::Ok ||
         writer.write_rgb_rows(source.data(), 137, stride) != StreamingPngStatus::Ok ||
         writer.write_rgb_rows(source.data() + 137u * stride, height - 137, stride) != StreamingPngStatus::Ok ||
-        writer.finish() != StreamingPngStatus::Ok ||
+        writer.finish_temporary() != StreamingPngStatus::Ok ||
+        !file_exists(partPath) ||
+        file_exists(checkPath) ||
+        writer.publish() != StreamingPngStatus::Ok ||
         file_exists(partPath) ||
         count_idat_chunks(checkPath) < 2) {
         writer.abort();
@@ -143,11 +146,29 @@ bool run_streaming_png_writer_runtime_checks(const char* outputPath) {
     const bool incompleteRejected =
         writer.open(checkPath, width, height) == StreamingPngStatus::Ok &&
         writer.write_rgb_rows(incomplete.data(), 1, rowBytes) == StreamingPngStatus::Ok &&
-        writer.finish() == StreamingPngStatus::InvalidState;
+        writer.finish_temporary() == StreamingPngStatus::InvalidState;
     const bool cleanupPassed = incompleteRejected &&
         sentinel_is_intact(checkPath) &&
         !file_exists(partPath);
+    if (!cleanupPassed) {
+        remove_file(checkPath);
+        remove_file(partPath);
+        return false;
+    }
+
+    std::vector<unsigned char> complete(rowBytes * height, 0x55u);
+    const bool cancellationBeforePublishPreservesOldOutput =
+        writer.open(checkPath, width, height) == StreamingPngStatus::Ok &&
+        writer.write_rgb_rows(complete.data(), height, rowBytes) == StreamingPngStatus::Ok &&
+        writer.finish_temporary() == StreamingPngStatus::Ok &&
+        file_exists(partPath) &&
+        sentinel_is_intact(checkPath);
+    writer.abort();
+    const bool cancellationCleanupPassed = cancellationBeforePublishPreservesOldOutput &&
+        sentinel_is_intact(checkPath) &&
+        !file_exists(partPath) &&
+        writer.publish() == StreamingPngStatus::InvalidState;
     remove_file(checkPath);
     remove_file(partPath);
-    return cleanupPassed;
+    return cancellationCleanupPassed;
 }

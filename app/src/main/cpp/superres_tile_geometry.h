@@ -130,7 +130,10 @@ constexpr CroppedCopyWindow resolve_cropped_copy_window(
 ) {
     if (srcX < 0 || srcY < 0 || dstX < 0 || dstY < 0 ||
         copyW <= 0 || copyH <= 0 ||
-        cropLeft < 0 || cropTop < 0 || cropWidth <= 0 || cropHeight <= 0) {
+        cropLeft < 0 || cropTop < 0 || cropWidth <= 0 || cropHeight <= 0 ||
+        copyW > kMaxIntDimension - dstX || copyH > kMaxIntDimension - dstY ||
+        cropWidth > kMaxIntDimension - cropLeft ||
+        cropHeight > kMaxIntDimension - cropTop) {
         return CroppedCopyWindow{false, 0, 0, 0, 0, 0, 0};
     }
     const int copyRight = dstX + copyW;
@@ -144,10 +147,17 @@ constexpr CroppedCopyWindow resolve_cropped_copy_window(
     if (intersectionLeft >= intersectionRight || intersectionTop >= intersectionBottom) {
         return CroppedCopyWindow{false, 0, 0, 0, 0, 0, 0};
     }
+    const long long resolvedSrcX =
+        static_cast<long long>(srcX) + intersectionLeft - dstX;
+    const long long resolvedSrcY =
+        static_cast<long long>(srcY) + intersectionTop - dstY;
+    if (resolvedSrcX > kMaxIntDimension || resolvedSrcY > kMaxIntDimension) {
+        return CroppedCopyWindow{false, 0, 0, 0, 0, 0, 0};
+    }
     return CroppedCopyWindow{
         true,
-        srcX + intersectionLeft - dstX,
-        srcY + intersectionTop - dstY,
+        static_cast<int>(resolvedSrcX),
+        static_cast<int>(resolvedSrcY),
         intersectionLeft - cropLeft,
         intersectionTop - cropTop,
         intersectionRight - intersectionLeft,

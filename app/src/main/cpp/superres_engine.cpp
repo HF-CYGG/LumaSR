@@ -140,7 +140,7 @@ public:
             static_cast<size_t>(destinationX) * 3u;
     }
 
-    SuperResNativeCode finish_png() {
+    SuperResNativeCode finish_png_temporary() {
         if (croppedRaw_) {
             return SuperResNativeCode::InvalidParams;
         }
@@ -150,10 +150,25 @@ public:
                 : lastFailure_;
         }
         const auto start = std::chrono::steady_clock::now();
-        const StreamingPngStatus status = writer_.finish();
+        const StreamingPngStatus status = writer_.finish_temporary();
         encodingDuration_ += std::chrono::steady_clock::now() - start;
         lastFailure_ = native_code(status);
         return lastFailure_;
+    }
+
+    SuperResNativeCode publish_png() {
+        if (croppedRaw_) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.publish();
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    void abort_png() {
+        writer_.abort();
     }
 
     const std::vector<unsigned char>& bytes() const {
@@ -472,6 +487,40 @@ bool is_cancelled(const std::string& taskId) {
     }
     cancelled_tasks.erase(found);
     return true;
+}
+
+bool consume_cancellation_locked(const std::string& taskId) {
+    const auto found = cancelled_tasks.find(taskId);
+    if (found == cancelled_tasks.end()) {
+        return false;
+    }
+    cancelled_tasks.erase(found);
+    return true;
+}
+
+std::string path_basename(const std::string& path) {
+    const size_t separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
+}
+
+std::string performance_model_key(const SuperResNativeParams& params) {
+    const std::string raw = path_basename(
+        params.modelFileBase.empty() ? params.modelDir : params.modelFileBase
+    );
+    std::string key;
+    key.reserve(std::min<size_t>(raw.size(), 64u));
+    for (char value : raw) {
+        if (key.size() >= 64u) {
+            break;
+        }
+        const bool safe =
+            (value >= 'a' && value <= 'z') ||
+            (value >= 'A' && value <= 'Z') ||
+            (value >= '0' && value <= '9') ||
+            value == '.' || value == '_' || value == '-';
+        key.push_back(safe ? value : '_');
+    }
+    return key.empty() ? "unknown" : key;
 }
 
 std::string join_path(const std::string& dir, const std::string& name) {
@@ -1342,8 +1391,9 @@ SuperResNativeCode run_ncnn_image(
     if (useCroppedOutput &&
         (params.outputCropLeft < 0 || params.outputCropTop < 0 ||
             params.outputCropWidth <= 0 || params.outputCropHeight <= 0 ||
-            params.outputCropLeft + params.outputCropWidth > outputW ||
-            params.outputCropTop + params.outputCropHeight > outputH)) {
+            params.outputCropLeft > outputW || params.outputCropTop > outputH ||
+            params.outputCropWidth > outputW - params.outputCropLeft ||
+            params.outputCropHeight > outputH - params.outputCropTop)) {
         return SuperResNativeCode::InvalidParams;
     }
     const int bufferW = useCroppedOutput ? params.outputCropWidth : outputW;
@@ -1627,6 +1677,11 @@ SuperResNativeCode run_ncnn_image(
     }
     }
 
+    // The last tile can complete while cancellation is being delivered. Consume it before
+    // spending time finalizing the temporary PNG, then arbitrate once more at publication.
+    if (is_cancelled(params.taskId)) {
+        return SuperResNativeCode::Cancelled;
+    }
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
     const long long expectedCoveredPixels = static_cast<long long>(bufferW) * bufferH;
     if (coveredPixels != expectedCoveredPixels) {
@@ -1660,9 +1715,24 @@ SuperResNativeCode run_ncnn_image(
         }
         performance.saveMs = elapsed_ms(saveStart);
     } else {
-        const SuperResNativeCode finishCode = output.finish_png();
+        const SuperResNativeCode finishCode = output.finish_png_temporary();
         if (finishCode != SuperResNativeCode::Ok) {
             return finishCode;
+        }
+        SuperResNativeCode publishCode = SuperResNativeCode::Ok;
+        {
+            // Publication and cancellation share one lock as their linearization point:
+            // cancellation that wins keeps the old destination and deletes .part; publication
+            // that wins commits atomically and this invocation must return Ok.
+            std::lock_guard<std::mutex> cancelLock(cancel_mutex);
+            if (consume_cancellation_locked(params.taskId)) {
+                output.abort_png();
+                return SuperResNativeCode::Cancelled;
+            }
+            publishCode = output.publish_png();
+        }
+        if (publishCode != SuperResNativeCode::Ok) {
+            return publishCode;
         }
         performance.saveMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             output.encoding_duration()
@@ -1676,12 +1746,27 @@ SuperResNativeCode run_ncnn_image(
     performance.encodeMs = performance.saveMs;
     performance.totalMs = elapsed_ms(totalStart);
     performance.hasValue = true;
+    const std::string modelKey = performance_model_key(params);
+    unsigned int driverId = 0u;
+    unsigned int driverVersion = 0u;
+    if (useVulkan) {
+        const int gpuIndex = ncnn::get_default_gpu_index();
+        const int gpuCount = ncnn::get_gpu_count();
+        if (gpuIndex >= 0 && gpuIndex < gpuCount) {
+            const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
+            driverId = static_cast<unsigned int>(gpuInfo.driver_id());
+            driverVersion = static_cast<unsigned int>(gpuInfo.driver_version());
+        }
+    }
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s accel=%s backend=%d precision=%d fallback=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld",
         params.taskId.c_str(),
-        params.modelFileBase.c_str(),
+        modelKey.c_str(),
+        modelKey.c_str(),
+        driverId,
+        driverVersion,
         acceleration_name(useVulkan),
         performance.effectiveBackend,
         performance.effectivePrecision,
@@ -1711,7 +1796,7 @@ SuperResNativeCode run_ncnn_image(
     );
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);
 
-    return is_cancelled(params.taskId) ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+    return SuperResNativeCode::Ok;
 }
 
 SuperResNativeCode run_ncnn(
@@ -2035,7 +2120,8 @@ SuperResNativeCode merge_raw_tiles_to_png(
     openTiles.reserve(tiles.size());
     for (const SuperResRawTile& tile : tiles) {
         if (tile.path.empty() || tile.x < 0 || tile.y < 0 || tile.width <= 0 || tile.height <= 0 ||
-            tile.x + tile.width > outputWidth || tile.y + tile.height > outputHeight) {
+            tile.x > outputWidth || tile.y > outputHeight ||
+            tile.width > outputWidth - tile.x || tile.height > outputHeight - tile.y) {
             for (OpenTile& openTile : openTiles) {
                 std::fclose(openTile.file);
             }

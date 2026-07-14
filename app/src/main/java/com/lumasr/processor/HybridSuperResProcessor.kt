@@ -82,7 +82,6 @@ class HybridSuperResProcessor(
     override fun cancel(taskId: String) {
         if (nativeAvailable()) {
             nativeProcessor.cancel(taskId)
-            (nativeProcessor as? NativeCacheOwner)?.clearNativeCache()
         }
         if (allowMockFallback) fallbackProcessor.cancel(taskId)
     }

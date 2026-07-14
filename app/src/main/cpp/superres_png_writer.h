@@ -24,7 +24,8 @@ public:
 
     StreamingPngStatus open(const std::string& outputPath, int width, int height);
     StreamingPngStatus write_rgb_rows(const unsigned char* rgb, int rowCount, size_t rowStride);
-    StreamingPngStatus finish();
+    StreamingPngStatus finish_temporary();
+    StreamingPngStatus publish();
     void abort();
 
 private:

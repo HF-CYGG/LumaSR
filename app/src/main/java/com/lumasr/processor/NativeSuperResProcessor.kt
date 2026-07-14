@@ -409,13 +409,15 @@ class NativeSuperResProcessor(
         val request = params.toNativeRequest()
         // Native ncnn/Vulkan execution can monopolize a thread, so it must never run on Main.
         val code = withContext(inferenceDispatcher) {
-            bridge.process(
+            val nativeCode = bridge.process(
                 request = request,
                 onProgress = { event ->
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
                 }
             )
+            if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
+            nativeCode
         }
         return code.toResult(params, onProgress)
     }
@@ -447,7 +449,7 @@ class NativeSuperResProcessor(
         onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
         val request = params.toNativeRequest()
         val code = withContext(inferenceDispatcher) {
-            regionBridge.processBitmapRegion(
+            val nativeCode = regionBridge.processBitmapRegion(
                 request = request,
                 bitmap = bitmap,
                 onProgress = { event ->
@@ -455,6 +457,8 @@ class NativeSuperResProcessor(
                     onProgress(params.progress(event))
                 }
             )
+            if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
+            nativeCode
         }
         return code.toResult(params, onProgress)
     }
@@ -462,7 +466,6 @@ class NativeSuperResProcessor(
     override fun cancel(taskId: String) {
         if (isNativeAvailable()) {
             bridge.cancel(taskId)
-            bridge.clearCache()
         }
     }
 

@@ -302,7 +302,7 @@ class NativeSuperResProcessorTest {
     }
 
     @Test
-    fun cancelForwardsToBridgeAndClearsNativeCacheWhenAvailable() {
+    fun cancelForwardsSignalWithoutSynchronouslyClearingNativeCache() {
         val bridge = FakeNativeBridge(NativeProcessCode.OK)
         val processor = NativeSuperResProcessor(
             bridge = bridge,
@@ -312,6 +312,32 @@ class NativeSuperResProcessorTest {
         processor.cancel("task-1")
 
         assertEquals(listOf("task-1"), bridge.cancelledTaskIds)
+        assertEquals(0, bridge.clearCacheCount)
+    }
+
+    @Test
+    fun cancelledProcessClearsNativeCacheAfterBridgeReturns() = runBlocking {
+        val bridge = FakeNativeBridge(NativeProcessCode.CANCELLED)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        processor.process(defaultParams()) {}
+
+        assertEquals(1, bridge.clearCacheCount)
+    }
+
+    @Test
+    fun cancelledBitmapRegionClearsNativeCacheAfterBridgeReturns() = runBlocking {
+        val bridge = FakeNativeBridge(NativeProcessCode.CANCELLED)
+        val processor = NativeSuperResProcessor(
+            bridge = bridge,
+            isAvailable = { true }
+        )
+
+        processor.processBitmapRegion(defaultParams(), bitmap = null) {}
+
         assertEquals(1, bridge.clearCacheCount)
     }
 
