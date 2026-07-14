@@ -1,0 +1,349 @@
+package com.lumasr.domain
+
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ProcessingCoordinatorTest {
+    @Test
+    fun executesQueuedTasksInFifoOrder() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("first", createdAt = 1_000L), spec("first"))
+            coordinator.enqueue(task("second", createdAt = 1_001L), spec("second"))
+            coordinator.enqueue(task("third", createdAt = 1_002L), spec("third"))
+
+            assertEquals("first", runner.awaitStarted())
+            runner.complete("first")
+            assertEquals("second", runner.awaitStarted())
+            runner.complete("second")
+            assertEquals("third", runner.awaitStarted())
+            runner.complete("third")
+            coordinator.awaitState("third", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun persistsRunningBeforeExecutionAndTerminalAfterResult() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        lateinit var runner: ProcessingTaskRunner
+        runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult {
+                assertEquals(ProcessingTaskState.RUNNING, tasks.find(task.id)?.state)
+                return ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("persisted"), spec("persisted"))
+            coordinator.awaitState("persisted", ProcessingTaskState.COMPLETED)
+
+            assertEquals(
+                listOf(
+                    ProcessingTaskState.QUEUED,
+                    ProcessingTaskState.RUNNING,
+                    ProcessingTaskState.COMPLETED
+                ),
+                tasks.saved.filter { it.id == "persisted" }.map { it.state }
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun recoversInterruptedTasksAndPreservesPausedInCreatedIdOrder() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val running = task(
+            id = "b-running",
+            state = ProcessingTaskState.RUNNING,
+            createdAt = 1_000L,
+            completedTiles = setOf(1, 2)
+        )
+        val queuedSameTime = task("a-queued", createdAt = 1_000L)
+        val paused = task("paused", state = ProcessingTaskState.PAUSED, createdAt = 900L)
+        tasks.seed(paused, running, queuedSameTime)
+        work.seed(spec(paused.id), spec(running.id), spec(queuedSameTime.id))
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+
+            assertEquals("a-queued", runner.awaitStarted())
+            runner.complete("a-queued")
+            assertEquals("b-running", runner.awaitStarted())
+            val recovered = tasks.find("b-running")
+            assertEquals(ProcessingTaskState.RUNNING, recovered?.state)
+            assertTrue(recovered?.completedExtremeTileIndexes.orEmpty().isEmpty())
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("paused")?.state)
+            runner.complete("b-running")
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun cancellationIsPersistedOnceAndLateSuccessCannotOverwriteIt() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("cancel-race"), spec("cancel-race"))
+            assertEquals("cancel-race", runner.awaitStarted())
+
+            coordinator.cancel("cancel-race")
+            coordinator.cancel("cancel-race")
+            runner.complete("cancel-race")
+            coordinator.awaitState("cancel-race", ProcessingTaskState.CANCELLED)
+            delay(50)
+
+            assertEquals(listOf("cancel-race"), runner.cancelled)
+            assertEquals(1, tasks.saved.count { it.id == "cancel-race" && it.state == ProcessingTaskState.CANCELLED })
+            assertEquals(ProcessingTaskState.CANCELLED, tasks.find("cancel-race")?.state)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun runnerExceptionBecomesTypedRetryableFailure() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult = throw IOException("native bridge failed")
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("exception"), spec("exception"))
+            val failed = coordinator.awaitState("exception", ProcessingTaskState.FAILED)
+
+            assertEquals(ProcessingFailureCode.RUNNER_EXCEPTION.stableCode, failed.retryableErrorCode)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun coalescesProgressToFiveHertzButForwardsStageAndTerminalChanges() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val clock = FakeClock(0L)
+        val observed = CopyOnWriteArrayList<Float?>()
+        lateinit var coordinator: ProcessingCoordinator
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult {
+                fun emit(stage: UpscaleStage, value: Float, atMs: Long) {
+                    clock.set(atMs)
+                    onProgress(progress(task.id, stage, value))
+                    observed += coordinator.snapshots.value.single().progress?.progress
+                }
+                emit(UpscaleStage.PREPARING, 0.1f, 0L)
+                emit(UpscaleStage.PREPARING, 0.2f, 50L)
+                emit(UpscaleStage.PREPARING, 0.3f, 200L)
+                emit(UpscaleStage.LOADING_MODEL, 0.4f, 210L)
+                emit(UpscaleStage.LOADING_MODEL, 0.5f, 220L)
+                emit(UpscaleStage.DONE, 1f, 221L)
+                return ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        coordinator = coordinator(tasks, work, runner, clock = clock)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("progress", createdAt = 0L), spec("progress"))
+            coordinator.awaitState("progress", ProcessingTaskState.COMPLETED)
+
+            assertEquals(listOf(0.1f, 0.1f, 0.3f, 0.4f, 0.4f, 1f), observed)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    private fun coordinator(
+        tasks: ProcessingTaskRepository,
+        work: ProcessingWorkSpecRepository,
+        runner: ProcessingTaskRunner,
+        dispatcher: CoroutineDispatcher = Dispatchers.Default,
+        clock: ProcessingClock = FakeClock(10_000L)
+    ) = ProcessingCoordinator(tasks, work, runner, dispatcher, clock)
+
+    private suspend fun ProcessingCoordinator.awaitState(
+        taskId: String,
+        state: ProcessingTaskState
+    ): ProcessingTask = withTimeout(5_000L) {
+        var matched: ProcessingTask?
+        do {
+            matched = snapshots.value
+                .firstOrNull { it.task.id == taskId }
+                ?.task
+                ?.takeIf { it.state == state }
+            if (matched == null) delay(10L)
+        } while (matched == null)
+        matched
+    }
+
+    private fun task(
+        id: String,
+        state: ProcessingTaskState = ProcessingTaskState.QUEUED,
+        createdAt: Long = 1_000L,
+        completedTiles: Set<Int> = emptySet()
+    ): ProcessingTask = ProcessingTask(
+        id = id,
+        copiedInputPath = java.io.File("build/test-tasks/$id/input.png").absolutePath,
+        outputPath = java.io.File("build/test-tasks/$id/output.png").absolutePath,
+        state = state,
+        imageIndex = 0,
+        imageCount = 1,
+        completedExtremeTileIndexes = completedTiles,
+        createdAtEpochMs = createdAt,
+        updatedAtEpochMs = createdAt,
+        terminalAtEpochMs = null,
+        retryableErrorCode = null,
+        executionProfileKey = "profile"
+    )
+
+    private fun spec(id: String): ProcessingWorkSpec = ProcessingWorkSpec.fromParams(
+        modelId = "model-$id",
+        params = UpscaleParams(
+            taskId = id,
+            inputPath = java.io.File("build/test-tasks/$id/input.png").absolutePath,
+            outputPath = java.io.File("build/test-tasks/$id/output.png").absolutePath,
+            engine = SuperResEngine.WAIFU2X,
+            modelDir = "/models",
+            modelName = "model",
+            scale = 2,
+            noise = 0,
+            tileSize = 128,
+            accelerationMode = AccelerationMode.CPU,
+            tta = false,
+            outputFormat = OutputFormat.PNG
+        )
+    )
+
+    private fun progress(taskId: String, stage: UpscaleStage, value: Float) = UpscaleProgress(
+        taskId = taskId,
+        stage = stage,
+        progress = value,
+        currentTile = 1,
+        totalTiles = 4,
+        completedTiles = (value * 4).toInt(),
+        message = stage.name,
+        estimatedRemainingMs = null
+    )
+
+    private class FakeClock(initial: Long) : ProcessingClock {
+        private val now = AtomicLong(initial)
+        override fun nowEpochMs(): Long = now.get()
+        fun set(value: Long) = now.set(value)
+    }
+
+    private class GateRunner(
+        private val ignoreCoroutineCancellation: Boolean = false
+    ) : ProcessingTaskRunner {
+        private val started = Channel<String>(Channel.UNLIMITED)
+        private val gates = ConcurrentHashMap<String, CompletableDeferred<ProcessingRunResult>>()
+        val cancelled = CopyOnWriteArrayList<String>()
+
+        override suspend fun run(
+            task: ProcessingTask,
+            workSpec: ProcessingWorkSpec,
+            onProgress: (UpscaleProgress) -> Unit
+        ): ProcessingRunResult {
+            val gate = CompletableDeferred<ProcessingRunResult>()
+            gates[task.id] = gate
+            started.send(task.id)
+            return if (ignoreCoroutineCancellation) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { gate.await() }
+            } else {
+                gate.await()
+            }
+        }
+
+        override fun cancel(taskId: String) {
+            cancelled += taskId
+        }
+
+        suspend fun awaitStarted(): String = withTimeout(5_000L) { started.receive() }
+
+        fun complete(taskId: String) {
+            checkNotNull(gates[taskId]).complete(ProcessingRunResult.Completed)
+        }
+    }
+
+    private class InMemoryTaskRepository : ProcessingTaskRepository {
+        private val records = ConcurrentHashMap<String, ProcessingTask>()
+        val saved = CopyOnWriteArrayList<ProcessingTask>()
+
+        fun seed(vararg tasks: ProcessingTask) {
+            tasks.forEach { records[it.id] = it }
+        }
+
+        override suspend fun save(task: ProcessingTask) {
+            records[task.id] = task
+            saved += task
+        }
+
+        override suspend fun find(taskId: String): ProcessingTask? = records[taskId]
+
+        override suspend fun list(): List<ProcessingTask> = records.values.toList()
+
+        override suspend fun delete(taskId: String): Boolean = records.remove(taskId) != null
+    }
+
+    private class InMemoryWorkRepository : ProcessingWorkSpecRepository {
+        private val records = ConcurrentHashMap<String, ProcessingWorkSpec>()
+
+        fun seed(vararg specs: ProcessingWorkSpec) {
+            specs.forEach { records[it.taskId] = it }
+        }
+
+        override suspend fun save(workSpec: ProcessingWorkSpec) {
+            records[workSpec.taskId] = workSpec
+        }
+
+        override suspend fun find(taskId: String): ProcessingWorkSpec? = records[taskId]
+
+        override suspend fun delete(taskId: String): Boolean = records.remove(taskId) != null
+    }
+}
