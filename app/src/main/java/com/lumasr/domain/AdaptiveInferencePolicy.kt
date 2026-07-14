@@ -61,14 +61,13 @@ enum class ThermalLevel {
     CRITICAL
 }
 
-data class ThermalAdjustment(
-    val profile: InferenceExecutionProfile,
+data class ThermalPolicyState(
+    val baselineProfile: InferenceExecutionProfile,
+    val effectiveProfile: InferenceExecutionProfile,
     val shouldPause: Boolean
 )
 
 object AdaptiveInferencePolicy {
-    private val safeTileSizes = listOf(128, 256, 512, 768, 1024)
-
     fun isFp16Eligible(
         device: DeviceCapabilityProfile,
         quality: Fp16QualityMetrics
@@ -114,35 +113,46 @@ object AdaptiveInferencePolicy {
         )
     }
 
-    fun adjustForThermalAtTileBoundary(
-        profile: InferenceExecutionProfile,
-        thermalLevel: ThermalLevel
-    ): ThermalAdjustment {
-        return when (thermalLevel) {
-            ThermalLevel.NORMAL,
-            ThermalLevel.LIGHT -> ThermalAdjustment(profile, shouldPause = false)
+    fun initialThermalState(profile: InferenceExecutionProfile): ThermalPolicyState {
+        return ThermalPolicyState(
+            baselineProfile = profile,
+            effectiveProfile = profile,
+            shouldPause = false
+        )
+    }
 
-            ThermalLevel.MODERATE -> ThermalAdjustment(
-                profile = profile.copy(
-                    commandBatchSize = (profile.commandBatchSize / 2).coerceAtLeast(1),
-                    gpuHeadroomPercent = profile.gpuHeadroomPercent.coerceAtLeast(10)
-                ),
-                shouldPause = false
+    fun adjustForThermalAtTileBoundary(
+        state: ThermalPolicyState,
+        thermalLevel: ThermalLevel
+    ): ThermalPolicyState {
+        val baseline = state.baselineProfile
+        val effective = when (thermalLevel) {
+            ThermalLevel.NORMAL,
+            ThermalLevel.LIGHT -> baseline
+
+            ThermalLevel.MODERATE -> baseline.copy(
+                commandBatchSize = (baseline.commandBatchSize / 2).coerceAtLeast(1),
+                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(10)
             )
 
             ThermalLevel.SEVERE,
-            ThermalLevel.CRITICAL -> ThermalAdjustment(
-                profile = profile.copy(
-                    commandBatchSize = 1,
-                    gpuHeadroomPercent = profile.gpuHeadroomPercent.coerceAtLeast(20)
-                ),
-                shouldPause = thermalLevel == ThermalLevel.CRITICAL
+            ThermalLevel.CRITICAL -> baseline.copy(
+                commandBatchSize = 1,
+                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(20)
             )
         }
+        return ThermalPolicyState(
+            baselineProfile = baseline,
+            effectiveProfile = effective,
+            shouldPause = thermalLevel == ThermalLevel.CRITICAL
+        )
     }
 
     fun withTtaEnabled(profile: InferenceExecutionProfile): InferenceExecutionProfile {
-        val reducedTileSize = safeTileSizes.lastOrNull { it < profile.tileSize } ?: profile.tileSize
+        val reducedTileSize = UpscaleParamsFactory.supportedTileSizes
+            .filter { it < profile.tileSize }
+            .maxOrNull()
+            ?: profile.tileSize
         return profile.copy(
             tileSize = reducedTileSize,
             commandBatchSize = 1,

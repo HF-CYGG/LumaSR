@@ -210,43 +210,84 @@ class AdaptiveInferencePolicyTest {
     @Test
     fun adjustsThermalPolicyOnlyThroughTileBoundaryDecision() {
         val base = executionProfile(commandBatchSize = 8, gpuHeadroomPercent = 8)
+        val initial = AdaptiveInferencePolicy.initialThermalState(base)
 
         val normal = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            base,
+            initial,
             ThermalLevel.NORMAL
         )
         val light = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            base,
+            initial,
             ThermalLevel.LIGHT
         )
         val moderate = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            base,
+            initial,
             ThermalLevel.MODERATE
         )
         val severe = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            base,
+            initial,
             ThermalLevel.SEVERE
         )
         val critical = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            base,
+            initial,
             ThermalLevel.CRITICAL
         )
 
-        assertEquals(base, normal.profile)
+        assertEquals(base, initial.baselineProfile)
+        assertEquals(base, initial.effectiveProfile)
+        assertEquals(base, normal.effectiveProfile)
         assertFalse(normal.shouldPause)
-        assertEquals(base, light.profile)
+        assertEquals(base, light.effectiveProfile)
         assertFalse(light.shouldPause)
-        assertEquals(4, moderate.profile.commandBatchSize)
-        assertEquals(10, moderate.profile.gpuHeadroomPercent)
+        assertEquals(4, moderate.effectiveProfile.commandBatchSize)
+        assertEquals(10, moderate.effectiveProfile.gpuHeadroomPercent)
         assertFalse(moderate.shouldPause)
-        assertEquals(1, severe.profile.commandBatchSize)
-        assertEquals(20, severe.profile.gpuHeadroomPercent)
+        assertEquals(1, severe.effectiveProfile.commandBatchSize)
+        assertEquals(20, severe.effectiveProfile.gpuHeadroomPercent)
         assertFalse(severe.shouldPause)
-        assertEquals(1, critical.profile.commandBatchSize)
-        assertEquals(20, critical.profile.gpuHeadroomPercent)
+        assertEquals(1, critical.effectiveProfile.commandBatchSize)
+        assertEquals(20, critical.effectiveProfile.gpuHeadroomPercent)
         assertTrue(critical.shouldPause)
         assertEquals(8, base.commandBatchSize)
         assertEquals(8, base.gpuHeadroomPercent)
+    }
+
+    @Test
+    fun repeatedModerateThermalSignalsDoNotAccumulateThrottling() {
+        val initial = AdaptiveInferencePolicy.initialThermalState(
+            executionProfile(commandBatchSize = 8, gpuHeadroomPercent = 8)
+        )
+        val firstModerate = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+            initial,
+            ThermalLevel.MODERATE
+        )
+        val secondModerate = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+            firstModerate,
+            ThermalLevel.MODERATE
+        )
+
+        assertEquals(4, firstModerate.effectiveProfile.commandBatchSize)
+        assertEquals(4, secondModerate.effectiveProfile.commandBatchSize)
+        assertEquals(10, secondModerate.effectiveProfile.gpuHeadroomPercent)
+    }
+
+    @Test
+    fun normalThermalSignalRestoresBaselineAfterSevereThrottling() {
+        val base = executionProfile(commandBatchSize = 8, gpuHeadroomPercent = 8)
+        val severe = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+            AdaptiveInferencePolicy.initialThermalState(base),
+            ThermalLevel.SEVERE
+        )
+        val recovered = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+            severe,
+            ThermalLevel.NORMAL
+        )
+
+        assertEquals(1, severe.effectiveProfile.commandBatchSize)
+        assertEquals(20, severe.effectiveProfile.gpuHeadroomPercent)
+        assertEquals(base, recovered.baselineProfile)
+        assertEquals(base, recovered.effectiveProfile)
+        assertFalse(recovered.shouldPause)
     }
 
     @Test
@@ -270,6 +311,16 @@ class AdaptiveInferencePolicyTest {
         )
         assertTrue(highHeadroomTta.tta)
         assertEquals(20, highHeadroomTta.gpuHeadroomPercent)
+    }
+
+    @Test
+    fun reducesSmallestStandardTileToSupported64WhenTtaIsEnabled() {
+        val ttaProfile = AdaptiveInferencePolicy.withTtaEnabled(
+            executionProfile(tileSize = 128)
+        )
+
+        assertEquals(64, ttaProfile.tileSize)
+        assertTrue(ttaProfile.tileSize in UpscaleParamsFactory.supportedTileSizes)
     }
 
     private fun executionProfile(

@@ -5,7 +5,7 @@ import java.io.File
 object UpscaleParamsFactory {
     const val DEFAULT_TILE_SIZE = 512
     const val DEFAULT_GPU_HEADROOM_PERCENT = 8
-    val supportedTileSizes = setOf(128, 256, 512, 768, 1024)
+    val supportedTileSizes = setOf(64, 128, 256, 512, 768, 1024)
 
     fun create(
         taskId: String,
