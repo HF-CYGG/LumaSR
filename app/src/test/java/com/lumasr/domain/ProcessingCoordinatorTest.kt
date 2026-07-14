@@ -577,6 +577,61 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun transientWorkSpecReadFailurePreservesPersistedExtremeCheckpointsUntilResume() = runBlocking {
+        val attempts = AtomicInteger(0)
+        val workSpecReads = AtomicInteger(0)
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository { taskId ->
+            if (
+                taskId == "extreme-work-spec" &&
+                workSpecReads.incrementAndGet() == 2
+            ) {
+                throw IOException("work spec temporarily unavailable")
+            }
+        }
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult = if (attempts.incrementAndGet() == 1) {
+                throw CancellationException("runner cancelled itself")
+            } else {
+                ProcessingRunResult.Completed
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        val completedTiles = setOf(1, 4, 7)
+        try {
+            coordinator.start()
+            coordinator.enqueue(
+                task("extreme-work-spec", completedTiles = completedTiles),
+                spec("extreme-work-spec", exportMode = ExportMode.EXTREME_SINGLE_PNG)
+            )
+            coordinator.awaitWorkerStopped()
+
+            assertFalse(coordinator.isWorkerCancelled())
+            assertEquals(ProcessingTaskState.RUNNING, tasks.find("extreme-work-spec")?.state)
+            assertEquals(completedTiles, tasks.find("extreme-work-spec")?.completedExtremeTileIndexes)
+            assertEquals(null, coordinator.taskState("extreme-work-spec"))
+            assertEquals(1, attempts.get())
+
+            coordinator.resumePersistedWork()
+
+            val completed = coordinator.awaitState(
+                "extreme-work-spec",
+                ProcessingTaskState.COMPLETED
+            )
+            assertEquals(completedTiles, completed.completedExtremeTileIndexes)
+            assertEquals(2, attempts.get())
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun runnerExceptionBecomesTypedRetryableFailure() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -764,7 +819,10 @@ class ProcessingCoordinatorTest {
         executionProfileKey = "profile"
     )
 
-    private fun spec(id: String): ProcessingWorkSpec = ProcessingWorkSpec.fromParams(
+    private fun spec(
+        id: String,
+        exportMode: ExportMode = ExportMode.AUTO
+    ): ProcessingWorkSpec = ProcessingWorkSpec.fromParams(
         modelId = "model-$id",
         params = UpscaleParams(
             taskId = id,
@@ -778,7 +836,8 @@ class ProcessingCoordinatorTest {
             tileSize = 128,
             accelerationMode = AccelerationMode.CPU,
             tta = false,
-            outputFormat = OutputFormat.PNG
+            outputFormat = OutputFormat.PNG,
+            exportMode = exportMode
         )
     )
 

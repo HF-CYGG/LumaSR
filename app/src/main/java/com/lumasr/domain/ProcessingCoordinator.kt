@@ -276,7 +276,12 @@ class ProcessingCoordinator(
                 }
                 ?: current.takeIf { it.state == ProcessingTaskState.RUNNING }
                 ?: return
-            val workSpec = runCatching { workSpecRepository.find(taskId) }.getOrNull()
+            val workSpecResult = runCatching { workSpecRepository.find(taskId) }
+            if (workSpecResult.isFailure) {
+                dropFailedTaskVersion(taskId, current)
+                return
+            }
+            val workSpec = workSpecResult.getOrNull()
             val recovered = TaskRecoveryPolicy.recover(
                 task = running,
                 mode = recoveryMode(running, workSpec),
