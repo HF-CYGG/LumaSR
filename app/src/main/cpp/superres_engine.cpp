@@ -831,6 +831,9 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     }
     const ncnn::Option executionOption = allocators.attach_to(net.opt);
     const int totalTiles = tilesX * tilesY;
+    std::chrono::steady_clock::duration uploadDuration{};
+    std::chrono::steady_clock::duration inferenceDuration{};
+    std::chrono::steady_clock::duration downloadDuration{};
     int firstTile = 0;
 
     while (firstTile < totalTiles) {
@@ -900,7 +903,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
 
             const auto uploadStart = std::chrono::steady_clock::now();
             command.record_upload(work.input, work.uploaded, executionOption);
-            performance.uploadMs += elapsed_ms(uploadStart);
+            uploadDuration += std::chrono::steady_clock::now() - uploadStart;
             if (work.uploaded.empty()) {
                 return SuperResNativeCode::VulkanFailed;
             }
@@ -910,12 +913,13 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             extractor->set_workspace_vkallocator(allocators.workspace());
             extractor->set_staging_vkallocator(allocators.staging());
             const auto inferenceStart = std::chrono::steady_clock::now();
-            if (extractor->input(files.inputBlob, work.uploaded) != 0 ||
-                extractor->extract(files.outputBlob, work.inferred, command) != 0) {
-                performance.inferenceMs += elapsed_ms(inferenceStart);
+            const bool inferenceFailed =
+                extractor->input(files.inputBlob, work.uploaded) != 0 ||
+                extractor->extract(files.outputBlob, work.inferred, command) != 0;
+            inferenceDuration += std::chrono::steady_clock::now() - inferenceStart;
+            if (inferenceFailed) {
                 return SuperResNativeCode::VulkanFailed;
             }
-            performance.inferenceMs += elapsed_ms(inferenceStart);
             if (work.inferred.empty()) {
                 return SuperResNativeCode::VulkanFailed;
             }
@@ -923,16 +927,16 @@ SuperResNativeCode run_optimized_vulkan_tiles(
 
             const auto downloadStart = std::chrono::steady_clock::now();
             command.record_download(work.inferred, work.downloaded, executionOption);
-            performance.downloadMs += elapsed_ms(downloadStart);
+            downloadDuration += std::chrono::steady_clock::now() - downloadStart;
         }
 
         // ncnn exposes one synchronization result for the complete command buffer; keep it in inference time.
         const auto submitStart = std::chrono::steady_clock::now();
-        if (command.submit_and_wait() != 0) {
-            performance.inferenceMs += elapsed_ms(submitStart);
+        const int submitResult = command.submit_and_wait();
+        inferenceDuration += std::chrono::steady_clock::now() - submitStart;
+        if (submitResult != 0) {
             return SuperResNativeCode::VulkanFailed;
         }
-        performance.inferenceMs += elapsed_ms(submitStart);
 
         if (is_cancelled(params.taskId)) {
             return SuperResNativeCode::Cancelled;
@@ -1027,6 +1031,10 @@ SuperResNativeCode run_optimized_vulkan_tiles(
         }
     }
 
+    // Convert once after all batches so sub-millisecond record calls accumulate instead of truncating per tile.
+    performance.uploadMs = std::chrono::duration_cast<std::chrono::milliseconds>(uploadDuration).count();
+    performance.inferenceMs = std::chrono::duration_cast<std::chrono::milliseconds>(inferenceDuration).count();
+    performance.downloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(downloadDuration).count();
     return SuperResNativeCode::Ok;
 }
 

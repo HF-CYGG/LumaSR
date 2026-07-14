@@ -1,5 +1,7 @@
 #include "superres_execution_profile.h"
 
+#include <limits>
+
 namespace {
 
 constexpr SuperResExecutionProfileRequest kOptimizedRequest{
@@ -64,7 +66,14 @@ static_assert(sanitize_gpu_headroom_percent(0) == 0);
 static_assert(sanitize_gpu_headroom_percent(17) == 17);
 static_assert(sanitize_gpu_headroom_percent(26) == 25);
 static_assert(calculate_gpu_headroom_sleep_ms(0, 100) == 0);
+static_assert(calculate_gpu_headroom_sleep_ms(8, -1) == 0);
 static_assert(calculate_gpu_headroom_sleep_ms(8, 100) == 8);
+static_assert(calculate_gpu_headroom_sleep_ms(1, 1979) == 19);
+static_assert(calculate_gpu_headroom_sleep_ms(1, 1980) == 20);
+static_assert(calculate_gpu_headroom_sleep_ms(
+    8,
+    std::numeric_limits<long long>::max()
+) == 20);
 
 constexpr SuperResCommandBatchPlan kFirstBatch = plan_command_batch(10, 4, 0, false);
 constexpr SuperResCommandBatchPlan kSecondBatch = plan_command_batch(10, 4, 4, false);

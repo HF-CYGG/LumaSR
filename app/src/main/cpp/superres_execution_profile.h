@@ -132,8 +132,14 @@ constexpr long long calculate_gpu_headroom_sleep_ms(int requestedPercent, long l
     if (headroom == 0 || elapsedMs <= 0) {
         return 0;
     }
-    const long long calculated = elapsedMs * headroom / (100 - headroom);
-    return calculated < 1 ? 1 : calculated > 20 ? 20 : calculated;
+    const long long divisor = 100 - headroom;
+    const long long cappedSleepNumerator = 20LL * divisor;
+    const long long capThreshold = (cappedSleepNumerator + headroom - 1) / headroom;
+    if (elapsedMs >= capThreshold) {
+        return 20;
+    }
+    const long long calculated = elapsedMs * headroom / divisor;
+    return calculated < 1 ? 1 : calculated;
 }
 
 struct SuperResCommandBatchPlan {
