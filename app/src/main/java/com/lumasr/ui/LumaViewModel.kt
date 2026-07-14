@@ -556,7 +556,7 @@ class LumaViewModel(
         progress = 0f,
         currentTile = 0,
         totalTiles = 1,
-        completedTileIndexes = emptySet(),
+        completedTiles = 0,
         message = "Preparing processing files",
         estimatedRemainingMs = null
     )
@@ -567,7 +567,7 @@ class LumaViewModel(
         progress = 1f,
         currentTile = 16,
         totalTiles = 16,
-        completedTileIndexes = (1..16).toSet(),
+        completedTiles = 16,
         message = "Mock upscale complete",
         estimatedRemainingMs = null
     )

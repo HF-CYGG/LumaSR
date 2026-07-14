@@ -53,7 +53,7 @@ class LumaUiStateSelectionTest {
                 progress = 0.5f,
                 currentTile = 4,
                 totalTiles = 8,
-                completedTileIndexes = setOf(1, 2, 3),
+                completedTiles = 3,
                 message = "Processing tile",
                 estimatedRemainingMs = null
             ),

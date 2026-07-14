@@ -431,7 +431,7 @@ class NativeSuperResProcessor(
         progress = value,
         currentTile = if (stage == UpscaleStage.DONE) 1 else 0,
         totalTiles = 1,
-        completedTileIndexes = if (stage == UpscaleStage.DONE) setOf(1) else emptySet(),
+        completedTiles = if (stage == UpscaleStage.DONE) 1 else 0,
         message = message,
         estimatedRemainingMs = null
     )
@@ -442,7 +442,7 @@ class NativeSuperResProcessor(
         progress = event.progress,
         currentTile = event.currentTile,
         totalTiles = event.totalTiles,
-        completedTileIndexes = (1..event.currentTile).toSet(),
+        completedTiles = event.currentTile,
         message = event.message,
         estimatedRemainingMs = null,
         performanceSnapshot = event.performanceSnapshot

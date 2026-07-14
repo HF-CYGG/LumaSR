@@ -196,7 +196,7 @@ fun ProcessTabV2(
             progress = 0f,
             currentTile = 0,
             totalTiles = 64,
-            completedTileIndexes = emptySet(),
+            completedTiles = 0,
             message = "Preparing native inference",
             estimatedRemainingMs = null
         )
@@ -1298,7 +1298,7 @@ private fun RenderTileOverlay(
     previewImage: ImageBitmap,
     modifier: Modifier = Modifier
 ) {
-    val visualState = remember(progress.stage, progress.currentTile, progress.totalTiles, progress.completedTileIndexes) {
+    val visualState = remember(progress.stage, progress.currentTile, progress.totalTiles, progress.completedTiles) {
         calculateRenderTileVisualState(progress)
     }
     val animatedProgress by animateFloatAsState(
@@ -1339,7 +1339,7 @@ private fun RenderTileOverlay(
         )
 
         tileRects
-            .filter { it.index <= completedCutoff || progress.completedTileIndexes.contains(it.index) }
+            .filter { it.index <= maxOf(completedCutoff, progress.completedTiles) }
             .forEach { tile ->
                 clipRect(left = tile.left, top = tile.top, right = tile.right, bottom = tile.bottom) {
                     drawImage(

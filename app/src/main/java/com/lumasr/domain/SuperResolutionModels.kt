@@ -107,7 +107,7 @@ data class UpscaleProgress(
     val progress: Float,
     val currentTile: Int,
     val totalTiles: Int,
-    val completedTileIndexes: Set<Int>,
+    val completedTiles: Int,
     val message: String,
     val estimatedRemainingMs: Long?,
     val performanceSnapshot: NativePerformanceSnapshot? = null

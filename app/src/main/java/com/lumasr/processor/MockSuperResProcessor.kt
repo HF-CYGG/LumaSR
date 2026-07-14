@@ -117,7 +117,7 @@ class MockSuperResProcessor(
                 progress = progress.coerceIn(0f, 1f),
                 currentTile = currentTile,
                 totalTiles = totalTiles,
-                completedTileIndexes = completedTiles.toSet(),
+                completedTiles = completedTiles.size,
                 message = message,
                 estimatedRemainingMs = null
             )

@@ -54,7 +54,7 @@ class RenderTileLayoutTest {
                 wholeTaskProgress = 0.45f,
                 currentTile = 3,
                 totalTiles = 8,
-                completedTileIndexes = setOf(1, 2, 3)
+                completedTiles = 3
             )
         )
 
@@ -87,7 +87,7 @@ class RenderTileLayoutTest {
                 wholeTaskProgress = 0.96f,
                 currentTile = 8,
                 totalTiles = 8,
-                completedTileIndexes = (1..8).toSet()
+                completedTiles = 8
             )
         )
 
@@ -101,14 +101,14 @@ class RenderTileLayoutTest {
         wholeTaskProgress: Float,
         currentTile: Int,
         totalTiles: Int,
-        completedTileIndexes: Set<Int> = emptySet()
+        completedTiles: Int = 0
     ) = UpscaleProgress(
         taskId = "task",
         stage = stage,
         progress = wholeTaskProgress,
         currentTile = currentTile,
         totalTiles = totalTiles,
-        completedTileIndexes = completedTileIndexes,
+        completedTiles = completedTiles,
         message = "",
         estimatedRemainingMs = null
     )

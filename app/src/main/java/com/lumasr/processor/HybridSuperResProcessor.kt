@@ -739,7 +739,7 @@ private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: 
     progress = value,
     currentTile = 1,
     totalTiles = 1,
-    completedTileIndexes = setOf(1),
+    completedTiles = 1,
     message = message,
     estimatedRemainingMs = null
 )
