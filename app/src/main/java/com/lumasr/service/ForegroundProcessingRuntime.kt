@@ -2,12 +2,13 @@ package com.lumasr.service
 
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
-import com.lumasr.domain.ThermalLevel
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
+import com.lumasr.domain.ProcessingExecutionProfileResolver
 import com.lumasr.domain.ProcessingOwnerHandoffResult
 import com.lumasr.domain.ProcessingSnapshotLease
 import com.lumasr.domain.ProcessingSnapshotOwner
+import com.lumasr.domain.ThermalLevel
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -212,7 +213,8 @@ object ApplicationForegroundProcessingRuntime {
 
     fun getOrCreate(
         taskDirectory: File,
-        thermalLevelProvider: () -> ThermalLevel? = { null }
+        thermalLevelProvider: () -> ThermalLevel? = { null },
+        executionProfileResolver: ProcessingExecutionProfileResolver? = null
     ): ForegroundProcessingRuntime {
         val normalizedDirectory = taskDirectory.absoluteFile.normalize()
         val normalizedPath = normalizedDirectory.path
@@ -230,7 +232,12 @@ object ApplicationForegroundProcessingRuntime {
                     ProcessingCoordinator(
                         taskRepository = FileProcessingTaskRepository(normalizedDirectory),
                         workSpecRepository = FileProcessingWorkSpecRepository(normalizedDirectory),
-                        runner = SuperResProcessingTaskRunner(
+                        runner = executionProfileResolver?.let { resolver ->
+                            SuperResProcessingTaskRunner(
+                                thermalLevelProvider = thermalLevelProvider,
+                                executionProfileResolver = resolver
+                            )
+                        } ?: SuperResProcessingTaskRunner(
                             thermalLevelProvider = thermalLevelProvider
                         )
                     )

@@ -294,6 +294,48 @@ class PersistentProcessingControllerTest {
         }
     }
 
+    @Test
+    fun thermalPausedTaskDoesNotCancelRemainingBatchItems() = runBlocking {
+        val fixture = Fixture()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            fixture.controller.startObserving(scope)
+            withTimeout(2_000L) {
+                while (fixture.snapshots.subscriptionCount.value == 0) yield()
+            }
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(
+                    task = task(
+                        id = "thermal-first",
+                        state = ProcessingTaskState.PAUSED,
+                        updatedAt = 2_000L,
+                        imageIndex = 0,
+                        imageCount = 2,
+                        retryableErrorCode = "THERMAL_CRITICAL"
+                    ),
+                    progress = null
+                ),
+                ProcessingTaskSnapshot(
+                    task = task(
+                        id = "queued-second",
+                        state = ProcessingTaskState.QUEUED,
+                        updatedAt = 1_001L,
+                        imageIndex = 1,
+                        imageCount = 2
+                    ),
+                    progress = null
+                )
+            )
+
+            yield()
+
+            assertTrue(fixture.service.cancelledTaskIds.isEmpty())
+            assertTrue(fixture.fallback.cancelledTaskIds.isEmpty())
+        } finally {
+            scope.cancel()
+        }
+    }
+
     private class Fixture(
         submitResult: ProcessingServiceStartResult = ProcessingServiceStartResult.Started,
         beforeSubmitResult: suspend () -> Unit = {}
@@ -394,7 +436,8 @@ class PersistentProcessingControllerTest {
             batchId: String = "batch-1",
             updatedAt: Long = 1_000L,
             imageIndex: Int = 0,
-            imageCount: Int = 1
+            imageCount: Int = 1,
+            retryableErrorCode: String? = null
         ): ProcessingTask {
             val terminalAt = updatedAt.takeIf { state.isTerminal }
             return ProcessingTask(
@@ -408,7 +451,7 @@ class PersistentProcessingControllerTest {
                 createdAtEpochMs = 1_000L + imageIndex,
                 updatedAtEpochMs = updatedAt,
                 terminalAtEpochMs = terminalAt,
-                retryableErrorCode = null,
+                retryableErrorCode = retryableErrorCode,
                 executionProfileKey = "profile",
                 batchId = batchId,
                 sourceDisplayName = "$id.png"

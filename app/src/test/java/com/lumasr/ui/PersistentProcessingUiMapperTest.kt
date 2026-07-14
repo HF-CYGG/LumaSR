@@ -11,6 +11,7 @@ import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -56,6 +57,7 @@ class PersistentProcessingUiMapperTest {
         val mapped = PersistentProcessingUiMapper.apply(LumaUiState(), state)
 
         assertEquals(LumaScreen.PROCESSING, mapped.screen)
+        assertFalse(mapped.processingPaused)
         assertEquals("second", mapped.activeParams?.taskId)
         assertEquals(progress, mapped.progress)
         assertEquals(2, mapped.activeBatchIndex)
@@ -94,7 +96,7 @@ class PersistentProcessingUiMapperTest {
     }
 
     @Test
-    fun criticalThermalFailureIsPresentedAsRetryableCoolingState() {
+    fun criticalThermalPauseStaysNonTerminalAndExplainsHowToResume() {
         val mapped = PersistentProcessingUiMapper.apply(
             LumaUiState(screen = LumaScreen.PROCESSING),
             PersistentProcessingState(
@@ -102,7 +104,7 @@ class PersistentProcessingUiMapperTest {
                     record(
                         "thermal",
                         0,
-                        ProcessingTaskState.FAILED,
+                        ProcessingTaskState.PAUSED,
                         retryableErrorCode = "THERMAL_CRITICAL"
                     )
                 ),
@@ -110,9 +112,10 @@ class PersistentProcessingUiMapperTest {
             )
         )
 
-        assertEquals(LumaScreen.EDITING, mapped.screen)
+        assertEquals(LumaScreen.PROCESSING, mapped.screen)
+        assertTrue(mapped.processingPaused)
         assertTrue(mapped.resultMessage.orEmpty().contains("cool", ignoreCase = true))
-        assertTrue(mapped.resultMessage.orEmpty().contains("try again", ignoreCase = true))
+        assertTrue(mapped.resultMessage.orEmpty().contains("resume", ignoreCase = true))
     }
 
     @Test

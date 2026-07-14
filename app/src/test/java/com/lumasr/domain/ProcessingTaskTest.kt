@@ -9,6 +9,20 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class ProcessingTaskTest {
+    @Test
+    fun thermalBackoffCanPauseWithRetryableCodeWithoutBecomingTerminal() {
+        val paused = ProcessingTaskTransitions.transition(
+            task = task(state = ProcessingTaskState.RUNNING),
+            targetState = ProcessingTaskState.PAUSED,
+            atEpochMs = 2_000L,
+            retryableErrorCode = ProcessingFailureCode.THERMAL_CRITICAL.stableCode
+        )
+
+        assertEquals(ProcessingTaskState.PAUSED, paused.state)
+        assertEquals(ProcessingFailureCode.THERMAL_CRITICAL.stableCode, paused.retryableErrorCode)
+        assertEquals(null, paused.terminalAtEpochMs)
+    }
+
     @get:Rule
     val temporaryFolder = TemporaryFolder()
 

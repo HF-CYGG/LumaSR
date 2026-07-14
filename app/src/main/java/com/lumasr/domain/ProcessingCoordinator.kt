@@ -1,5 +1,6 @@
 package com.lumasr.domain
 
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlinx.coroutines.CancellationException
@@ -33,13 +34,17 @@ enum class ProcessingFailureCode(val stableCode: String) {
     PROCESSOR_FAILED("PROCESSOR_FAILED"),
     RUNNER_EXCEPTION("RUNNER_EXCEPTION"),
     WORK_SPEC_MISSING("WORK_SPEC_MISSING"),
-    THERMAL_CRITICAL("THERMAL_CRITICAL")
+    THERMAL_CRITICAL("THERMAL_CRITICAL"),
+    CALIBRATION_IN_PROGRESS("CALIBRATION_IN_PROGRESS")
 }
 
 sealed interface ProcessingRunResult {
     data object Completed : ProcessingRunResult
 
     data class Failed(val code: ProcessingFailureCode) : ProcessingRunResult
+
+    /** A recoverable environmental condition stopped work before native processing began. */
+    data class RetryLater(val code: ProcessingFailureCode) : ProcessingRunResult
 
     data object Cancelled : ProcessingRunResult
 }
@@ -201,13 +206,18 @@ class ProcessingCoordinator(
                 PausedExecution(task.id, current?.takeIf { it.taskId == task.id })
             }
             val activeResult = pausedExecution?.active?.let {
-                runCatching { runner.cancel(pausedExecution.taskId) }
                 it.result.cancel(CancellationException("Task paused by foreground-service timeout"))
                 it.result
+            }
+            val cancelSignal = pausedExecution?.active?.let {
+                scope.async(Dispatchers.IO) {
+                    runCatching { runner.cancel(pausedExecution.taskId) }
+                }
             }
             val worker = workerJob
             worker?.cancel(CancellationException("Foreground-service timeout"))
             withTimeoutOrNull(pauseJoinTimeoutMs) {
+                cancelSignal?.await()
                 activeResult?.join()
                 worker?.join()
             }
@@ -420,9 +430,16 @@ class ProcessingCoordinator(
             }
             finalizeResult(running, result)
         } finally {
-            stateMutex.withLock {
+            val cleanCancelledArtifacts = stateMutex.withLock {
+                val shouldClean = tasksById[taskId]?.state == ProcessingTaskState.CANCELLED
                 if (activeExecution?.result === executionResult) activeExecution = null
                 explicitlyCancelledTaskIds.remove(taskId)
+                shouldClean
+            }
+            if (cleanCancelledArtifacts) {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    deleteCancelledOutput(running.outputPath)
+                }
             }
         }
     }
@@ -436,13 +453,19 @@ class ProcessingCoordinator(
             val targetState = when (result) {
                 ProcessingRunResult.Completed -> ProcessingTaskState.COMPLETED
                 is ProcessingRunResult.Failed -> ProcessingTaskState.FAILED
+                is ProcessingRunResult.RetryLater -> ProcessingTaskState.PAUSED
                 ProcessingRunResult.Cancelled -> ProcessingTaskState.CANCELLED
             }
             val transitioned = ProcessingTaskTransitions.transition(
                 task = current,
                 targetState = targetState,
                 atEpochMs = safeNow(current),
-                retryableErrorCode = (result as? ProcessingRunResult.Failed)?.code?.stableCode
+                retryableErrorCode = when (result) {
+                    is ProcessingRunResult.Failed -> result.code.stableCode
+                    is ProcessingRunResult.RetryLater -> result.code.stableCode
+                    ProcessingRunResult.Completed,
+                    ProcessingRunResult.Cancelled -> null
+                }
             )
             taskRepository.save(transitioned)
             tasksById[current.id] = transitioned
@@ -540,6 +563,13 @@ class ProcessingCoordinator(
             persisted == ProcessingTaskTransitions.retry(current, persisted.updatedAtEpochMs)
 
     private fun safeNow(task: ProcessingTask): Long = max(clock.nowEpochMs(), task.updatedAtEpochMs)
+
+    private fun deleteCancelledOutput(outputPath: String) {
+        // Native publication is atomic, but a UI cancel can race immediately after that commit.
+        // Deleting only after the native call returns makes CANCELLED imply no final artifact.
+        runCatching { File(outputPath).delete() }
+        runCatching { File("$outputPath.part").delete() }
+    }
 
     private data class ActiveExecution(
         val taskId: String,

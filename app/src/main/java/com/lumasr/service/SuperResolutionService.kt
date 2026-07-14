@@ -23,6 +23,7 @@ import com.lumasr.domain.ProcessingSnapshotLease
 import com.lumasr.domain.ProcessingSnapshotOwner
 import com.lumasr.domain.ProcessingTaskSnapshot
 import com.lumasr.domain.ProcessingTaskState
+import com.lumasr.ui.createInferenceExecutionProfileResolver
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -66,7 +67,8 @@ class SuperResolutionService : Service() {
             runner = SuperResProcessingTaskRunner(
                 thermalLevelProvider = ThermalSampler(
                     AndroidThermalSignalSource(this)
-                )::sampleLevel
+                )::sampleLevel,
+                executionProfileResolver = createInferenceExecutionProfileResolver(this)
             )
         )
         snapshotLease = checkNotNull(

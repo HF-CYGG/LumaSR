@@ -185,6 +185,7 @@ fun ProcessTabV2(
     onTtaChanged: (Boolean) -> Unit,
     onStart: () -> Unit,
     onClearImage: () -> Unit,
+    onResume: () -> Unit,
     onCancel: () -> Unit
 ) {
     val batchPhotoPicker = rememberImageBatchPicker(onPickImages)
@@ -298,6 +299,8 @@ fun ProcessTabV2(
                     progress = it,
                     batchIndex = state.activeBatchIndex,
                     batchSize = state.activeBatchSize,
+                    isPaused = state.processingPaused,
+                    onResume = onResume,
                     onCancel = onCancel
                 )
             }
@@ -1399,6 +1402,8 @@ private fun RenderStatusStrip(
     progress: UpscaleProgress,
     batchIndex: Int,
     batchSize: Int,
+    isPaused: Boolean,
+    onResume: () -> Unit,
     onCancel: () -> Unit
 ) {
     Surface(
@@ -1434,6 +1439,11 @@ private fun RenderStatusStrip(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+                if (shouldOfferProcessingResume(isPaused)) {
+                    TextButton(onClick = onResume) {
+                        Text("恢复")
+                    }
+                }
                 TextButton(onClick = onCancel) {
                     Icon(Icons.Rounded.Close, contentDescription = null)
                     Spacer(Modifier.width(4.dp))
@@ -1449,6 +1459,8 @@ private fun RenderStatusStrip(
         }
     }
 }
+
+internal fun shouldOfferProcessingResume(isPaused: Boolean): Boolean = isPaused
 
 @Composable
 fun CompareScreenV2(

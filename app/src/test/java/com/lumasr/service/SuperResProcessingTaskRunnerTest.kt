@@ -1,9 +1,12 @@
 package com.lumasr.service
 
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.CalibrationExecutionGate
 import com.lumasr.domain.InferencePrecision
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.ProcessingClock
+import com.lumasr.domain.ProcessingExecutionProfileResolver
 import com.lumasr.domain.ProcessingFailureCode
 import com.lumasr.domain.ProcessingRunResult
 import com.lumasr.domain.ProcessingTask
@@ -29,7 +32,8 @@ class SuperResProcessingTaskRunnerTest {
         val levels = ArrayDeque(listOf(ThermalLevel.MODERATE, ThermalLevel.SEVERE))
         val runner = SuperResProcessingTaskRunner(
             processor = processor,
-            thermalLevelProvider = { levels.removeFirst() }
+            thermalLevelProvider = { levels.removeFirst() },
+            executionProfileResolver = passthroughResolver()
         )
 
         assertEquals(ProcessingRunResult.Completed, runner.run(task("one"), spec("one")) {})
@@ -53,7 +57,7 @@ class SuperResProcessingTaskRunnerTest {
         val result = runner.run(task("critical"), spec("critical")) {}
 
         assertEquals(
-            ProcessingRunResult.Failed(ProcessingFailureCode.THERMAL_CRITICAL),
+            ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL),
             result
         )
         assertTrue(processor.requests.isEmpty())
@@ -64,7 +68,8 @@ class SuperResProcessingTaskRunnerTest {
         val processor = RecordingProcessor()
         val runner = SuperResProcessingTaskRunner(
             processor = processor,
-            thermalLevelProvider = { ThermalLevel.SEVERE }
+            thermalLevelProvider = { ThermalLevel.SEVERE },
+            executionProfileResolver = passthroughResolver()
         )
         val params = params("pipeline").copy(
             pipelinePasses = listOf(
@@ -87,6 +92,78 @@ class SuperResProcessingTaskRunnerTest {
         assertTrue(resolved.pipelinePasses.all { it.gpuHeadroomPercent == 20 })
     }
 
+    @Test
+    fun resolvesPersistedProfileAgainAtExecutionBoundary() = runBlocking {
+        val processor = RecordingProcessor()
+        val resolutionTimes = mutableListOf<Long>()
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            executionProfileResolver = ProcessingExecutionProfileResolver { _, params, nowEpochMs ->
+                resolutionTimes += nowEpochMs
+                params.copy(
+                    nativeBackend = NativeBackend.LEGACY_SAFE,
+                    inferencePrecision = InferencePrecision.FP32,
+                    commandBatchSize = 1,
+                    modelCacheCapacity = 1
+                )
+            },
+            clock = ProcessingClock { 9_000L }
+        )
+
+        val persisted = spec("stale").copy(
+            params = params("stale").copy(
+                nativeBackend = NativeBackend.OPTIMIZED,
+                inferencePrecision = InferencePrecision.FP16,
+                commandBatchSize = 8,
+                modelCacheCapacity = 2
+            )
+        )
+
+        assertEquals(ProcessingRunResult.Completed, runner.run(task("stale"), persisted) {})
+
+        assertEquals(listOf(9_000L), resolutionTimes)
+        val executed = processor.requests.single()
+        assertEquals(NativeBackend.LEGACY_SAFE, executed.nativeBackend)
+        assertEquals(InferencePrecision.FP32, executed.inferencePrecision)
+        assertEquals(1, executed.commandBatchSize)
+        assertEquals(1, executed.modelCacheCapacity)
+    }
+
+    @Test
+    fun defaultResolverFailsClosedInsteadOfTrustingPersistedOptimization() = runBlocking {
+        val processor = RecordingProcessor()
+        val runner = SuperResProcessingTaskRunner(processor = processor)
+
+        assertEquals(ProcessingRunResult.Completed, runner.run(task("default-safe"), spec("default-safe")) {})
+
+        val executed = processor.requests.single()
+        assertEquals(NativeBackend.LEGACY_SAFE, executed.nativeBackend)
+        assertEquals(InferencePrecision.FP32, executed.inferencePrecision)
+        assertEquals(1, executed.commandBatchSize)
+        assertEquals(1, executed.modelCacheCapacity)
+    }
+
+    @Test
+    fun lingeringCalibrationProbePausesFormalProcessingWithoutStartingNativeWork() = runBlocking {
+        val calibrationLease = checkNotNull(CalibrationExecutionGate.tryEnterCalibration())
+        val processor = RecordingProcessor()
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            executionProfileResolver = passthroughResolver()
+        )
+        try {
+            val result = runner.run(task("calibration-busy"), spec("calibration-busy")) {}
+
+            assertEquals(
+                ProcessingRunResult.RetryLater(ProcessingFailureCode.CALIBRATION_IN_PROGRESS),
+                result
+            )
+            assertTrue(processor.requests.isEmpty())
+        } finally {
+            calibrationLease.close()
+        }
+    }
+
     private fun task(id: String): ProcessingTask {
         val root = File("build/thermal/$id").absoluteFile
         return ProcessingTask(
@@ -106,6 +183,8 @@ class SuperResProcessingTaskRunnerTest {
     }
 
     private fun spec(id: String) = ProcessingWorkSpec.fromParams("model", params(id))
+
+    private fun passthroughResolver() = ProcessingExecutionProfileResolver { _, params, _ -> params }
 
     private fun params(id: String): UpscaleParams {
         val root = File("build/thermal/$id").absoluteFile

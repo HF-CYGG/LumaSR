@@ -415,6 +415,7 @@ private fun LumaNavHost(
                 onTtaChanged = viewModel::setTta,
                 onStart = viewModel::startProcessing,
                 onClearImage = viewModel::clearSelectedImage,
+                onResume = viewModel::resumeProcessing,
                 onCancel = viewModel::cancelProcessing
             )
         }

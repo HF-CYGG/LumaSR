@@ -563,6 +563,12 @@ class LumaViewModel(
         }
     }
 
+    fun resumeProcessing() {
+        viewModelScope.launch {
+            persistentController.restoreAndResume()
+        }
+    }
+
     fun onHostStarted() {
         viewModelScope.launch {
             persistentController.onHostStarted()
@@ -697,6 +703,7 @@ data class LumaUiState(
     val screen: LumaScreen = LumaScreen.EDITING,
     val selectedTab: LumaTab = LumaTab.PROCESS,
     val progress: UpscaleProgress? = null,
+    val processingPaused: Boolean = false,
     val activeParams: UpscaleParams? = null,
     val activeBatchIndex: Int = 0,
     val activeBatchSize: Int = 0,

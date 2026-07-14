@@ -97,14 +97,20 @@ object ProcessingTaskTransitions {
         require(targetState in allowedTargets(task.state)) {
             "Invalid task transition: ${task.state} -> $targetState"
         }
-        require(targetState == ProcessingTaskState.FAILED || retryableErrorCode == null) {
-            "Error codes are only valid for failed tasks"
+        require(
+            targetState == ProcessingTaskState.FAILED ||
+                targetState == ProcessingTaskState.PAUSED ||
+                retryableErrorCode == null
+        ) {
+            "Error codes are only valid for failed or retryable paused tasks"
         }
         return task.copy(
             state = targetState,
             updatedAtEpochMs = atEpochMs,
             terminalAtEpochMs = atEpochMs.takeIf { targetState.isTerminal },
-            retryableErrorCode = retryableErrorCode.takeIf { targetState == ProcessingTaskState.FAILED }
+            retryableErrorCode = retryableErrorCode.takeIf {
+                targetState == ProcessingTaskState.FAILED || targetState == ProcessingTaskState.PAUSED
+            }
         )
     }
 

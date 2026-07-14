@@ -16,7 +16,7 @@ object PersistentProcessingUiMapper {
             .asReversed()
             .map(::toTaskSummary)
             .take(MAX_RECENT_TASKS)
-        var mapped = previous.copy(recentTasks = recentTasks)
+        var mapped = previous.copy(recentTasks = recentTasks, processingPaused = false)
         val requestedBatchId = processing.trackedBatchId
         if (requestedBatchId == null) {
             return mapped.withNewMessage(processing.notice?.message)
@@ -81,6 +81,7 @@ object PersistentProcessingUiMapper {
                 screen = LumaScreen.PROCESSING,
                 selectedTab = LumaTab.PROCESS,
                 progress = activeProgress,
+                processingPaused = active.task.state == ProcessingTaskState.PAUSED,
                 activeParams = active.workSpec?.toUpscaleParams(),
                 activeBatchIndex = active.task.imageIndex + 1,
                 activeBatchSize = active.task.imageCount,
@@ -88,7 +89,10 @@ object PersistentProcessingUiMapper {
                 savedOutputUri = null,
                 savedOutputUris = emptyList()
             )
-            return mapped.withNewMessage(processing.notice?.message)
+            val pausedMessage = active.task.retryableErrorCode
+                ?.takeIf { active.task.state == ProcessingTaskState.PAUSED }
+                ?.let(::pauseMessage)
+            return mapped.withNewMessage(pausedMessage ?: processing.notice?.message)
         }
 
         val expectedImageCount = batchRecords.maxOf { it.task.imageCount }
@@ -181,6 +185,14 @@ object PersistentProcessingUiMapper {
         "PROCESSOR_FAILED" -> "Processing failed. Try a smaller tile size or CPU mode."
         "THERMAL_CRITICAL" -> "Device temperature is too high. Let it cool down, then try again."
         else -> "Processing failed. Please try again."
+    }
+
+    private fun pauseMessage(code: String): String = when (code) {
+        "THERMAL_CRITICAL" ->
+            "Device temperature is too high. Let it cool down, then tap Resume."
+        "CALIBRATION_IN_PROGRESS" ->
+            "Performance calibration is still finishing. Tap Resume again shortly."
+        else -> "Processing paused. Tap Resume when the device is ready."
     }
 
     private fun LumaUiState.withNewMessage(message: String?): LumaUiState {

@@ -29,9 +29,11 @@ internal fun createPersistentProcessingController(context: Context): PersistentP
         serviceClient = serviceClient
     )
     val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
+    val executionProfileResolver = createInferenceExecutionProfileResolver(appContext)
     val foregroundRuntime = ApplicationForegroundProcessingRuntime.getOrCreate(
         taskDirectory = taskDirectory,
-        thermalLevelProvider = thermalSampler::sampleLevel
+        thermalLevelProvider = thermalSampler::sampleLevel,
+        executionProfileResolver = executionProfileResolver
     )
     return PersistentProcessingController(
         taskRepository = taskRepository,

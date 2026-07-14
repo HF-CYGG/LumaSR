@@ -1,5 +1,6 @@
 package com.lumasr.domain
 
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -21,6 +22,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -174,6 +176,39 @@ class ProcessingCoordinatorTest {
             assertEquals(1, tasks.saved.count { it.id == "cancel-race" && it.state == ProcessingTaskState.CANCELLED })
             assertEquals(ProcessingTaskState.CANCELLED, tasks.find("cancel-race")?.state)
         } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun cancelledTaskRemovesOutputPublishedAfterCancellationRequest() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(tasks, work, runner)
+        val target = task("cancel-published-race")
+        val output = File(target.outputPath)
+        val temporary = File("${target.outputPath}.part")
+        output.parentFile?.mkdirs()
+        output.delete()
+        temporary.delete()
+        try {
+            coordinator.start()
+            coordinator.enqueue(target, spec(target.id))
+            assertEquals(target.id, runner.awaitStarted())
+
+            coordinator.cancel(target.id)
+            output.writeBytes(byteArrayOf(1, 2, 3))
+            temporary.writeBytes(byteArrayOf(4, 5, 6))
+            runner.complete(target.id)
+
+            withTimeout(5_000L) {
+                while (output.exists() || temporary.exists()) yield()
+            }
+            assertEquals(ProcessingTaskState.CANCELLED, tasks.find(target.id)?.state)
+        } finally {
+            output.delete()
+            temporary.delete()
             coordinator.close()
         }
     }
@@ -402,6 +437,41 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun pauseTimeoutIncludesABlockingNativeCancelSignal() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val cancelEntered = CountDownLatch(1)
+        val releaseCancel = CountDownLatch(1)
+        val runner = GateRunner(
+            ignoreCoroutineCancellation = true,
+            onCancel = {
+                cancelEntered.countDown()
+                releaseCancel.await(5L, TimeUnit.SECONDS)
+            }
+        )
+        val coordinator = coordinator(
+            tasks = tasks,
+            work = work,
+            runner = runner,
+            pauseJoinTimeoutMs = 50L
+        )
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("blocking-cancel"), spec("blocking-cancel"))
+            assertEquals("blocking-cancel", runner.awaitStarted())
+
+            withTimeout(1_000L) { coordinator.pauseActive() }
+
+            assertTrue(cancelEntered.await(1L, TimeUnit.SECONDS))
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("blocking-cancel")?.state)
+        } finally {
+            releaseCancel.countDown()
+            runner.completeIfStarted("blocking-cancel")
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun concurrentResumeRebuildsOneWorkerAfterPause() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -585,6 +655,33 @@ class ProcessingCoordinatorTest {
 
             coordinator.awaitState("runner-cancel", ProcessingTaskState.COMPLETED)
             assertEquals(2, attempts.get())
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun retryLaterPausesTaskWithoutTerminalizingIt() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ) = ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL)
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("thermal-pause"), spec("thermal-pause"))
+
+            val paused = coordinator.awaitState("thermal-pause", ProcessingTaskState.PAUSED)
+
+            assertEquals(ProcessingFailureCode.THERMAL_CRITICAL.stableCode, paused.retryableErrorCode)
+            assertEquals(null, paused.terminalAtEpochMs)
         } finally {
             coordinator.close()
         }
