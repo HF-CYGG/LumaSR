@@ -12,11 +12,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.lumasr.BuildConfig
 import com.lumasr.data.GalleryRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ModelAssetRepository
 import com.lumasr.data.ModelManifestRepository
+import com.lumasr.data.ProcessingTaskSubmission
 import com.lumasr.data.UserPreferencesRepository
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.AutoTileSizePolicy
@@ -26,8 +26,10 @@ import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.ProcessingTask
+import com.lumasr.domain.ProcessingTaskState
+import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.ProcessingResourceProfile
-import com.lumasr.domain.ProcessingFailureDiagnostics
 import com.lumasr.domain.ResourceBudgetPolicy
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
@@ -39,12 +41,11 @@ import com.lumasr.domain.UpscaleStage
 import com.lumasr.domain.availableDenoiseForScale
 import com.lumasr.domain.realEsrganDenoisePreprocessor
 import com.lumasr.domain.sanitizeTargetScale
-import com.lumasr.processor.HybridSuperResProcessor
-import com.lumasr.processor.NativeCacheOwner
-import com.lumasr.domain.SuperResProcessor
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,11 +60,11 @@ import kotlin.math.abs
 class LumaViewModel(
     application: Application,
     private val repository: ModelManifestRepository = ModelManifestRepository(application),
-    private val imageCacheRepository: ImageCacheRepository = ImageCacheRepository(application),
+    private val imageCacheRepository: ImageCacheRepository = ImageCacheRepository.persistent(application),
     private val modelAssetRepository: ModelAssetRepository = ModelAssetRepository.fromContext(application),
     private val galleryRepository: GalleryRepository = GalleryRepository(application),
     private val userPreferencesRepository: UserPreferencesRepository = UserPreferencesRepository.fromContext(application),
-    private val processor: SuperResProcessor = HybridSuperResProcessor(),
+    private val persistentController: PersistentProcessingController = createPersistentProcessingController(application),
     private val modelRuntimePolicy: ModelRuntimePolicy = ModelRuntimePolicy(Build.SUPPORTED_ABIS.toList()),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : AndroidViewModel(application) {
@@ -75,6 +76,21 @@ class LumaViewModel(
 
     init {
         _uiState.update { it.withTileSizePreferences(userPreferencesRepository.loadTileSizePreferences()) }
+        persistentController.startObserving(viewModelScope)
+        viewModelScope.launch {
+            persistentController.state.collect { processingState ->
+                val trackedBatchId = processingState.trackedBatchId
+                currentTaskId = processingState.records
+                    .firstOrNull {
+                        it.task.batchId == trackedBatchId && !it.task.state.isTerminal
+                    }
+                    ?.task
+                    ?.id
+                _uiState.update { state ->
+                    PersistentProcessingUiMapper.apply(state, processingState)
+                }
+            }
+        }
         loadManifest()
     }
 
@@ -136,16 +152,11 @@ class LumaViewModel(
     }
 
     fun clearSelectedImage() {
-        currentTaskId = null
         _uiState.update { it.clearImageSelection() }
     }
 
     fun selectModel(modelId: String) {
-        val previousModelId = _uiState.value.selectedModelId
         val model = _uiState.value.models.firstOrNull { it.id == modelId } ?: return
-        if (previousModelId != null && previousModelId != modelId) {
-            releaseNativeCacheIfSupported()
-        }
         _uiState.update {
             val scale = model.defaultScale
             it.copy(
@@ -259,18 +270,28 @@ class LumaViewModel(
             }
             return
         }
-        currentTaskId?.let(processor::cancel)
         currentJob?.cancel()
-
-        // Batch state stays in the ViewModel so Compose can render the queue without owning task logic.
         currentJob = viewModelScope.launch {
-            var lastParams: UpscaleParams? = null
-            var lastResultMessage: String? = null
-            var lastStage: UpscaleStage = UpscaleStage.CANCELLED
-            var lastSuccess = false
-            val completedResults = mutableListOf<RenderResultInfo>()
-            val preparedModelDirs = runCatching {
-                withContext(ioDispatcher) {
+            val preparedTaskDirectories = mutableListOf<File>()
+            var published = false
+            val batchId = UUID.randomUUID().toString()
+            val taskIds = List(images.size) { UUID.randomUUID().toString() }
+            currentTaskId = taskIds.first()
+            _uiState.update {
+                it.copy(
+                    selectedImage = images.first(),
+                    screen = LumaScreen.PROCESSING,
+                    selectedTab = LumaTab.PROCESS,
+                    progress = preparingProgress(taskIds.first()),
+                    activeBatchIndex = 1,
+                    activeBatchSize = images.size,
+                    completedResults = emptyList(),
+                    savedOutputUri = null,
+                    savedOutputUris = emptyList()
+                )
+            }
+            try {
+                val preparedModelDirs = withContext(ioDispatcher) {
                     buildMap {
                         put(model.id, modelAssetRepository.prepareModel(model).absolutePath)
                         denoiseModel?.let { denoiser ->
@@ -278,185 +299,113 @@ class LumaViewModel(
                         }
                     }
                 }
-            }.getOrElse { error ->
-                _uiState.update {
-                    it.copy(
-                        screen = LumaScreen.EDITING,
-                        progress = null
-                    ).withResultMessage("Cannot prepare ${model.displayName}: ${error.message}")
-                }
-                currentTaskId = null
-                return@launch
-            }
-            val modelDir = preparedModelDirs.getValue(model.id)
-            val denoiseModelDir = denoiseModel?.let { preparedModelDirs[it.id] }
-
-            for ((index, image) in images.withIndex()) {
-                if (!isActive) break
-
-                val profile = processingResourceProfile(image)
-                val requestedTileSize = state.tileSizeFor(image, model, state.scale, profile)
-                val budgetDecision = ResourceBudgetPolicy.evaluate(
-                    imageWidth = image.width,
-                    imageHeight = image.height,
-                    model = model,
-                    scale = state.scale,
-                    tileSize = requestedTileSize,
-                    gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
-                    accelerationMode = state.accelerationMode,
-                    tta = state.tta,
-                    exportMode = ExportMode.AUTO,
-                    resourceProfile = profile
-                )
-                if (state.tileSizeMode == TileSizeMode.AUTO) {
-                    persistTileSizePreferences(
-                        state.copy(
-                            tileSize = budgetDecision.tileSize,
-                            lastAutoTileSize = budgetDecision.tileSize
-                        )
+                val modelDir = preparedModelDirs.getValue(model.id)
+                val denoiseModelDir = denoiseModel?.let { preparedModelDirs[it.id] }
+                val baseCreatedAt = System.currentTimeMillis()
+                val submissions = images.mapIndexed { index, image ->
+                    if (!isActive) throw CancellationException("Processing preparation cancelled")
+                    val profile = processingResourceProfile(image)
+                    val requestedTileSize = state.tileSizeFor(image, model, state.scale, profile)
+                    val budgetDecision = ResourceBudgetPolicy.evaluate(
+                        imageWidth = image.width,
+                        imageHeight = image.height,
+                        model = model,
+                        scale = state.scale,
+                        tileSize = requestedTileSize,
+                        gpuHeadroomPercent = DEFAULT_GPU_HEADROOM_PERCENT,
+                        accelerationMode = state.accelerationMode,
+                        tta = state.tta,
+                        exportMode = ExportMode.AUTO,
+                        resourceProfile = profile
                     )
-                }
-                val taskId = UUID.randomUUID().toString()
-                currentTaskId = taskId
-                _uiState.update {
-                    it.copy(
-                        selectedImage = image,
-                        screen = LumaScreen.PROCESSING,
-                        selectedTab = LumaTab.PROCESS,
-                        progress = preparingProgress(taskId),
-                        activeBatchIndex = index + 1,
-                        activeBatchSize = images.size,
-                        completedResults = emptyList(),
-                        savedOutputUri = null,
-                        savedOutputUris = emptyList(),
-                        scale = budgetDecision.scale,
-                        tileSize = budgetDecision.tileSize,
-                        accelerationMode = budgetDecision.accelerationMode,
-                        tta = budgetDecision.tta
-                    ).withResultMessage(budgetDecision.message)
-                }
-
-                val params = runCatching {
-                    withContext(ioDispatcher) {
-                        val paths = imageCacheRepository.copyToTaskCache(Uri.parse(image.sourceUri), taskId, image.mimeType)
-                        UpscaleParamsFactory.createPipeline(
+                    if (index == 0) {
+                        _uiState.update {
+                            it.copy(
+                                scale = budgetDecision.scale,
+                                tileSize = budgetDecision.tileSize,
+                                accelerationMode = budgetDecision.accelerationMode,
+                                tta = budgetDecision.tta
+                            ).withResultMessage(budgetDecision.message)
+                        }
+                    }
+                    if (state.tileSizeMode == TileSizeMode.AUTO) {
+                        persistTileSizePreferences(
+                            state.copy(
+                                tileSize = budgetDecision.tileSize,
+                                lastAutoTileSize = budgetDecision.tileSize
+                            )
+                        )
+                    }
+                    val taskId = taskIds[index]
+                    val paths = withContext(ioDispatcher) {
+                        imageCacheRepository.copyToTaskCache(
+                            uri = Uri.parse(image.sourceUri),
                             taskId = taskId,
-                            inputPath = paths.inputFile.absolutePath,
-                            outputPath = paths.outputFile.absolutePath,
-                            model = model,
-                            resolvedModelDir = modelDir,
-                            denoiseModel = denoiseModel,
-                            resolvedDenoiseModelDir = denoiseModelDir,
-                            scale = budgetDecision.scale,
-                            noise = state.noise,
-                            tileSize = budgetDecision.tileSize,
-                            gpuHeadroomPercent = budgetDecision.gpuHeadroomPercent,
-                            accelerationMode = budgetDecision.accelerationMode,
-                            allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
-                            tta = budgetDecision.tta,
-                            outputFormat = OutputFormat.PNG,
-                            exportMode = budgetDecision.exportMode
-                        ).processorParams
+                            mimeType = image.mimeType
+                        )
                     }
-                }.getOrElse { error ->
-                    currentTaskId = null
-                    _uiState.update {
-                        it.copy(
-                            screen = LumaScreen.EDITING,
-                            progress = null
-                        ).withResultMessage("Cannot prepare ${image.displayName}: ${error.message}")
-                    }
-                    return@launch
+                    preparedTaskDirectories += paths.taskDir
+                    val params = UpscaleParamsFactory.createPipeline(
+                        taskId = taskId,
+                        inputPath = paths.inputFile.absolutePath,
+                        outputPath = paths.outputFile.absolutePath,
+                        model = model,
+                        resolvedModelDir = modelDir,
+                        denoiseModel = denoiseModel,
+                        resolvedDenoiseModelDir = denoiseModelDir,
+                        scale = budgetDecision.scale,
+                        noise = state.noise,
+                        tileSize = budgetDecision.tileSize,
+                        gpuHeadroomPercent = budgetDecision.gpuHeadroomPercent,
+                        accelerationMode = budgetDecision.accelerationMode,
+                        allowRealEsrganVulkan = modelRuntimePolicy.allowsRealEsrganVulkan(model),
+                        tta = budgetDecision.tta,
+                        outputFormat = OutputFormat.PNG,
+                        exportMode = budgetDecision.exportMode
+                    ).processorParams
+                    val createdAt = baseCreatedAt + index
+                    val task = ProcessingTask(
+                        id = taskId,
+                        copiedInputPath = params.inputPath,
+                        outputPath = params.outputPath,
+                        state = ProcessingTaskState.QUEUED,
+                        imageIndex = index,
+                        imageCount = images.size,
+                        completedExtremeTileIndexes = emptySet(),
+                        createdAtEpochMs = createdAt,
+                        updatedAtEpochMs = createdAt,
+                        terminalAtEpochMs = null,
+                        retryableErrorCode = null,
+                        executionProfileKey = params.executionProfileKey(),
+                        batchId = batchId,
+                        sourceDisplayName = image.displayName.toStableDisplayName(index)
+                    )
+                    ProcessingTaskSubmission(
+                        task = task,
+                        workSpec = ProcessingWorkSpec.fromParams(model.id, params)
+                    )
                 }
-
+                persistentController.submitBatch(submissions)
+                published = true
+            } catch (cancelled: CancellationException) {
                 _uiState.update {
-                    it.copy(
-                        activeParams = params,
-                        recentTasks = it.recentTasks.upsert(
-                            RenderTaskSummary.fromParams(
-                                params = params,
-                                fileName = image.displayName,
-                                status = RenderTaskStatus.RUNNING,
-                                progress = 0f
-                            )
-                        )
-                    )
+                    it.copy(screen = LumaScreen.EDITING, progress = null)
+                        .withResultMessage("Processing cancelled.")
                 }
-
-                val result = processor.process(params) { progress ->
-                    _uiState.update {
-                        it.copy(
-                            progress = progress,
-                            recentTasks = it.recentTasks.upsert(
-                                RenderTaskSummary.fromParams(
-                                    params = params,
-                                    fileName = image.displayName,
-                                    status = progress.toTaskStatus(),
-                                    progress = progress.progress
-                                )
-                            )
-                        )
+                throw cancelled
+            } catch (error: Exception) {
+                _uiState.update {
+                    it.copy(screen = LumaScreen.EDITING, progress = null)
+                        .withResultMessage("Cannot prepare processing batch: ${error.message}")
+                }
+            } finally {
+                if (!published) {
+                    withContext(NonCancellable + ioDispatcher) {
+                        preparedTaskDirectories.forEach(::deleteUnpublishedTaskDirectory)
                     }
                 }
-
-                lastParams = params
-                lastResultMessage = result.message
-                lastStage = result.stage
-                lastSuccess = result.success
-                ProcessingFailureDiagnostics.throwIfEnabled(
-                    enabled = BuildConfig.LUMASR_CRASH_ON_PROCESSING_FAILURE,
-                    params = params,
-                    result = result
-                )
-
-                if (result.success) {
-                    completedResults += RenderResultInfo(
-                        taskId = params.taskId,
-                        fileName = image.displayName,
-                        inputPath = params.inputPath,
-                        outputPath = result.outputPath ?: params.outputPath,
-                        modelName = params.modelName,
-                        scale = params.scale,
-                        noise = params.noise,
-                        pipelineLabel = params.pipelineLabel,
-                        outputFormat = params.outputFormat,
-                        isExtremeExport = params.exportMode == ExportMode.EXTREME_SINGLE_PNG
-                    )
-                }
-
-                _uiState.update {
-                    it.copy(
-                        recentTasks = it.recentTasks.upsert(
-                            RenderTaskSummary.fromParams(
-                                params = params,
-                                fileName = image.displayName,
-                                status = when {
-                                    result.success -> RenderTaskStatus.DONE
-                                    result.stage == UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
-                                    else -> RenderTaskStatus.FAILED
-                                },
-                                progress = if (result.success) 1f else it.progress?.progress ?: 0f
-                            )
-                        )
-                    )
-                }
-
-                if (!result.success) break
-            }
-
-            val finalTaskId = lastParams?.taskId ?: currentTaskId
-            _uiState.update {
-                val finalMessage = if (lastSuccess) it.resultMessage ?: lastResultMessage else lastResultMessage
-                it.copy(
-                    screen = if (lastSuccess) LumaScreen.COMPARE else LumaScreen.EDITING,
-                    progress = it.progress ?: finalTaskId?.let(::doneProgress),
-                    activeBatchIndex = 0,
-                    activeBatchSize = images.size,
-                    completedResults = completedResults.toList()
-                ).withResultMessage(finalMessage)
-            }
-            if (lastStage != UpscaleStage.PROCESSING_TILE) {
-                currentTaskId = null
+                currentJob = null
+                if (!published) currentTaskId = null
             }
         }
     }
@@ -466,20 +415,27 @@ class LumaViewModel(
     }
 
     fun cancelProcessing() {
-        currentTaskId?.let(processor::cancel)
+        currentJob?.cancel()
+        val taskId = currentTaskId ?: return
+        viewModelScope.launch {
+            persistentController.cancel(taskId)
+        }
+    }
+
+    fun onHostStarted() {
+        viewModelScope.launch {
+            persistentController.onHostStarted()
+        }
+    }
+
+    fun onHostStopped() {
+        viewModelScope.launch {
+            persistentController.onHostStopped()
+        }
     }
 
     fun backHome() {
         _uiState.update { it.copy(screen = LumaScreen.EDITING, selectedTab = LumaTab.PROCESS) }
-    }
-
-    private fun releaseNativeCacheIfSupported() {
-        (processor as? NativeCacheOwner)?.clearNativeCache()
-    }
-
-    override fun onCleared() {
-        releaseNativeCacheIfSupported()
-        super.onCleared()
     }
 
     fun saveResultToGallery() {
@@ -561,16 +517,16 @@ class LumaViewModel(
         estimatedRemainingMs = null
     )
 
-    private fun doneProgress(taskId: String) = UpscaleProgress(
-        taskId = taskId,
-        stage = UpscaleStage.DONE,
-        progress = 1f,
-        currentTile = 16,
-        totalTiles = 16,
-        completedTiles = 16,
-        message = "Mock upscale complete",
-        estimatedRemainingMs = null
-    )
+    private fun deleteUnpublishedTaskDirectory(taskDirectory: File) {
+        runCatching {
+            val stableRoot = File(
+                getApplication<Application>().noBackupFilesDir,
+                ImageCacheRepository.PERSISTENT_TASK_DIRECTORY
+            ).canonicalFile
+            val target = taskDirectory.canonicalFile
+            if (target.parentFile == stableRoot) target.deleteRecursively()
+        }
+    }
 
     class Factory(
         private val application: Application
@@ -709,10 +665,6 @@ data class RenderTaskSummary(
             progress = progress.coerceIn(0f, 1f)
         )
     }
-}
-
-private fun List<RenderTaskSummary>.upsert(item: RenderTaskSummary): List<RenderTaskSummary> {
-    return (listOf(item) + filterNot { it.taskId == item.taskId }).take(8)
 }
 
 fun LumaUiState.clearImageSelection(): LumaUiState {
@@ -859,13 +811,28 @@ private fun ModelPack.sanitizeNoiseForUi(
         .minBy { abs(it - noise) }
 }
 
-private fun UpscaleProgress.toTaskStatus(): RenderTaskStatus {
-    return when (stage) {
-        UpscaleStage.DONE -> RenderTaskStatus.DONE
-        UpscaleStage.FAILED -> RenderTaskStatus.FAILED
-        UpscaleStage.CANCELLED -> RenderTaskStatus.CANCELLED
-        else -> RenderTaskStatus.RUNNING
-    }
+private fun UpscaleParams.executionProfileKey(): String = listOf(
+    engine.name,
+    scale.toString(),
+    noise.toString(),
+    tileSize.toString(),
+    accelerationMode.name,
+    tta.toString(),
+    exportMode.name,
+    outputMode.name,
+    nativeBackend.name,
+    inferencePrecision.name,
+    cpuThreads.toString(),
+    openmpBlocktimeMs.toString(),
+    commandBatchSize.toString(),
+    modelCacheCapacity.toString()
+).joinToString(separator = "_")
+
+private fun String.toStableDisplayName(index: Int): String {
+    val sanitized = map { character ->
+        if (character.isISOControl()) '_' else character
+    }.joinToString(separator = "").trim().take(MAX_SOURCE_DISPLAY_NAME_LENGTH)
+    return sanitized.ifBlank { "image-${index + 1}.png" }
 }
 
 private fun com.lumasr.data.CachedImageInfo.toSelectedImageInfo() = SelectedImageInfo(
@@ -878,3 +845,4 @@ private fun com.lumasr.data.CachedImageInfo.toSelectedImageInfo() = SelectedImag
 )
 
 private const val DEFAULT_MODEL_ID = "realcugan-standard"
+private const val MAX_SOURCE_DISPLAY_NAME_LENGTH = 512
