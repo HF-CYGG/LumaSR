@@ -1325,10 +1325,16 @@ SuperResNativeCode run_ncnn_image(
     }
 
     const int tileSize = std::max(32, params.tileSize);
+    if (!safe_mul_leq(tileSize, params.scale, kMaxIntDimension)) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    const int maximumBandHeight = static_cast<int>(
+        static_cast<long long>(tileSize) * params.scale
+    );
     performance.tileSize = tileSize;
     const int tileOverlap = std::min(32, std::max(8, tileSize / 4));
-    const int tilesX = (image.width + tileSize - 1) / tileSize;
-    const int tilesY = (image.height + tileSize - 1) / tileSize;
+    const int tilesX = 1 + (image.width - 1) / tileSize;
+    const int tilesY = 1 + (image.height - 1) / tileSize;
     const int totalTiles = tilesX * tilesY;
     const int outputW = image.width * params.scale;
     const int outputH = image.height * params.scale;
@@ -1349,7 +1355,7 @@ SuperResNativeCode run_ncnn_image(
             bufferW,
             bufferH,
             useCroppedOutput,
-            tileSize * params.scale
+            maximumBandHeight
         );
     if (outputInitialization != SuperResNativeCode::Ok) {
         return outputInitialization;
