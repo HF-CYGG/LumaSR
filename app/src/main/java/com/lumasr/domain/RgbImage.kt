@@ -6,13 +6,11 @@ class RgbImage(
     bytes: ByteArray
 ) {
     val byteCount: Int = checkedByteCount(width, height)
-    private val channels = bytes.copyOf()
-
-    init {
-        require(bytes.size == byteCount) {
+    private val channels = bytes.also { source ->
+        require(source.size == byteCount) {
             "RGB byte count ${bytes.size} does not match ${width}x${height}x$CHANNEL_COUNT"
         }
-    }
+    }.copyOf()
 
     fun copyBytes(): ByteArray = channels.copyOf()
 

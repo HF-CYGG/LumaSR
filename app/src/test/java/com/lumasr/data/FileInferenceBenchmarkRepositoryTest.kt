@@ -116,6 +116,38 @@ class FileInferenceBenchmarkRepositoryTest {
     }
 
     @Test
+    fun quarantinesWrongJsonScalarTypesAndNonCanonicalInfinity() = runBlocking {
+        val validIdentity = """
+            {"schemaKey":"benchmark-v1","engineKey":"ncnn-v1:realcugan-x4plus",
+             "profileHash":"profile-a","deviceFingerprint":"$DEVICE_HASH_A",
+             "gpuDriverVersion":"driver-v1"}
+        """.trimIndent().replace("\n", "")
+        val cases = listOf(
+            "wrong-string-type" to validIdentity.replace("\"schemaKey\":\"benchmark-v1\"", "\"schemaKey\":1"),
+            "quoted-number" to validIdentity,
+            "overflow-number" to validIdentity,
+            "noncanonical-infinity" to validIdentity
+        )
+
+        cases.forEach { (name, identityJson) ->
+            val root = temporaryFolder.newFolder(name)
+            val ssim = if (name == "quoted-number") "\"0.999\"" else "0.999"
+            val psnr = when (name) {
+                "overflow-number" -> "1e999"
+                "noncanonical-infinity" -> "\"Infinity\""
+                else -> "48.0"
+            }
+            File(root, "inference-benchmarks.json").writeText(
+                """{"schemaVersion":1,"results":[{"identity":$identityJson,"quality":{"ssim":$ssim,"psnrDb":$psnr,"p99ChannelError":1},"recommendedCommandBatchSize":4,"measuredAtEpochMs":1000,"validUntilEpochMs":2000}]}"""
+            )
+
+            assertEquals(emptyList<InferenceBenchmarkResult>(), FileInferenceBenchmarkRepository(root).list())
+            assertFalse(File(root, "inference-benchmarks.json").exists())
+            assertTrue(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+        }
+    }
+
+    @Test
     fun writeIsAtomicLeavesNoTemporaryFileAndContainsNoRawDeviceOrImageData() = runBlocking {
         val root = temporaryFolder.newFolder("privacy")
         val repository = FileInferenceBenchmarkRepository(root)

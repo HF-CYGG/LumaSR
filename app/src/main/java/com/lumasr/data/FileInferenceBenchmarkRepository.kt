@@ -235,27 +235,40 @@ private object BenchmarkResultJson {
         )
     }
 
-    private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive.content
+    private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive
+        .also { check(it.isString) { "$key must be a JSON string" } }
+        .content
 
-    private fun JsonObject.requiredInt(key: String): Int = getValue(key).jsonPrimitive.int
+    private fun JsonObject.requiredInt(key: String): Int = getValue(key).jsonPrimitive
+        .also { check(!it.isString) { "$key must be a JSON number" } }
+        .int
 
-    private fun JsonObject.requiredLong(key: String): Long = getValue(key).jsonPrimitive.long
+    private fun JsonObject.requiredLong(key: String): Long = getValue(key).jsonPrimitive
+        .also { check(!it.isString) { "$key must be a JSON number" } }
+        .long
 
-    private fun JsonObject.requiredDouble(key: String): Double = getValue(key).jsonPrimitive.double
+    private fun JsonObject.requiredDouble(key: String): Double = getValue(key).jsonPrimitive
+        .also { check(!it.isString) { "$key must be a JSON number" } }
+        .double
+        .also { check(it.isFinite()) { "$key must be finite" } }
 
     private fun JsonObject.requiredPsnr(key: String): Double {
         val primitive = getValue(key).jsonPrimitive
-        return if (primitive.content == POSITIVE_INFINITY) {
+        return if (primitive.isString) {
+            check(primitive.content == POSITIVE_INFINITY) { "$key has an unsupported string value" }
             Double.POSITIVE_INFINITY
         } else {
-            primitive.double
+            primitive.double.also { check(it.isFinite()) { "$key must be finite" } }
         }
     }
 
     private fun JsonObject.requiredArray(key: String): JsonArray = getValue(key).jsonArray
 
-    private fun JsonObject.optionalString(key: String): String? = get(key)
-        ?.takeUnless { it is JsonNull }
-        ?.jsonPrimitive
-        ?.contentOrNull
+    private fun JsonObject.optionalString(key: String): String? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(it.isString) { "$key must be a JSON string or null" } }
+            .contentOrNull
+    }
 }

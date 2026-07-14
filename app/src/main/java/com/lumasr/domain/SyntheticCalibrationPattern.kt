@@ -24,18 +24,19 @@ object SyntheticCalibrationPattern {
                 val blockY = (y.toLong() * 2L / height).toInt().coerceAtMost(1)
                 val block = blockOffsets[blockY * 3 + blockX]
                 val checker = if (((x / 2) + (y / 2)) and 1 == 0) 30 else -30
-                val base = intArrayOf(
-                    (x.toLong() * 255L / xDenominator).toInt(),
-                    (y.toLong() * 255L / yDenominator).toInt(),
-                    ((x.toLong() + y.toLong()) * 255L / diagonalDenominator).toInt()
-                )
+                val baseRed = (x.toLong() * 255L / xDenominator).toInt()
+                val baseGreen = (y.toLong() * 255L / yDenominator).toInt()
+                val baseBlue = ((x.toLong() + y.toLong()) * 255L / diagonalDenominator).toInt()
                 val offset = (y * width + x) * 3
-                for (channel in 0 until 3) {
-                    val noise = random.nextByte().mod(15) - 7
-                    bytes[offset + channel] = (base[channel] + block[channel] + checker + noise)
-                        .coerceIn(0, 255)
-                        .toByte()
-                }
+                bytes[offset] = (baseRed + block[0] + checker + random.nextByte().mod(15) - 7)
+                    .coerceIn(0, 255)
+                    .toByte()
+                bytes[offset + 1] = (baseGreen + block[1] + checker + random.nextByte().mod(15) - 7)
+                    .coerceIn(0, 255)
+                    .toByte()
+                bytes[offset + 2] = (baseBlue + block[2] + checker + random.nextByte().mod(15) - 7)
+                    .coerceIn(0, 255)
+                    .toByte()
             }
         }
         return RgbImage(width, height, bytes)
