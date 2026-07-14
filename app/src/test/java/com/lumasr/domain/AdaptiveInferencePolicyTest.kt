@@ -110,7 +110,8 @@ class AdaptiveInferencePolicyTest {
         val cached = BenchmarkIdentity(
             schemaKey = "benchmark-v1",
             engineKey = "ncnn-20260526",
-            deviceFingerprint = "google/husky/release-keys",
+            profileHash = "device-capability-v1:profile-a",
+            deviceFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             gpuDriverVersion = "r42p0"
         )
 
@@ -130,7 +131,13 @@ class AdaptiveInferencePolicyTest {
         assertFalse(
             AdaptiveInferencePolicy.isBenchmarkValid(
                 cached,
-                cached.copy(deviceFingerprint = "google/husky/dev-keys")
+                cached.copy(profileHash = "device-capability-v1:profile-b")
+            )
+        )
+        assertFalse(
+            AdaptiveInferencePolicy.isBenchmarkValid(
+                cached,
+                cached.copy(deviceFingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             )
         )
         assertFalse(
@@ -633,7 +640,8 @@ class AdaptiveInferencePolicyTest {
     private fun benchmarkIdentity() = BenchmarkIdentity(
         schemaKey = "benchmark-v1",
         engineKey = "ncnn-test",
-        deviceFingerprint = "device-test",
+        profileHash = "device-capability-v1:test-profile",
+        deviceFingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         gpuDriverVersion = "driver-v1"
     )
 

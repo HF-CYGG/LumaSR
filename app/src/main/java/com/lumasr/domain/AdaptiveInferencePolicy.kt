@@ -49,9 +49,38 @@ data class Fp16QualityMetrics(
 data class BenchmarkIdentity(
     val schemaKey: String,
     val engineKey: String,
+    val profileHash: String,
     val deviceFingerprint: String,
     val gpuDriverVersion: String?
-)
+) {
+    init {
+        requireNormalizedIdentifier(schemaKey, "Benchmark schema key", MAX_SCHEMA_KEY_LENGTH)
+        requireNormalizedIdentifier(engineKey, "Benchmark engine key", MAX_ENGINE_KEY_LENGTH)
+        requireNormalizedIdentifier(profileHash, "Benchmark profile hash", MAX_PROFILE_HASH_LENGTH)
+        require(DEVICE_FINGERPRINT_HASH.matches(deviceFingerprint)) {
+            "Benchmark device fingerprint must be a lowercase SHA-256 hash"
+        }
+        gpuDriverVersion?.let {
+            requireNormalizedIdentifier(it, "Benchmark GPU driver version", MAX_GPU_DRIVER_LENGTH)
+        }
+    }
+
+    private companion object {
+        const val MAX_SCHEMA_KEY_LENGTH = 64
+        const val MAX_ENGINE_KEY_LENGTH = 256
+        const val MAX_PROFILE_HASH_LENGTH = 256
+        const val MAX_GPU_DRIVER_LENGTH = 256
+        val DEVICE_FINGERPRINT_HASH = Regex("[0-9a-f]{64}")
+
+        fun requireNormalizedIdentifier(value: String, label: String, maxLength: Int) {
+            require(value.isNotBlank()) { "$label must not be blank" }
+            require(value.length <= maxLength) { "$label is too long" }
+            require(value == value.trim() && value.none(Char::isISOControl)) {
+                "$label must be normalized and contain no control characters"
+            }
+        }
+    }
+}
 
 data class InferenceBenchmarkResult(
     val identity: BenchmarkIdentity,
