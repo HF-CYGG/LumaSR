@@ -64,19 +64,50 @@ class UpscaleParamsFactoryTest {
     }
 
     @Test
-    fun fallsBackUnsupportedTileAndHeadroomValuesToSafeDefaults() {
+    fun clampsGpuHeadroomToExpandedNativeRange() {
+        val zeroHeadroom = UpscaleParamsFactory.create(
+            taskId = "task-zero",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            gpuHeadroomPercent = 0
+        )
+        val maximumHeadroom = UpscaleParamsFactory.create(
+            taskId = "task-max",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            gpuHeadroomPercent = 25
+        )
         val params = UpscaleParamsFactory.create(
             taskId = "task-1",
             inputPath = "cache/input.png",
             outputPath = "cache/output.png",
             model = realEsrganModel(),
             resolvedModelDir = "cache/models/realesrgan",
-            tileSize = 333,
             gpuHeadroomPercent = 99
         )
 
+        assertEquals(0, zeroHeadroom.gpuHeadroomPercent)
+        assertEquals(25, maximumHeadroom.gpuHeadroomPercent)
+        assertEquals(25, params.gpuHeadroomPercent)
+        assertEquals(0, UpscaleParamsFactory.sanitizeGpuHeadroomPercent(-1))
+    }
+
+    @Test
+    fun fallsBackUnsupportedTileToSafeDefault() {
+        val params = UpscaleParamsFactory.create(
+            taskId = "task-1",
+            inputPath = "cache/input.png",
+            outputPath = "cache/output.png",
+            model = realEsrganModel(),
+            resolvedModelDir = "cache/models/realesrgan",
+            tileSize = 333
+        )
+
         assertEquals(512, params.tileSize)
-        assertEquals(8, params.gpuHeadroomPercent)
     }
 
     @Test

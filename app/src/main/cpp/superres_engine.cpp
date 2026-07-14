@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "net.h"
+#include "command.h"
 #include "cpu.h"
 #include "gpu.h"
 #include "mat.h"
@@ -67,6 +68,75 @@ struct LoadedNet {
     bool cacheHit = false;
 };
 
+class InvocationVulkanAllocators {
+public:
+    explicit InvocationVulkanAllocators(const ncnn::VulkanDevice* device)
+        : device_(device),
+          blob_(device == nullptr ? nullptr : device->acquire_blob_allocator()),
+          workspace_(device == nullptr ? nullptr : device->acquire_blob_allocator()),
+          staging_(device == nullptr ? nullptr : device->acquire_staging_allocator()) {}
+
+    ~InvocationVulkanAllocators() {
+        if (device_ == nullptr) {
+            return;
+        }
+        if (staging_ != nullptr) {
+            device_->reclaim_staging_allocator(staging_);
+        }
+        if (workspace_ != nullptr) {
+            device_->reclaim_blob_allocator(workspace_);
+        }
+        if (blob_ != nullptr) {
+            device_->reclaim_blob_allocator(blob_);
+        }
+    }
+
+    InvocationVulkanAllocators(const InvocationVulkanAllocators&) = delete;
+    InvocationVulkanAllocators& operator=(const InvocationVulkanAllocators&) = delete;
+
+    bool valid() const {
+        return device_ != nullptr && blob_ != nullptr && workspace_ != nullptr && staging_ != nullptr;
+    }
+
+    ncnn::VkAllocator* blob() const {
+        return blob_;
+    }
+
+    ncnn::VkAllocator* workspace() const {
+        return workspace_;
+    }
+
+    ncnn::VkAllocator* staging() const {
+        return staging_;
+    }
+
+    ncnn::Option attach_to(const ncnn::Option& base) const {
+        ncnn::Option option = base;
+        option.blob_vkallocator = blob_;
+        option.workspace_vkallocator = workspace_;
+        option.staging_vkallocator = staging_;
+        return option;
+    }
+
+private:
+    const ncnn::VulkanDevice* device_;
+    ncnn::VkAllocator* blob_;
+    ncnn::VkAllocator* workspace_;
+    ncnn::VkAllocator* staging_;
+};
+
+struct OptimizedVulkanTileWork {
+    int tileX;
+    int tileY;
+    int tileW;
+    int tileH;
+    TileInputRegion region;
+    ncnn::Mat input;
+    ncnn::VkMat uploaded;
+    ncnn::VkMat inferred;
+    ncnn::Mat downloaded;
+};
+
 NetCacheEntry net_cache;
 std::vector<NetCacheEntry> net_cache_entries;
 
@@ -83,10 +153,6 @@ bool is_regular_file(const std::string& path) {
 
 const char* acceleration_name(bool useVulkan) {
     return useVulkan ? "vulkan" : "cpu";
-}
-
-int clamp_gpu_headroom_percent(int value) {
-    return std::min(10, std::max(5, value));
 }
 
 SuperResNativeBackend native_backend_from_code(int code) {
@@ -144,11 +210,7 @@ std::string make_net_cache_key(
     const SuperResExecutionProfile& profile
 ) {
     return files.paramPath + "|" + files.binPath + "|" +
-        (useVulkan ? "vulkan" : "cpu") + "|" +
-        std::to_string(static_cast<int>(profile.effectiveBackend)) + "|" +
-        std::to_string(static_cast<int>(profile.effectivePrecision)) + "|" +
-        std::to_string(profile.cpuThreads) + "|" +
-        std::to_string(profile.openmpBlocktimeMs);
+        serialize_execution_cache_identity(useVulkan, profile);
 }
 
 void trim_cached_nets_locked(int requestedCapacity) {
@@ -229,12 +291,11 @@ void sleep_for_gpu_headroom(
     int gpuHeadroomPercent,
     const std::chrono::steady_clock::duration& elapsed
 ) {
-    const int headroom = clamp_gpu_headroom_percent(gpuHeadroomPercent);
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    if (elapsedMs <= 0) {
+    const long long sleepMs = calculate_gpu_headroom_sleep_ms(gpuHeadroomPercent, elapsedMs);
+    if (sleepMs <= 0) {
         return;
     }
-    const long long sleepMs = std::min<long long>(20, std::max<long long>(1, elapsedMs * headroom / (100 - headroom)));
     std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
 }
 
@@ -742,6 +803,233 @@ void log_tile_output_mismatch(
     );
 }
 
+SuperResNativeCode run_optimized_vulkan_tiles(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const LoadedImage& image,
+    const ModelFiles& files,
+    ncnn::Net& net,
+    const SuperResExecutionProfile& executionProfile,
+    int tileSize,
+    int tileOverlap,
+    int tilesX,
+    int tilesY,
+    int bufferW,
+    int bufferH,
+    int outputW,
+    int outputH,
+    bool useCroppedOutput,
+    std::vector<unsigned char>& output,
+    long long& coveredPixels,
+    int& completed,
+    SuperResNativePerformance& performance
+) {
+    const ncnn::VulkanDevice* device = net.vulkan_device();
+    InvocationVulkanAllocators allocators(device);
+    if (!allocators.valid()) {
+        return SuperResNativeCode::VulkanFailed;
+    }
+    const ncnn::Option executionOption = allocators.attach_to(net.opt);
+    const int totalTiles = tilesX * tilesY;
+    int firstTile = 0;
+
+    while (firstTile < totalTiles) {
+        const bool cancellationRequested = is_cancelled(params.taskId);
+        const SuperResCommandBatchPlan plan = plan_command_batch(
+            totalTiles,
+            executionProfile.commandBatchSize,
+            firstTile,
+            cancellationRequested
+        );
+        if (!plan.shouldRecord) {
+            return cancellationRequested ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+        }
+
+        const auto batchStart = std::chrono::steady_clock::now();
+        std::vector<OptimizedVulkanTileWork> batch;
+        std::vector<std::unique_ptr<ncnn::Extractor>> extractors;
+        batch.reserve(static_cast<size_t>(plan.tileCount));
+        extractors.reserve(static_cast<size_t>(plan.tileCount));
+        ncnn::VkCompute command(device);
+
+        for (int offset = 0; offset < plan.tileCount; ++offset) {
+            const int tileIndex = plan.firstTile + offset;
+            const int tx = tileIndex % tilesX;
+            const int ty = tileIndex / tilesX;
+            const int tileX = tx * tileSize;
+            const int tileY = ty * tileSize;
+            const int tileW = std::min(tileSize, image.width - tileX);
+            const int tileH = std::min(tileSize, image.height - tileY);
+            const TileInputRegion region = params.engineType == kEngineWaifu2x
+                ? make_waifu2x_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                : params.engineType == kEngineRealCugan
+                    ? make_realcugan_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                    : make_overlapped_tile_region(
+                        image.width,
+                        image.height,
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        tileSize,
+                        tileOverlap,
+                        params.scale
+                    );
+
+            const auto inputStart = std::chrono::steady_clock::now();
+            ncnn::Mat input = make_input_tile(
+                image,
+                region.inputX,
+                region.inputY,
+                region.inputW,
+                region.inputH
+            );
+            performance.tileInputMs += elapsed_ms(inputStart);
+            batch.push_back(OptimizedVulkanTileWork{
+                tileX,
+                tileY,
+                tileW,
+                tileH,
+                region,
+                input,
+                ncnn::VkMat{},
+                ncnn::VkMat{},
+                ncnn::Mat{}
+            });
+            OptimizedVulkanTileWork& work = batch.back();
+
+            const auto uploadStart = std::chrono::steady_clock::now();
+            command.record_upload(work.input, work.uploaded, executionOption);
+            performance.uploadMs += elapsed_ms(uploadStart);
+            if (work.uploaded.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+
+            auto extractor = std::make_unique<ncnn::Extractor>(net.create_extractor());
+            extractor->set_blob_vkallocator(allocators.blob());
+            extractor->set_workspace_vkallocator(allocators.workspace());
+            extractor->set_staging_vkallocator(allocators.staging());
+            const auto inferenceStart = std::chrono::steady_clock::now();
+            if (extractor->input(files.inputBlob, work.uploaded) != 0 ||
+                extractor->extract(files.outputBlob, work.inferred, command) != 0) {
+                performance.inferenceMs += elapsed_ms(inferenceStart);
+                return SuperResNativeCode::VulkanFailed;
+            }
+            performance.inferenceMs += elapsed_ms(inferenceStart);
+            if (work.inferred.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+            extractors.push_back(std::move(extractor));
+
+            const auto downloadStart = std::chrono::steady_clock::now();
+            command.record_download(work.inferred, work.downloaded, executionOption);
+            performance.downloadMs += elapsed_ms(downloadStart);
+        }
+
+        // ncnn exposes one synchronization result for the complete command buffer; keep it in inference time.
+        const auto submitStart = std::chrono::steady_clock::now();
+        if (command.submit_and_wait() != 0) {
+            performance.inferenceMs += elapsed_ms(submitStart);
+            return SuperResNativeCode::VulkanFailed;
+        }
+        performance.inferenceMs += elapsed_ms(submitStart);
+
+        if (is_cancelled(params.taskId)) {
+            return SuperResNativeCode::Cancelled;
+        }
+
+        for (size_t index = 0; index < batch.size(); ++index) {
+            if (index > 0 && is_cancelled(params.taskId)) {
+                return SuperResNativeCode::Cancelled;
+            }
+            OptimizedVulkanTileWork& work = batch[index];
+            if (work.downloaded.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+
+            ncnn::Mat copySource;
+            if (!normalize_output_tile_for_copy(work.downloaded, copySource, performance.tileCopyMs)) {
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-normalize",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResNativeCode::TileOutputMismatch;
+            }
+
+            const auto copyStart = std::chrono::steady_clock::now();
+            if (!copy_output_tile(
+                    copySource,
+                    output,
+                    coveredPixels,
+                    params.engineType == kEngineRealCugan && params.scale == 4 ? &image : nullptr,
+                    bufferW,
+                    bufferH,
+                    outputW,
+                    outputH,
+                    work.region.cropX,
+                    work.region.cropY,
+                    work.region.dstX,
+                    work.region.dstY,
+                    work.region.copyW,
+                    work.region.copyH,
+                    useCroppedOutput,
+                    params.outputCropLeft,
+                    params.outputCropTop,
+                    params.outputCropWidth,
+                    params.outputCropHeight,
+                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
+                    params.engineType == kEngineRealCugan && params.scale == 4
+                )) {
+                performance.tileCopyMs += elapsed_ms(copyStart);
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-copy",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResNativeCode::TileOutputMismatch;
+            }
+            performance.tileCopyMs += elapsed_ms(copyStart);
+
+            completed += 1;
+            const float progress = 0.12f + 0.78f * (static_cast<float>(completed) / totalTiles);
+            emit(
+                onProgress,
+                SuperResNativeStage::ProcessingTile,
+                completed,
+                totalTiles,
+                progress,
+                "Processing tile " + std::to_string(completed) + "/" + std::to_string(totalTiles)
+            );
+        }
+
+        firstTile += plan.tileCount;
+        sleep_for_gpu_headroom(
+            params.gpuHeadroomPercent,
+            std::chrono::steady_clock::now() - batchStart
+        );
+        if (is_cancelled(params.taskId)) {
+            return SuperResNativeCode::Cancelled;
+        }
+    }
+
+    return SuperResNativeCode::Ok;
+}
+
 SuperResNativeCode run_ncnn_image(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
@@ -750,6 +1038,11 @@ SuperResNativeCode run_ncnn_image(
     long long decodeMs
 ) {
     const auto totalStart = std::chrono::steady_clock::now();
+    static const bool executionProfileChecksPass = run_execution_profile_runtime_checks();
+    if (!executionProfileChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Execution profile runtime checks failed");
+        return SuperResNativeCode::InvalidParams;
+    }
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
     performance.decodeMs = decodeMs;
@@ -857,6 +1150,36 @@ SuperResNativeCode run_ncnn_image(
 
     int completed = 0;
     long long coveredPixels = 0;
+    const bool useExplicitVulkanPath =
+        should_use_optimized_vulkan_path(executionProfile.effectiveBackend, useVulkan) &&
+        !params.tta;
+    if (useExplicitVulkanPath) {
+        const SuperResNativeCode optimizedCode = run_optimized_vulkan_tiles(
+            params,
+            onProgress,
+            image,
+            files,
+            *net,
+            executionProfile,
+            tileSize,
+            tileOverlap,
+            tilesX,
+            tilesY,
+            bufferW,
+            bufferH,
+            outputW,
+            outputH,
+            useCroppedOutput,
+            output,
+            coveredPixels,
+            completed,
+            performance
+        );
+        if (optimizedCode != SuperResNativeCode::Ok) {
+            return optimizedCode;
+        }
+        performance.tileExtractMs = performance.inferenceMs;
+    } else {
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
             if (is_cancelled(params.taskId)) {
@@ -1084,6 +1407,7 @@ SuperResNativeCode run_ncnn_image(
             );
         }
     }
+    }
 
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
     const long long expectedCoveredPixels = static_cast<long long>(bufferW) * bufferH;
@@ -1124,7 +1448,9 @@ SuperResNativeCode run_ncnn_image(
     }
     performance.saveMs = elapsed_ms(saveStart);
     performance.preprocessMs = performance.tileInputMs;
-    performance.inferenceMs = performance.tileExtractMs;
+    if (!useExplicitVulkanPath) {
+        performance.inferenceMs = performance.tileExtractMs;
+    }
     performance.postprocessMs = performance.tileCopyMs;
     performance.encodeMs = performance.saveMs;
     performance.totalMs = elapsed_ms(totalStart);

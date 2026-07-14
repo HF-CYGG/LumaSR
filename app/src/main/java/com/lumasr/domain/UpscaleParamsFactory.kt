@@ -165,7 +165,7 @@ object UpscaleParamsFactory {
     }
 
     fun sanitizeGpuHeadroomPercent(value: Int): Int {
-        return if (value in 5..10) value else DEFAULT_GPU_HEADROOM_PERCENT
+        return value.coerceIn(0, 25)
     }
 
     private fun sanitizeAccelerationMode(

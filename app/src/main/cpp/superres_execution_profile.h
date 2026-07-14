@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 
 enum class SuperResNativeBackend {
     LegacySafe = 0,
@@ -121,3 +122,62 @@ constexpr std::size_t cache_entries_to_trim(std::size_t currentSize, int request
     );
     return currentSize > capacity ? currentSize - capacity : 0;
 }
+
+constexpr int sanitize_gpu_headroom_percent(int value) {
+    return clamp_execution_value(value, 0, 25);
+}
+
+constexpr long long calculate_gpu_headroom_sleep_ms(int requestedPercent, long long elapsedMs) {
+    const int headroom = sanitize_gpu_headroom_percent(requestedPercent);
+    if (headroom == 0 || elapsedMs <= 0) {
+        return 0;
+    }
+    const long long calculated = elapsedMs * headroom / (100 - headroom);
+    return calculated < 1 ? 1 : calculated > 20 ? 20 : calculated;
+}
+
+struct SuperResCommandBatchPlan {
+    int firstTile = 0;
+    int tileCount = 0;
+    bool shouldRecord = false;
+};
+
+constexpr SuperResCommandBatchPlan plan_command_batch(
+    int totalTiles,
+    int requestedBatchSize,
+    int firstTile,
+    bool cancellationRequested
+) {
+    const int safeTotal = totalTiles < 0 ? 0 : totalTiles;
+    const int safeFirst = firstTile < 0 ? 0 : firstTile;
+    if (cancellationRequested || safeFirst >= safeTotal) {
+        return SuperResCommandBatchPlan{safeFirst, 0, false};
+    }
+    const int batchSize = clamp_execution_value(requestedBatchSize, 1, 8);
+    const int remaining = safeTotal - safeFirst;
+    return SuperResCommandBatchPlan{
+        safeFirst,
+        remaining < batchSize ? remaining : batchSize,
+        true
+    };
+}
+
+constexpr bool should_use_optimized_vulkan_path(
+    SuperResNativeBackend backend,
+    bool useVulkan
+) {
+    return backend == SuperResNativeBackend::Optimized && useVulkan;
+}
+
+inline std::string serialize_execution_cache_identity(
+    bool useVulkan,
+    const SuperResExecutionProfile& profile
+) {
+    return std::string("device=") + (useVulkan ? "vulkan" : "cpu") +
+        "|backend=" + std::to_string(static_cast<int>(profile.effectiveBackend)) +
+        "|precision=" + std::to_string(static_cast<int>(profile.effectivePrecision)) +
+        "|threads=" + std::to_string(profile.cpuThreads) +
+        "|blocktime_ms=" + std::to_string(profile.openmpBlocktimeMs);
+}
+
+bool run_execution_profile_runtime_checks();
