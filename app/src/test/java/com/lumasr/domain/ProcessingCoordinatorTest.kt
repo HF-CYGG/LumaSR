@@ -260,6 +260,80 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun ownerHandoffCancelsNativeAndWaitsForQueuedRecoveryBeforeReturning() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("owner-handoff"), spec("owner-handoff"))
+            assertEquals("owner-handoff", runner.awaitStarted())
+
+            val handoff = async(Dispatchers.Default) {
+                coordinator.relinquishForOwnerHandoff()
+            }
+            withTimeout(5_000L) {
+                while (runner.cancelled.isEmpty()) delay(10L)
+            }
+
+            assertEquals(listOf("owner-handoff"), runner.cancelled)
+            assertFalse(handoff.isCompleted)
+
+            runner.complete("owner-handoff")
+            withTimeout(5_000L) { handoff.await() }
+
+            assertEquals(ProcessingTaskState.QUEUED, tasks.find("owner-handoff")?.state)
+            assertEquals(ProcessingTaskState.QUEUED, coordinator.taskState("owner-handoff"))
+            assertFalse(
+                tasks.saved.any {
+                    it.id == "owner-handoff" &&
+                        it.state in setOf(ProcessingTaskState.PAUSED, ProcessingTaskState.CANCELLED)
+                }
+            )
+        } finally {
+            runner.completeIfStarted("owner-handoff")
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun nextCoordinatorResumesRelinquishedTaskOnceWithoutLateCompletion() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val oldRunner = GateRunner(ignoreCoroutineCancellation = true)
+        val oldCoordinator = coordinator(tasks, work, oldRunner)
+        oldCoordinator.start()
+        oldCoordinator.enqueue(task("handoff-resume"), spec("handoff-resume"))
+        assertEquals("handoff-resume", oldRunner.awaitStarted())
+
+        val handoff = async(Dispatchers.Default) {
+            oldCoordinator.relinquishForOwnerHandoff()
+        }
+        withTimeout(5_000L) {
+            while (oldRunner.cancelled.isEmpty()) delay(10L)
+        }
+        oldRunner.complete("handoff-resume")
+        withTimeout(5_000L) { handoff.await() }
+        oldCoordinator.close()
+
+        assertEquals(ProcessingTaskState.QUEUED, tasks.find("handoff-resume")?.state)
+        val newRunner = GateRunner()
+        val newCoordinator = coordinator(tasks, work, newRunner)
+        try {
+            newCoordinator.resumePersistedWork()
+            assertEquals("handoff-resume", newRunner.awaitStarted())
+            newRunner.complete("handoff-resume")
+            newCoordinator.awaitState("handoff-resume", ProcessingTaskState.COMPLETED)
+
+            assertEquals(1, oldRunner.startedIds.count { it == "handoff-resume" })
+            assertEquals(1, newRunner.startedIds.count { it == "handoff-resume" })
+        } finally {
+            newCoordinator.close()
+        }
+    }
+
+    @Test
     fun pauseTimeoutReturnsWithoutAllowingResumeToOverlapOldExecution() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()

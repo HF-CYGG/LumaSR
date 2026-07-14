@@ -1,6 +1,10 @@
 package com.lumasr.domain
 
 import java.io.File
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -45,6 +49,24 @@ class ProcessingSnapshotBridgeTest {
 
         assertNull(bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK))
         assertTrue(service.publish(listOf(snapshot("service"))))
+    }
+
+    @Test
+    fun serviceRevokesFallbackAndWaitsForItsReleaseBarrier() = runBlocking {
+        val bridge = ProcessingSnapshotBridge()
+        val fallback = requireNotNull(bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK))
+
+        val fallbackRevoked = async { fallback.awaitRevocation() }
+        val service = requireNotNull(bridge.acquire(ProcessingSnapshotOwner.SERVICE))
+        withTimeout(1_000L) { fallbackRevoked.await() }
+
+        val serviceReady = async { service.awaitPredecessorRelease() }
+        delay(50L)
+        assertFalse(serviceReady.isCompleted)
+
+        assertFalse(fallback.release())
+        withTimeout(1_000L) { serviceReady.await() }
+        assertTrue(service.publish(listOf(snapshot("service-after-release"))))
     }
 
     private fun snapshot(id: String): ProcessingTaskSnapshot {

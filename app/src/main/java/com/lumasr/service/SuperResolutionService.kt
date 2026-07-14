@@ -38,6 +38,7 @@ class SuperResolutionService : Service() {
     private lateinit var notificationManager: NotificationManager
     private lateinit var coordinator: ProcessingCoordinator
     private lateinit var snapshotLease: ProcessingSnapshotLease
+    private lateinit var ownerHandoff: ProcessingServiceOwnerHandoff
 
     override fun onCreate() {
         super.onCreate()
@@ -47,6 +48,7 @@ class SuperResolutionService : Service() {
         snapshotLease = checkNotNull(
             ApplicationProcessingSnapshotBridge.acquire(ProcessingSnapshotOwner.SERVICE)
         )
+        ownerHandoff = ProcessingServiceOwnerHandoff(snapshotLease)
 
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
         coordinator = ProcessingCoordinator(
@@ -68,18 +70,30 @@ class SuperResolutionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val operation = lifecycleGate.beginOperation(startId)
         when (intent?.action) {
-            ACTION_RESUME -> launchOperation(operation) { coordinator.resumePersistedWork() }
+            ACTION_RESUME -> launchOperation(operation) {
+                ownerHandoff.runAfterPredecessorRelease {
+                    coordinator.resumePersistedWork()
+                }
+            }
             ACTION_CANCEL -> {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID)
                 if (!taskId.isNullOrBlank()) {
-                    launchOperation(operation) { coordinator.cancel(taskId) }
+                    launchOperation(operation) {
+                        ownerHandoff.runAfterPredecessorRelease {
+                            coordinator.cancel(taskId)
+                        }
+                    }
                 } else {
                     lifecycleGate.completeOperation(operation)
                     stopIfIdle(coordinator.snapshots.value)
                 }
             }
 
-            else -> launchOperation(operation) { coordinator.resumePersistedWork() }
+            else -> launchOperation(operation) {
+                ownerHandoff.runAfterPredecessorRelease {
+                    coordinator.resumePersistedWork()
+                }
+            }
         }
         return START_STICKY
     }

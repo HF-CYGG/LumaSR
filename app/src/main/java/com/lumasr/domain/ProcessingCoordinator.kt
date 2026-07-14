@@ -82,6 +82,7 @@ class ProcessingCoordinator(
     private val lastProgressAtMs = mutableMapOf<String, Long>()
     private val lastProgressStage = mutableMapOf<String, UpscaleStage>()
     private val started = AtomicBoolean(false)
+    private val relinquishing = AtomicBoolean(false)
     private var workerJob: Job? = null
     private var activeExecution: ActiveExecution? = null
     private val _snapshots = MutableStateFlow<List<ProcessingTaskSnapshot>>(emptyList())
@@ -89,6 +90,7 @@ class ProcessingCoordinator(
     val snapshots: StateFlow<List<ProcessingTaskSnapshot>> = _snapshots.asStateFlow()
 
     suspend fun start() {
+        check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
         if (!started.compareAndSet(false, true)) return
         try {
             ensureWorker()
@@ -101,6 +103,7 @@ class ProcessingCoordinator(
     }
 
     suspend fun resumePersistedWork() {
+        check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
         if (started.get()) {
             ensureWorker()
             refreshQueue()
@@ -219,6 +222,33 @@ class ProcessingCoordinator(
         }
     }
 
+    /**
+     * Stops this owner without terminalizing its active task. The next owner may start only after
+     * native cancellation, worker shutdown, and durable RUNNING-to-QUEUED recovery complete.
+     */
+    suspend fun relinquishForOwnerHandoff() = withContext(NonCancellable) {
+        relinquishing.set(true)
+        workerMutex.withLock {
+            val execution = stateMutex.withLock {
+                val active = activeExecution
+                val taskId = active?.taskId
+                    ?: tasksById.values.firstOrNull { it.state == ProcessingTaskState.RUNNING }?.id
+                OwnerHandoffExecution(taskId = taskId, active = active)
+            }
+            execution.taskId?.let { taskId ->
+                runCatching { runner.cancel(taskId) }
+            }
+            execution.active?.result?.cancel(
+                CancellationException("Task relinquished for processing owner handoff")
+            )
+            val worker = workerJob
+            worker?.cancel(CancellationException("Coordinator relinquished processing ownership"))
+            execution.active?.result?.join()
+            worker?.join()
+            execution.taskId?.let { recoverTaskForOwnerHandoff(it) }
+        }
+    }
+
     override fun close() {
         queue.close()
         scope.cancel()
@@ -313,6 +343,7 @@ class ProcessingCoordinator(
 
     private suspend fun ensureWorker() {
         workerMutex.withLock {
+            check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
             val current = workerJob
             if (current?.isActive == true) return@withLock
             current?.join()
@@ -325,7 +356,7 @@ class ProcessingCoordinator(
         val workSpec = workSpecRepository.find(taskId)
         val running = stateMutex.withLock {
             val task = tasksById[taskId] ?: taskRepository.find(taskId)
-            if (task == null || task.state != ProcessingTaskState.QUEUED) {
+            if (relinquishing.get() || task == null || task.state != ProcessingTaskState.QUEUED) {
                 enqueuedTaskIds.remove(taskId)
                 return
             }
@@ -388,6 +419,7 @@ class ProcessingCoordinator(
 
     private suspend fun finalizeResult(taskAtStart: ProcessingTask, result: ProcessingRunResult) {
         stateMutex.withLock {
+            if (relinquishing.get()) return
             val current = tasksById[taskAtStart.id] ?: return
             if (current.state.isTerminal || current.state == ProcessingTaskState.PAUSED) return
             if (current.state != ProcessingTaskState.RUNNING) return
@@ -437,6 +469,35 @@ class ProcessingCoordinator(
         }
     }
 
+    private suspend fun recoverTaskForOwnerHandoff(taskId: String) {
+        stateMutex.withLock {
+            val inMemory = tasksById[taskId]
+            val persisted = taskRepository.find(taskId)
+            val current = when {
+                persisted == null -> inMemory
+                inMemory == null -> persisted
+                persisted.updatedAtEpochMs >= inMemory.updatedAtEpochMs -> persisted
+                else -> inMemory
+            } ?: return@withLock
+            val recovered = if (current.state == ProcessingTaskState.RUNNING) {
+                val workSpec = workSpecRepository.find(taskId)
+                TaskRecoveryPolicy.recover(
+                    task = current,
+                    mode = recoveryMode(current, workSpec),
+                    atEpochMs = safeNow(current)
+                ).also { taskRepository.save(it) }
+            } else {
+                current
+            }
+            check(recovered.state != ProcessingTaskState.RUNNING) {
+                "Owner handoff cannot release a running task"
+            }
+            tasksById[taskId] = recovered
+            clearWorkerBookkeeping(taskId)
+            publishTask(recovered)
+        }
+    }
+
     private fun publishTask(task: ProcessingTask) {
         _snapshots.update { snapshots ->
             val previous = snapshots.firstOrNull { it.task.id == task.id }
@@ -477,6 +538,11 @@ class ProcessingCoordinator(
 
     private data class PausedExecution(
         val taskId: String,
+        val active: ActiveExecution?
+    )
+
+    private data class OwnerHandoffExecution(
+        val taskId: String?,
         val active: ActiveExecution?
     )
 
