@@ -1,5 +1,7 @@
 #pragma once
 
+#include "superres_capability.h"
+
 #include <functional>
 #include <cstddef>
 #include <string>
@@ -115,6 +117,7 @@ SuperResNativeCode process_superres_rgb(
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();
+SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot();
 SuperResNativeCode merge_raw_tiles_to_png(
     const std::string& outputPath,
     int outputWidth,

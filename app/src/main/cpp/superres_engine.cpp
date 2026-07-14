@@ -1607,6 +1607,67 @@ bool deflate_png_bytes(
 }
 }
 
+SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot() {
+    if (!run_capability_normalization_runtime_checks()) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "Capability normalization runtime checks failed"
+        );
+        return SuperResNativeCapabilitySnapshot{};
+    }
+
+    const SuperResCpuTopology topology = normalize_cpu_topology(
+        ncnn::get_physical_cpu_count(),
+        ncnn::get_physical_big_cpu_count(),
+        ncnn::get_physical_little_cpu_count()
+    );
+    SuperResNativeCapabilitySnapshot snapshot;
+    snapshot.physicalCoreCount = topology.physicalCoreCount;
+    snapshot.bigCoreCount = topology.bigCoreCount;
+    snapshot.littleCoreCount = topology.littleCoreCount;
+
+    std::lock_guard<std::mutex> gpuLock(gpu_mutex);
+    if (!ensure_gpu_instance()) {
+        return snapshot;
+    }
+
+    const int gpuIndex = ncnn::get_default_gpu_index();
+    const int gpuCount = ncnn::get_gpu_count();
+    if (gpuIndex < 0 || gpuIndex >= gpuCount) {
+        return snapshot;
+    }
+
+    const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
+    char vendorIdentity[32] = {};
+    std::snprintf(
+        vendorIdentity,
+        sizeof(vendorIdentity),
+        "vendor=0x%08x",
+        static_cast<unsigned int>(gpuInfo.vendor_id())
+    );
+    char driverIdentity[96] = {};
+    const std::string driverName = sanitize_capability_text(gpuInfo.driver_name(), 48);
+    std::snprintf(
+        driverIdentity,
+        sizeof(driverIdentity),
+        "%s%sid=0x%08x version=0x%08x",
+        driverName.c_str(),
+        driverName.empty() ? "" : " ",
+        static_cast<unsigned int>(gpuInfo.driver_id()),
+        static_cast<unsigned int>(gpuInfo.driver_version())
+    );
+
+    snapshot.gpuVendor = sanitize_capability_text(vendorIdentity);
+    snapshot.gpuDevice = sanitize_capability_text(gpuInfo.device_name());
+    snapshot.gpuDriverVersion = sanitize_capability_text(driverIdentity);
+    snapshot.gpuRoughScore = normalize_gpu_rough_score(gpuInfo.rough_score());
+    snapshot.supportsVulkan = true;
+    snapshot.supportsFp16Storage = gpuInfo.support_fp16_storage();
+    snapshot.supportsFp16Arithmetic = gpuInfo.support_fp16_arithmetic();
+    return snapshot;
+}
+
 using RunNcnnFunction = std::function<SuperResNativeCode(
     const SuperResNativeParams&,
     const SuperResProgressCallback&,

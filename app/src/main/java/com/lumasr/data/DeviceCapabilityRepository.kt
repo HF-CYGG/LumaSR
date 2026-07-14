@@ -28,7 +28,7 @@ fun interface NativeCapabilityProbe {
 }
 
 class AndroidNativeCapabilityProbe(
-    private val snapshotReader: () -> NativeCapabilitySnapshot? = NativeCapabilityJni::readSnapshot
+    private val snapshotReader: () -> NativeCapabilitySnapshot? = NativeCapabilitySource::readSnapshot
 ) : NativeCapabilityProbe {
     override fun snapshot(): NativeCapabilitySnapshot {
         return try {
@@ -41,6 +41,32 @@ class AndroidNativeCapabilityProbe(
             NativeCapabilitySnapshot.UNKNOWN
         }
     }
+}
+
+internal class NativeCapabilitySnapshotReader(
+    private val libraryLoader: () -> Boolean,
+    private val nativeReader: () -> NativeCapabilitySnapshot?
+) {
+    fun readSnapshot(): NativeCapabilitySnapshot? {
+        return if (libraryLoader()) nativeReader() else null
+    }
+}
+
+private object NativeCapabilitySource {
+    private val reader = NativeCapabilitySnapshotReader(
+        libraryLoader = LocalSrNativeLibraryLoader::ensureLoaded,
+        nativeReader = NativeCapabilityJni::readSnapshot
+    )
+
+    fun readSnapshot(): NativeCapabilitySnapshot? = reader.readSnapshot()
+}
+
+private object LocalSrNativeLibraryLoader {
+    private val loaded by lazy {
+        runCatching { System.loadLibrary("localsr") }.isSuccess
+    }
+
+    fun ensureLoaded(): Boolean = loaded
 }
 
 private object NativeCapabilityJni {
@@ -166,7 +192,7 @@ class DeviceCapabilityRepository(
         val values = listOf(
             SCHEMA_KEY,
             android.sdkInt.toString(),
-            android.fingerprint,
+            android.fingerprint.normalizedIdentity(MAX_IDENTITY_STRING_LENGTH),
             android.isLowRamDevice.toString(),
             memoryBucketMb.toString(),
             physicalCoreCount.toString(),
@@ -197,10 +223,23 @@ class DeviceCapabilityRepository(
             ?: MEMORY_BUCKETS_MB.first()
     }
 
-    private fun String?.normalizedOrNull(): String? = this?.trim()?.takeIf { it.isNotEmpty() }
+    private fun String?.normalizedOrNull(): String? {
+        return this
+            ?.filterNot(Char::isISOControl)
+            ?.trim()
+            ?.take(MAX_CAPABILITY_STRING_LENGTH)
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+    }
+
+    private fun String.normalizedIdentity(maxLength: Int): String {
+        return filterNot(Char::isISOControl).trim().take(maxLength)
+    }
 
     companion object {
         const val SCHEMA_KEY = "device-capability-v1"
+        const val MAX_CAPABILITY_STRING_LENGTH = 128
+        private const val MAX_IDENTITY_STRING_LENGTH = 512
         private const val MEBIBYTE = 1_024L * 1_024L
         private val MEMORY_BUCKETS_MB = listOf(
             512,

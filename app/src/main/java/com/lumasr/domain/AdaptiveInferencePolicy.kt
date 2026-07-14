@@ -53,6 +53,12 @@ data class BenchmarkIdentity(
     val gpuDriverVersion: String?
 )
 
+data class InferenceBenchmarkResult(
+    val identity: BenchmarkIdentity,
+    val fp16Quality: Fp16QualityMetrics,
+    val recommendedCommandBatchSize: Int
+)
+
 enum class ThermalLevel {
     NORMAL,
     LIGHT,
@@ -112,6 +118,78 @@ object AdaptiveInferencePolicy {
             tta = false
         )
     }
+
+    fun selectExecutionProfile(
+        device: DeviceCapabilityProfile,
+        accelerationMode: AccelerationMode,
+        ttaEnabled: Boolean,
+        benchmarkResult: InferenceBenchmarkResult?,
+        currentBenchmarkIdentity: BenchmarkIdentity?,
+        currentSafeTileSize: Int
+    ): InferenceExecutionProfile {
+        val safeTileSize = UpscaleParamsFactory.sanitizeTileSize(currentSafeTileSize)
+        val isCapabilityUnknown = device.physicalCoreCount <= 0 || device.memoryBucketMb <= 0
+        val baseProfile = if (device.isLowRamDevice || isCapabilityUnknown) {
+            conservativeFallback(device, safeTileSize).let { fallback ->
+                if (accelerationMode == AccelerationMode.CPU) {
+                    fallback.copy(accelerationMode = AccelerationMode.CPU)
+                } else {
+                    fallback
+                }
+            }
+        } else {
+            val canUseVulkan = accelerationMode != AccelerationMode.CPU && device.supportsVulkan
+            val benchmarkIsValid = benchmarkResult != null &&
+                currentBenchmarkIdentity != null &&
+                isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity)
+            val qualityAllowsFp16 = benchmarkResult?.fp16Quality?.let { quality ->
+                isFp16Eligible(device, quality)
+            } == true
+            val canUseOptimizedFp16 = canUseVulkan &&
+                device.gpuRoughScore?.let { it >= MIN_OPTIMIZED_GPU_ROUGH_SCORE } == true &&
+                benchmarkIsValid &&
+                qualityAllowsFp16
+
+            if (canUseOptimizedFp16) {
+                InferenceExecutionProfile(
+                    backend = NativeBackend.OPTIMIZED,
+                    accelerationMode = accelerationMode,
+                    precision = InferencePrecision.FP16,
+                    cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
+                    tileSize = safeTileSize,
+                    commandBatchSize = benchmarkResult
+                        ?.recommendedCommandBatchSize
+                        ?.coerceIn(1, MAX_COMMAND_BATCH_SIZE)
+                        ?: 1,
+                    gpuHeadroomPercent = 8,
+                    modelCacheCapacity = 2,
+                    tta = false
+                )
+            } else {
+                InferenceExecutionProfile(
+                    backend = NativeBackend.LEGACY_SAFE,
+                    accelerationMode = when {
+                        accelerationMode == AccelerationMode.CPU -> AccelerationMode.CPU
+                        device.supportsVulkan -> accelerationMode
+                        else -> AccelerationMode.AUTO
+                    },
+                    precision = InferencePrecision.FP32,
+                    cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
+                    tileSize = safeTileSize,
+                    commandBatchSize = 1,
+                    gpuHeadroomPercent = 8,
+                    modelCacheCapacity = 1,
+                    tta = false
+                )
+            }
+        }
+
+        return if (ttaEnabled) withTtaEnabled(baseProfile) else baseProfile
+    }
+
+    // ncnn documents scores above 75 as high-end and below 10 as low-end.
+    const val MIN_OPTIMIZED_GPU_ROUGH_SCORE = 75
+    private const val MAX_COMMAND_BATCH_SIZE = 8
 
     fun initialThermalState(profile: InferenceExecutionProfile): ThermalPolicyState {
         return ThermalPolicyState(

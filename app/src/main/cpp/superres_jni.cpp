@@ -131,6 +131,154 @@ bool bitmap_to_rgb(JNIEnv* env, jobject bitmap, std::vector<unsigned char>& rgb,
     AndroidBitmap_unlockPixels(env, bitmap);
     return ok;
 }
+
+jobject box_nullable_int(
+    JNIEnv* env,
+    jclass integer_class,
+    jmethodID integer_value_of,
+    int value,
+    bool present
+) {
+    if (!present || env->ExceptionCheck()) {
+        return nullptr;
+    }
+    return env->CallStaticObjectMethod(
+        integer_class,
+        integer_value_of,
+        static_cast<jint>(value)
+    );
+}
+
+jstring new_nullable_string(JNIEnv* env, const std::string& value) {
+    if (value.empty() || env->ExceptionCheck()) {
+        return nullptr;
+    }
+    return env->NewStringUTF(value.c_str());
+}
+
+void delete_local_ref(JNIEnv* env, jobject reference) {
+    if (reference != nullptr) {
+        env->DeleteLocalRef(reference);
+    }
+}
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
+    JNIEnv* env,
+    jobject
+) {
+    SuperResNativeCapabilitySnapshot snapshot;
+    try {
+        snapshot = read_superres_native_capability_snapshot();
+    } catch (...) {
+        return nullptr;
+    }
+
+    jclass snapshot_class = nullptr;
+    jclass integer_class = nullptr;
+    jobject physical_cores = nullptr;
+    jobject big_cores = nullptr;
+    jobject little_cores = nullptr;
+    jobject rough_score = nullptr;
+    jstring gpu_vendor = nullptr;
+    jstring gpu_device = nullptr;
+    jstring gpu_driver = nullptr;
+    jobject result = nullptr;
+
+    do {
+        snapshot_class = env->FindClass("com/lumasr/data/NativeCapabilitySnapshot");
+        if (snapshot_class == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+        const jmethodID snapshot_constructor = env->GetMethodID(
+            snapshot_class,
+            "<init>",
+            "(Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;ZZZ)V"
+        );
+        if (snapshot_constructor == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+
+        integer_class = env->FindClass("java/lang/Integer");
+        if (integer_class == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+        const jmethodID integer_value_of = env->GetStaticMethodID(
+            integer_class,
+            "valueOf",
+            "(I)Ljava/lang/Integer;"
+        );
+        if (integer_value_of == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+
+        physical_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.physicalCoreCount,
+            snapshot.physicalCoreCount > 0
+        );
+        big_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.bigCoreCount,
+            snapshot.bigCoreCount > 0
+        );
+        little_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.littleCoreCount,
+            snapshot.littleCoreCount > 0
+        );
+        rough_score = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.gpuRoughScore,
+            snapshot.gpuRoughScore >= 0
+        );
+        gpu_vendor = new_nullable_string(env, snapshot.gpuVendor);
+        gpu_device = new_nullable_string(env, snapshot.gpuDevice);
+        gpu_driver = new_nullable_string(env, snapshot.gpuDriverVersion);
+        if (env->ExceptionCheck()) {
+            break;
+        }
+
+        result = env->NewObject(
+            snapshot_class,
+            snapshot_constructor,
+            physical_cores,
+            big_cores,
+            little_cores,
+            gpu_vendor,
+            gpu_device,
+            gpu_driver,
+            rough_score,
+            snapshot.supportsVulkan ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsFp16Storage ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsFp16Arithmetic ? JNI_TRUE : JNI_FALSE
+        );
+    } while (false);
+
+    delete_local_ref(env, physical_cores);
+    delete_local_ref(env, big_cores);
+    delete_local_ref(env, little_cores);
+    delete_local_ref(env, rough_score);
+    delete_local_ref(env, gpu_vendor);
+    delete_local_ref(env, gpu_device);
+    delete_local_ref(env, gpu_driver);
+    delete_local_ref(env, integer_class);
+    delete_local_ref(env, snapshot_class);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    return result;
 }
 
 extern "C"

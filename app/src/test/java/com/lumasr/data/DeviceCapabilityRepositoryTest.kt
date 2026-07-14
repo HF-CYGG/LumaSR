@@ -93,12 +93,69 @@ class DeviceCapabilityRepositoryTest {
     }
 
     @Test
+    fun releaseRulesKeepCapabilityJniAndReflectedSnapshotConstructor() {
+        val rules = File("proguard-rules.pro").readText()
+
+        assertTrue(rules.contains("-keep class com.lumasr.data.NativeCapabilityJni"))
+        assertTrue(rules.contains("native <methods>;"))
+        assertTrue(rules.contains("-keep class com.lumasr.data.NativeCapabilitySnapshot"))
+        assertTrue(
+            rules.contains(
+                "public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer," +
+                    "java.lang.String,java.lang.String,java.lang.String,java.lang.Integer," +
+                    "boolean,boolean,boolean);"
+            )
+        )
+    }
+
+    @Test
     fun androidNativeProbeFailsClosedWhenJniIsUnavailable() {
         val probe = AndroidNativeCapabilityProbe {
             throw UnsatisfiedLinkError("JNI is not installed yet")
         }
 
         assertEquals(NativeCapabilitySnapshot.UNKNOWN, probe.snapshot())
+    }
+
+    @Test
+    fun libraryLoadFailureSkipsNativeCapabilityCall() {
+        var nativeCalls = 0
+        val reader = NativeCapabilitySnapshotReader(
+            libraryLoader = { false },
+            nativeReader = {
+                nativeCalls += 1
+                NativeCapabilitySnapshot(physicalCoreCount = 8)
+            }
+        )
+
+        assertNull(reader.readSnapshot())
+        assertEquals(0, nativeCalls)
+    }
+
+    @Test
+    fun sanitizesPartialNativeSnapshotBeforePublishingOrHashing() {
+        val unboundedVendor = "\u0000  " + "V".repeat(256) + "  \u0007"
+        val profile = repository(
+            nativeSnapshot = NativeCapabilitySnapshot(
+                physicalCoreCount = 6,
+                bigCoreCount = null,
+                littleCoreCount = 4,
+                gpuVendor = unboundedVendor,
+                gpuDevice = "  Partial GPU  ",
+                gpuDriverVersion = "\u0000\t\r\n",
+                gpuRoughScore = -1,
+                supportsVulkan = false
+            )
+        ).loadProfile()
+
+        assertEquals(6, profile.physicalCoreCount)
+        assertNull(profile.bigCoreCount)
+        assertEquals(4, profile.littleCoreCount)
+        assertEquals(DeviceCapabilityRepository.MAX_CAPABILITY_STRING_LENGTH, profile.gpuVendor?.length)
+        assertTrue(profile.gpuVendor.orEmpty().all { !it.isISOControl() })
+        assertEquals("Partial GPU", profile.gpuDevice)
+        assertNull(profile.gpuDriverVersion)
+        assertNull(profile.gpuRoughScore)
     }
 
     private fun repository(

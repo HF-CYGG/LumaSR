@@ -323,6 +323,190 @@ class AdaptiveInferencePolicyTest {
         assertTrue(ttaProfile.tileSize in UpscaleParamsFactory.supportedTileSizes)
     }
 
+    @Test
+    fun selectsOptimizedFp16OnlyForMatchingQualifiedBenchmark() {
+        val identity = benchmarkIdentity()
+        val benchmark = InferenceBenchmarkResult(
+            identity = identity,
+            fp16Quality = passingQuality(),
+            recommendedCommandBatchSize = 3
+        )
+
+        val optimized = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity.copy(),
+            currentSafeTileSize = 512
+        )
+
+        assertEquals(NativeBackend.OPTIMIZED, optimized.backend)
+        assertEquals(AccelerationMode.VULKAN, optimized.accelerationMode)
+        assertEquals(InferencePrecision.FP16, optimized.precision)
+        assertEquals(3, optimized.commandBatchSize)
+        assertEquals(2, optimized.modelCacheCapacity)
+
+        val stale = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity.copy(gpuDriverVersion = "driver-v2"),
+            currentSafeTileSize = 512
+        )
+
+        assertEquals(NativeBackend.LEGACY_SAFE, stale.backend)
+        assertEquals(InferencePrecision.FP32, stale.precision)
+        assertEquals(1, stale.commandBatchSize)
+    }
+
+    @Test
+    fun rejectsOptimizedProfileAtEveryCapabilityAndQualityBoundary() {
+        val identity = benchmarkIdentity()
+        val passingBenchmark = benchmarkResult(identity)
+        val cases = listOf(
+            device().copy(supportsVulkan = false) to passingBenchmark,
+            device().copy(supportsFp16Storage = false) to passingBenchmark,
+            device().copy(supportsFp16Arithmetic = false) to passingBenchmark,
+            device().copy(gpuRoughScore = null) to passingBenchmark,
+            device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(ssim = 0.9949)),
+            device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(psnrDb = 39.99)),
+            device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(p99ChannelError = 4))
+        )
+
+        cases.forEach { (candidateDevice, benchmark) ->
+            val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+                device = candidateDevice,
+                accelerationMode = AccelerationMode.AUTO,
+                ttaEnabled = false,
+                benchmarkResult = benchmark,
+                currentBenchmarkIdentity = identity,
+                currentSafeTileSize = 256
+            )
+
+            assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+            assertEquals(InferencePrecision.FP32, selected.precision)
+            assertEquals(1, selected.commandBatchSize)
+        }
+    }
+
+    @Test
+    fun unknownAndLowRamDevicesAlwaysSelectConservativeProfiles() {
+        val identity = benchmarkIdentity()
+        val benchmark = benchmarkResult(identity)
+        val candidates = listOf(
+            device().copy(
+                memoryBucketMb = 0,
+                physicalCoreCount = 0,
+                bigCoreCount = null,
+                littleCoreCount = null,
+                gpuVendor = null,
+                gpuDevice = null,
+                gpuDriverVersion = null,
+                gpuRoughScore = null,
+                supportsVulkan = false,
+                supportsFp16Storage = false,
+                supportsFp16Arithmetic = false
+            ),
+            device().copy(isLowRamDevice = true)
+        )
+
+        candidates.forEach { candidate ->
+            val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+                device = candidate,
+                accelerationMode = AccelerationMode.VULKAN,
+                ttaEnabled = false,
+                benchmarkResult = benchmark,
+                currentBenchmarkIdentity = identity,
+                currentSafeTileSize = 256
+            )
+
+            assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+            assertEquals(AccelerationMode.AUTO, selected.accelerationMode)
+            assertEquals(InferencePrecision.FP32, selected.precision)
+            assertEquals(1, selected.commandBatchSize)
+            assertEquals(1, selected.modelCacheCapacity)
+        }
+
+        val explicitCpu = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(isLowRamDevice = true),
+            accelerationMode = AccelerationMode.CPU,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 256
+        )
+        assertEquals(AccelerationMode.CPU, explicitCpu.accelerationMode)
+    }
+
+    @Test
+    fun cpuPreferenceAndMissingBenchmarkStayOnLegacyFp32() {
+        val identity = benchmarkIdentity()
+        val benchmark = benchmarkResult(identity)
+
+        val cpu = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.CPU,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512
+        )
+        val uncalibrated = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.AUTO,
+            ttaEnabled = false,
+            benchmarkResult = null,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512
+        )
+
+        assertEquals(AccelerationMode.CPU, cpu.accelerationMode)
+        assertEquals(NativeBackend.LEGACY_SAFE, cpu.backend)
+        assertEquals(InferencePrecision.FP32, cpu.precision)
+        assertEquals(NativeBackend.LEGACY_SAFE, uncalibrated.backend)
+        assertEquals(InferencePrecision.FP32, uncalibrated.precision)
+        assertEquals(1, uncalibrated.commandBatchSize)
+    }
+
+    @Test
+    fun ttaKeepsSelectionButForcesSafeTileAndSingleCommandBatch() {
+        val identity = benchmarkIdentity()
+        val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = true,
+            benchmarkResult = benchmarkResult(identity),
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512
+        )
+
+        assertEquals(NativeBackend.OPTIMIZED, selected.backend)
+        assertEquals(InferencePrecision.FP16, selected.precision)
+        assertTrue(selected.tta)
+        assertEquals(256, selected.tileSize)
+        assertEquals(1, selected.commandBatchSize)
+        assertTrue(selected.gpuHeadroomPercent >= 10)
+    }
+
+    @Test
+    fun lowGpuRoughScoreCannotEnableOptimizedBatching() {
+        val identity = benchmarkIdentity()
+        val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE - 1),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmarkResult(identity),
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512
+        )
+
+        assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+        assertEquals(InferencePrecision.FP32, selected.precision)
+        assertEquals(1, selected.commandBatchSize)
+    }
+
     private fun executionProfile(
         commandBatchSize: Int = 4,
         gpuHeadroomPercent: Int = 8,
@@ -356,5 +540,24 @@ class AdaptiveInferencePolicyTest {
         supportsVulkan = true,
         supportsFp16Storage = true,
         supportsFp16Arithmetic = true
+    )
+
+    private fun benchmarkIdentity() = BenchmarkIdentity(
+        schemaKey = "benchmark-v1",
+        engineKey = "ncnn-test",
+        deviceFingerprint = "device-test",
+        gpuDriverVersion = "driver-v1"
+    )
+
+    private fun passingQuality() = Fp16QualityMetrics(
+        ssim = 0.995,
+        psnrDb = 40.0,
+        p99ChannelError = 3
+    )
+
+    private fun benchmarkResult(identity: BenchmarkIdentity) = InferenceBenchmarkResult(
+        identity = identity,
+        fp16Quality = passingQuality(),
+        recommendedCommandBatchSize = 4
     )
 }

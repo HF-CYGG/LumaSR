@@ -6,3 +6,12 @@
 -keep class com.lumasr.processor.NativeProgressSink {
     *;
 }
+
+# Native capability JNI uses name-based binding and constructs the snapshot via FindClass/GetMethodID.
+-keep class com.lumasr.data.NativeCapabilityJni {
+    native <methods>;
+}
+
+-keep class com.lumasr.data.NativeCapabilitySnapshot {
+    public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer,java.lang.String,java.lang.String,java.lang.String,java.lang.Integer,boolean,boolean,boolean);
+}
