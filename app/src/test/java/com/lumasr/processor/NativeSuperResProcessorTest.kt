@@ -104,13 +104,16 @@ class NativeSuperResProcessorTest {
             bridge = bridge,
             isAvailable = { true }
         )
-        val progressEvents = mutableListOf<Pair<UpscaleStage, Float>>()
+        val progressEvents = mutableListOf<com.lumasr.domain.UpscaleProgress>()
 
         processor.process(defaultParams()) { progress ->
-            progressEvents += progress.stage to progress.progress
+            progressEvents += progress
         }
 
-        assertTrue(progressEvents.contains(UpscaleStage.PROCESSING_TILE to 0.45f))
+        val tileProgress = progressEvents.single { it.stage == UpscaleStage.PROCESSING_TILE }
+        assertEquals(0.45f, tileProgress.progress)
+        assertEquals(3, tileProgress.currentTile)
+        assertEquals(3, tileProgress.completedTiles)
     }
 
     @Test

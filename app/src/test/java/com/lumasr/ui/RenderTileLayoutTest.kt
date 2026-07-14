@@ -64,6 +64,40 @@ class RenderTileLayoutTest {
     }
 
     @Test
+    fun visualStateClampsNegativeCompletedTilesToZero() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.PROCESSING_TILE,
+                wholeTaskProgress = 0.45f,
+                currentTile = 0,
+                totalTiles = 8,
+                completedTiles = -2
+            )
+        )
+
+        assertEquals(0, state.completedCount)
+        assertEquals(1, state.activeIndex)
+        assertEquals(0f, state.completedRatio, 0.001f)
+    }
+
+    @Test
+    fun visualStateClampsCompletedTilesToTotalTiles() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.PROCESSING_TILE,
+                wholeTaskProgress = 0.45f,
+                currentTile = 8,
+                totalTiles = 8,
+                completedTiles = 10
+            )
+        )
+
+        assertEquals(8, state.completedCount)
+        assertEquals(null, state.activeIndex)
+        assertEquals(1f, state.completedRatio, 0.001f)
+    }
+
+    @Test
     fun visualStateDoesNotRevealTilesDuringModelLoadingProgress() {
         val state = calculateRenderTileVisualState(
             progress = progress(
