@@ -141,7 +141,8 @@ class FileProcessingTaskRepository(
 }
 
 private object ProcessingTaskJson {
-    private const val SCHEMA_VERSION = 1
+    private const val LEGACY_SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
     private val json = Json
 
     fun encode(task: ProcessingTask): String = buildJsonObject {
@@ -160,14 +161,21 @@ private object ProcessingTaskJson {
         put("terminalAtEpochMs", task.terminalAtEpochMs)
         put("retryableErrorCode", task.retryableErrorCode)
         put("executionProfileKey", task.executionProfileKey)
+        put("batchId", task.batchId)
+        put("sourceDisplayName", task.sourceDisplayName)
     }.toString()
 
     fun decode(value: String): ProcessingTask {
         val record = json.parseToJsonElement(value).jsonObject
-        check(record.requiredInt("schemaVersion") == SCHEMA_VERSION) { "Unsupported task schema" }
+        val schemaVersion = record.requiredInt("schemaVersion")
+        check(schemaVersion == LEGACY_SCHEMA_VERSION || schemaVersion == SCHEMA_VERSION) {
+            "Unsupported task schema"
+        }
+        val id = record.requiredString("id")
+        val copiedInputPath = record.requiredString("copiedInputPath")
         return ProcessingTask(
-            id = record.requiredString("id"),
-            copiedInputPath = record.requiredString("copiedInputPath"),
+            id = id,
+            copiedInputPath = copiedInputPath,
             outputPath = record.requiredString("outputPath"),
             state = ProcessingTaskState.valueOf(record.requiredString("state")),
             imageIndex = record.requiredInt("imageIndex"),
@@ -179,7 +187,13 @@ private object ProcessingTaskJson {
             updatedAtEpochMs = record.requiredLong("updatedAtEpochMs"),
             terminalAtEpochMs = record.optionalLong("terminalAtEpochMs"),
             retryableErrorCode = record.optionalString("retryableErrorCode"),
-            executionProfileKey = record.requiredString("executionProfileKey")
+            executionProfileKey = record.requiredString("executionProfileKey"),
+            batchId = if (schemaVersion == LEGACY_SCHEMA_VERSION) id else record.requiredString("batchId"),
+            sourceDisplayName = if (schemaVersion == LEGACY_SCHEMA_VERSION) {
+                File(copiedInputPath).name
+            } else {
+                record.requiredString("sourceDisplayName")
+            }
         )
     }
 

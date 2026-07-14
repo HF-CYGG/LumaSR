@@ -26,7 +26,9 @@ data class ProcessingTask(
     val updatedAtEpochMs: Long,
     val terminalAtEpochMs: Long?,
     val retryableErrorCode: String?,
-    val executionProfileKey: String
+    val executionProfileKey: String,
+    val batchId: String = id,
+    val sourceDisplayName: String = File(copiedInputPath).name
 ) {
     init {
         require(id.isNotBlank()) { "Task id must not be blank" }
@@ -38,6 +40,16 @@ data class ProcessingTask(
         require(createdAtEpochMs >= 0) { "Created timestamp must be non-negative" }
         require(updatedAtEpochMs >= createdAtEpochMs) { "Updated timestamp cannot precede creation" }
         require(executionProfileKey.isNotBlank()) { "Execution profile key must not be blank" }
+        require(batchId.isNotBlank()) { "Batch id must not be blank" }
+        require(batchId.length <= MAX_BATCH_ID_LENGTH) { "Batch id is too long" }
+        require(batchId.none(Char::isISOControl)) { "Batch id must not contain control characters" }
+        require(sourceDisplayName.isNotBlank()) { "Source display name must not be blank" }
+        require(sourceDisplayName.length <= MAX_SOURCE_DISPLAY_NAME_LENGTH) {
+            "Source display name is too long"
+        }
+        require(sourceDisplayName.none(Char::isISOControl)) {
+            "Source display name must not contain control characters"
+        }
         require(retryableErrorCode == null || SAFE_ERROR_CODE.matches(retryableErrorCode)) {
             "Retryable error code must be a stable code"
         }
@@ -53,6 +65,8 @@ data class ProcessingTask(
 
     companion object {
         private val SAFE_ERROR_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
+        private const val MAX_BATCH_ID_LENGTH = 512
+        private const val MAX_SOURCE_DISPLAY_NAME_LENGTH = 512
 
         private fun requireStableLocalPath(path: String, label: String) {
             require(path.isNotBlank()) { "$label must not be blank" }

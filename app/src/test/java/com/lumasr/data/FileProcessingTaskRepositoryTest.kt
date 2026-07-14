@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -25,13 +26,52 @@ class FileProcessingTaskRepositoryTest {
             imageIndex = 2,
             imageCount = 4,
             completedTiles = setOf(0, 4, 9),
-            retryableErrorCode = "VULKAN_OOM"
+            retryableErrorCode = "VULKAN_OOM",
+            batchId = "batch-summer-trip",
+            sourceDisplayName = "海边照片.png"
         )
 
         repository.save(expected)
 
         assertEquals(expected, repository.find(expected.id))
         assertEquals(listOf(expected), repository.list())
+    }
+
+    @Test
+    fun migratesSchemaOneRecordWithRecoverableBatchDefaults() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-one")
+        val repository = FileProcessingTaskRepository(root)
+        val legacy = task()
+        repository.save(legacy.copy(batchId = "new-batch", sourceDisplayName = "新名称.png"))
+        val record = root.listFiles().orEmpty().single { it.extension == "json" }
+        record.writeText(
+            record.readText()
+                .replace("\"schemaVersion\":2", "\"schemaVersion\":1")
+                .replace(Regex(",\"batchId\":\"[^\"]*\""), "")
+                .replace(Regex(",\"sourceDisplayName\":\"[^\"]*\""), "")
+        )
+
+        val migrated = repository.find(legacy.id)
+
+        assertNotNull(migrated)
+        assertEquals(legacy.id, migrated?.batchId)
+        assertEquals("input.png", migrated?.sourceDisplayName)
+    }
+
+    @Test
+    fun rejectsInvalidRecoverableBatchMetadata() {
+        assertThrows(IllegalArgumentException::class.java) {
+            task(batchId = " ")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            task(sourceDisplayName = "broken\u0000name.png")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            task(batchId = "b".repeat(513))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            task(sourceDisplayName = "照".repeat(513))
+        }
     }
 
     @Test
@@ -80,7 +120,9 @@ class FileProcessingTaskRepositoryTest {
         imageCount: Int = 1,
         completedTiles: Set<Int> = emptySet(),
         updatedAtEpochMs: Long = 1_000L,
-        retryableErrorCode: String? = null
+        retryableErrorCode: String? = null,
+        batchId: String = "task-1",
+        sourceDisplayName: String = "input.png"
     ): ProcessingTask {
         val taskDir = temporaryFolder.root.resolve("task-1")
         return ProcessingTask(
@@ -95,7 +137,9 @@ class FileProcessingTaskRepositoryTest {
             updatedAtEpochMs = updatedAtEpochMs,
             terminalAtEpochMs = null,
             retryableErrorCode = retryableErrorCode,
-            executionProfileKey = "realcugan-x4-vulkan-128"
+            executionProfileKey = "realcugan-x4-vulkan-128",
+            batchId = batchId,
+            sourceDisplayName = sourceDisplayName
         )
     }
 }

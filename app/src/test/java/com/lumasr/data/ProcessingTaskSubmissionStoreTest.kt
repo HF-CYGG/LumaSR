@@ -29,6 +29,295 @@ import org.junit.Test
 
 class ProcessingTaskSubmissionStoreTest {
     @Test
+    fun submitsTwoImagesInListOrderThenResumesServiceOnce() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events, includeIdsInEvents = true)
+        val work = RecordingWorkRepository(events, includeIdsInEvents = true)
+        val store = store(tasks, work, events)
+        val firstTask = task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 2)
+        val secondTask = task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2)
+
+        val result = store.submitBatch(
+            listOf(
+                ProcessingTaskSubmission(firstTask, spec("task-1")),
+                ProcessingTaskSubmission(secondTask, spec("task-2"))
+            )
+        )
+
+        assertEquals(
+            listOf(
+                "work.save:task-1",
+                "task.save:task-1",
+                "work.save:task-2",
+                "task.save:task-2",
+                "service.resume"
+            ),
+            events
+        )
+        assertEquals(ProcessingServiceStartResult.Started, result)
+    }
+
+    @Test
+    fun laterPersistThenThrowCompensatesEveryTouchedBatchItem() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events, failAfterSaveId = "task-2")
+        val work = RecordingWorkRepository(events)
+        val store = store(tasks, work, events)
+
+        assertThrows(IOException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 2),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertEquals(null, tasks.find("task-1"))
+        assertEquals(null, tasks.find("task-2"))
+        assertEquals(null, work.find("task-1"))
+        assertEquals(null, work.find("task-2"))
+        assertTrue("service must not start", "service.resume" !in events)
+    }
+
+    @Test
+    fun invalidOrExistingBatchIsRejectedBeforeAnyWrite() = runBlocking {
+        val emptyEvents = mutableListOf<String>()
+        val emptyStore = store(
+            RecordingTaskRepository(emptyEvents),
+            RecordingWorkRepository(emptyEvents),
+            emptyEvents
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { emptyStore.submitBatch(emptyList()) }
+        }
+        assertTrue(emptyEvents.isEmpty())
+
+        val duplicateEvents = mutableListOf<String>()
+        val duplicateStore = store(
+            RecordingTaskRepository(duplicateEvents),
+            RecordingWorkRepository(duplicateEvents),
+            duplicateEvents
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                duplicateStore.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 2),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 1, imageCount = 2),
+                            spec("task-1")
+                        )
+                    )
+                )
+            }
+        }
+        assertTrue(duplicateEvents.isEmpty())
+
+        val existingEvents = mutableListOf<String>()
+        val existingTasks = RecordingTaskRepository(existingEvents)
+        val existingWork = RecordingWorkRepository(existingEvents)
+        existingTasks.save(
+            task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2)
+        )
+        existingEvents.clear()
+        val existingStore = store(existingTasks, existingWork, existingEvents)
+
+        assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                existingStore.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 2),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+        assertEquals(null, existingTasks.find("task-1"))
+        assertEquals(null, existingWork.find("task-1"))
+        assertTrue(existingEvents.isEmpty())
+    }
+
+    @Test
+    fun mixedBatchIdsAreRejectedBeforeAnyWrite() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events)
+        val work = RecordingWorkRepository(events)
+        val store = store(tasks, work, events)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-a", imageIndex = 0, imageCount = 2),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-2", batchId = "batch-b", imageIndex = 1, imageCount = 2),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertTrue(events.isEmpty())
+
+    }
+
+    @Test
+    fun mismatchedImageCountIsRejectedBeforeAnyWrite() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events)
+        val work = RecordingWorkRepository(events)
+        val store = store(tasks, work, events)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 3),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun outOfOrderImageIndexesAreRejectedBeforeAnyWrite() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events)
+        val work = RecordingWorkRepository(events)
+        val store = store(tasks, work, events)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(id = "task-2", batchId = "batch-1", imageIndex = 1, imageCount = 2),
+                            spec("task-2")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(id = "task-1", batchId = "batch-1", imageIndex = 0, imageCount = 2),
+                            spec("task-1")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun nonIncreasingCreationTimesAreRejectedBeforeAnyWrite() = runBlocking {
+        val events = mutableListOf<String>()
+        val tasks = RecordingTaskRepository(events)
+        val work = RecordingWorkRepository(events)
+        val store = store(tasks, work, events)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(
+                                id = "task-1",
+                                batchId = "batch-1",
+                                imageIndex = 0,
+                                imageCount = 2,
+                                createdAtEpochMs = 1_000L
+                            ),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(
+                                id = "task-2",
+                                batchId = "batch-1",
+                                imageIndex = 1,
+                                imageCount = 2,
+                                createdAtEpochMs = 1_000L
+                            ),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun reversedCreationTimesAreRejectedBeforeAnyWrite() = runBlocking {
+        val events = mutableListOf<String>()
+        val store = store(
+            RecordingTaskRepository(events),
+            RecordingWorkRepository(events),
+            events
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                store.submitBatch(
+                    listOf(
+                        ProcessingTaskSubmission(
+                            task(
+                                id = "task-1",
+                                batchId = "batch-1",
+                                imageIndex = 0,
+                                imageCount = 2,
+                                createdAtEpochMs = 1_001L
+                            ),
+                            spec("task-1")
+                        ),
+                        ProcessingTaskSubmission(
+                            task(
+                                id = "task-2",
+                                batchId = "batch-1",
+                                imageIndex = 1,
+                                imageCount = 2,
+                                createdAtEpochMs = 1_000L
+                            ),
+                            spec("task-2")
+                        )
+                    )
+                )
+            }
+        }
+
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
     fun savesCompleteWorkBeforeQueuedTaskThenResumesService() = runBlocking {
         val events = mutableListOf<String>()
         val tasks = RecordingTaskRepository(events)
@@ -187,19 +476,27 @@ class ProcessingTaskSubmissionStoreTest {
         )
     )
 
-    private fun task(id: String = "task-1") = ProcessingTask(
+    private fun task(
+        id: String = "task-1",
+        batchId: String = id,
+        imageIndex: Int = 0,
+        imageCount: Int = 1,
+        createdAtEpochMs: Long = 1_000L + imageIndex
+    ) = ProcessingTask(
         id = id,
         copiedInputPath = File("build/tasks/$id/input.png").absolutePath,
         outputPath = File("build/tasks/$id/output.png").absolutePath,
         state = ProcessingTaskState.QUEUED,
-        imageIndex = 0,
-        imageCount = 1,
+        imageIndex = imageIndex,
+        imageCount = imageCount,
         completedExtremeTileIndexes = emptySet(),
-        createdAtEpochMs = 1_000L,
-        updatedAtEpochMs = 1_000L,
+        createdAtEpochMs = createdAtEpochMs,
+        updatedAtEpochMs = createdAtEpochMs,
         terminalAtEpochMs = null,
         retryableErrorCode = null,
-        executionProfileKey = "profile"
+        executionProfileKey = "profile",
+        batchId = batchId,
+        sourceDisplayName = "$id.png"
     )
 
     private fun spec(id: String = "task-1") = ProcessingWorkSpec.fromParams(
@@ -223,15 +520,19 @@ class ProcessingTaskSubmissionStoreTest {
     private class RecordingTaskRepository(
         private val events: MutableList<String>,
         private val failSave: Boolean = false,
-        private val failAfterSave: Boolean = false
+        private val failAfterSave: Boolean = false,
+        private val failAfterSaveId: String? = null,
+        private val includeIdsInEvents: Boolean = false
     ) : ProcessingTaskRepository {
         private val records = mutableMapOf<String, ProcessingTask>()
 
         override suspend fun save(task: ProcessingTask) {
-            events += "task.save"
+            events += if (includeIdsInEvents) "task.save:${task.id}" else "task.save"
             if (failSave) throw IOException("task unavailable")
             records[task.id] = task
-            if (failAfterSave) throw IOException("task acknowledgement unavailable")
+            if (failAfterSave || task.id == failAfterSaveId) {
+                throw IOException("task acknowledgement unavailable")
+            }
         }
 
         override suspend fun find(taskId: String): ProcessingTask? = records[taskId]
@@ -245,12 +546,13 @@ class ProcessingTaskSubmissionStoreTest {
     private class RecordingWorkRepository(
         private val events: MutableList<String>,
         private val failSave: Boolean = false,
-        private val failAfterSave: Boolean = false
+        private val failAfterSave: Boolean = false,
+        private val includeIdsInEvents: Boolean = false
     ) : ProcessingWorkSpecRepository {
         private val records = mutableMapOf<String, ProcessingWorkSpec>()
 
         override suspend fun save(workSpec: ProcessingWorkSpec) {
-            events += "work.save"
+            events += if (includeIdsInEvents) "work.save:${workSpec.taskId}" else "work.save"
             if (failSave) throw IOException("work unavailable")
             records[workSpec.taskId] = workSpec
             if (failAfterSave) throw IOException("work acknowledgement unavailable")
