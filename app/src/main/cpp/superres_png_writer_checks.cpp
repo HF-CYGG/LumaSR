@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -168,7 +169,32 @@ bool run_streaming_png_writer_runtime_checks(const char* outputPath) {
         sentinel_is_intact(checkPath) &&
         !file_exists(partPath) &&
         writer.publish() == StreamingPngStatus::InvalidState;
+    if (!cancellationCleanupPassed) {
+        remove_file(checkPath);
+        remove_file(partPath);
+        return false;
+    }
+
+    const std::string ioFailurePath = checkPath + ".io-failure-dir";
+    const std::string ioFailurePartPath = ioFailurePath + ".part";
+    const std::string ioFailureSentinel = ioFailurePath + "/keep";
+    std::error_code filesystemError;
+    std::filesystem::remove_all(ioFailurePath, filesystemError);
+    filesystemError.clear();
+    const bool ioDirectoryReady = std::filesystem::create_directory(ioFailurePath, filesystemError) &&
+        write_sentinel(ioFailureSentinel);
+    const bool ioFailureCleansPartAndPreservesDestination = ioDirectoryReady &&
+        writer.open(ioFailurePath, width, height) == StreamingPngStatus::Ok &&
+        writer.write_rgb_rows(complete.data(), height, rowBytes) == StreamingPngStatus::Ok &&
+        writer.finish_temporary() == StreamingPngStatus::Ok &&
+        writer.publish() == StreamingPngStatus::IoError &&
+        !file_exists(ioFailurePartPath) &&
+        std::filesystem::is_directory(ioFailurePath, filesystemError) &&
+        sentinel_is_intact(ioFailureSentinel);
     remove_file(checkPath);
     remove_file(partPath);
-    return cancellationCleanupPassed;
+    remove_file(ioFailureSentinel);
+    std::filesystem::remove(ioFailurePath, filesystemError);
+    remove_file(ioFailurePartPath);
+    return ioFailureCleansPartAndPreservesDestination;
 }

@@ -34,10 +34,9 @@ import java.nio.file.StandardCopyOption
 
 class FileInferenceBenchmarkRepository(
     private val directory: File,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val atomicMove: (File, File) -> Unit = ::systemMoveReplacing
 ) : InferenceBenchmarkRepository {
-    private val mutex = Mutex()
-
     override suspend fun save(result: InferenceBenchmarkResult) {
         check(publish(result, BenchmarkPublicationGate())) {
             "Fresh benchmark publication was unexpectedly cancelled"
@@ -48,7 +47,7 @@ class FileInferenceBenchmarkRepository(
         result: InferenceBenchmarkResult,
         gate: BenchmarkPublicationGate
     ): Boolean = withContext(ioDispatcher) {
-        mutex.withLock {
+        PROCESS_MUTEX.withLock {
             validateResult(result)
             ensureDirectory()
             val updated = readAll()
@@ -56,19 +55,25 @@ class FileInferenceBenchmarkRepository(
                 .plus(result)
                 .sortedWith(RESULT_ORDER)
             require(updated.size <= MAX_RESULT_COUNT) { "Too many benchmark results" }
-            prepareAtomic(BenchmarkResultJson.encode(updated).toByteArray(Charsets.UTF_8)).let {
-                temporary ->
-                try {
-                    gate.tryCommit { moveReplacing(temporary, recordFile()) }
-                } finally {
-                    temporary.delete()
-                }
+            val target = recordFile()
+            val rollback = prepareRollbackCopy(target)
+            val temporary = prepareAtomic(
+                BenchmarkResultJson.encode(updated).toByteArray(Charsets.UTF_8)
+            )
+            try {
+                gate.tryCommit(
+                    commit = { atomicMove(temporary, target) },
+                    rollback = { rollbackPublication(target, rollback) }
+                )
+            } finally {
+                temporary.delete()
+                rollback?.delete()
             }
         }
     }
 
     override suspend fun list(): List<InferenceBenchmarkResult> = withContext(ioDispatcher) {
-        mutex.withLock { readAll() }
+        PROCESS_MUTEX.withLock { readAll() }
     }
 
     override suspend fun findValid(
@@ -76,7 +81,7 @@ class FileInferenceBenchmarkRepository(
         nowEpochMs: Long
     ): InferenceBenchmarkResult? = withContext(ioDispatcher) {
         require(nowEpochMs >= 0L) { "Current benchmark time must be non-negative" }
-        mutex.withLock {
+        PROCESS_MUTEX.withLock {
             readAll().firstOrNull { result ->
                 result.identity == identity &&
                     nowEpochMs >= result.measuredAtEpochMs &&
@@ -142,13 +147,38 @@ class FileInferenceBenchmarkRepository(
         }
     }
 
+    private fun prepareRollbackCopy(target: File): File? {
+        if (!target.isFile) return null
+        val rollback = File.createTempFile(target.name, ".$ROLLBACK_EXTENSION", directory)
+        try {
+            Files.copy(
+                target.toPath(),
+                rollback.toPath(),
+                StandardCopyOption.REPLACE_EXISTING
+            )
+            FileOutputStream(rollback, true).use { stream -> stream.fd.sync() }
+            return rollback
+        } catch (error: Exception) {
+            rollback.delete()
+            throw error
+        }
+    }
+
+    private fun rollbackPublication(target: File, rollback: File?) {
+        if (rollback != null) {
+            atomicMove(rollback, target)
+        } else {
+            Files.deleteIfExists(target.toPath())
+        }
+    }
+
     private fun quarantine(file: File) {
         try {
             val destination = File(
                 directory,
                 "${file.name}.${System.currentTimeMillis()}.$CORRUPT_EXTENSION"
             )
-            moveReplacing(file, destination)
+            atomicMove(file, destination)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -156,24 +186,13 @@ class FileInferenceBenchmarkRepository(
         }
     }
 
-    private fun moveReplacing(source: File, destination: File) {
-        try {
-            Files.move(
-                source.toPath(),
-                destination.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        }
-    }
-
     private fun recordFile(): File = File(directory, RECORD_FILE_NAME)
 
     private companion object {
+        val PROCESS_MUTEX = Mutex()
         const val RECORD_FILE_NAME = "inference-benchmarks.json"
         const val TEMP_EXTENSION = "tmp"
+        const val ROLLBACK_EXTENSION = "rollback"
         const val CORRUPT_EXTENSION = "corrupt"
         const val MAX_RECORD_BYTES = 1_048_576L
         const val MAX_RESULT_COUNT = 128
@@ -187,6 +206,19 @@ class FileInferenceBenchmarkRepository(
             { it.identity.deviceFingerprint },
             { it.identity.gpuDriverVersion.orEmpty() }
         )
+    }
+}
+
+private fun systemMoveReplacing(source: File, destination: File) {
+    try {
+        Files.move(
+            source.toPath(),
+            destination.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING
+        )
+    } catch (_: AtomicMoveNotSupportedException) {
+        Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
     }
 }
 

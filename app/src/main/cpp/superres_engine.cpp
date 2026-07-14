@@ -2,9 +2,13 @@
 #include "superres_engine.h"
 #include "superres_d4_tta_ncnn.h"
 #include "superres_execution_profile.h"
+#include "superres_atomic_publish.h"
 #include "superres_pixel_io.h"
 #include "superres_png_writer.h"
 #include "superres_png_writer_checks.h"
+#include "superres_atomic_publish_checks.h"
+#include "superres_task_registry.h"
+#include "superres_task_registry_checks.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -18,7 +22,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include "net.h"
@@ -27,6 +30,7 @@
 #include "gpu.h"
 #include "mat.h"
 #include "zlib.h"
+#include <unistd.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -41,11 +45,27 @@ constexpr int kAccelerationVulkan = 1;
 constexpr int kNativeOutputPng = 0;
 constexpr int kNativeOutputRawCroppedRgbTile = 1;
 
-std::mutex cancel_mutex;
 std::mutex gpu_mutex;
 std::mutex net_cache_mutex;
-std::unordered_set<std::string> cancelled_tasks;
+SuperResTaskRegistry task_registry;
 SuperResGpuInitState gpu_init_state = SuperResGpuInitState::Uninitialized;
+
+class TaskCompletionGuard {
+public:
+    TaskCompletionGuard(SuperResTaskRegistry& registry, std::string taskId)
+        : registry_(registry), taskId_(std::move(taskId)) {}
+
+    ~TaskCompletionGuard() {
+        registry_.complete_task(taskId_);
+    }
+
+    TaskCompletionGuard(const TaskCompletionGuard&) = delete;
+    TaskCompletionGuard& operator=(const TaskCompletionGuard&) = delete;
+
+private:
+    SuperResTaskRegistry& registry_;
+    std::string taskId_;
+};
 
 struct ModelFiles {
     std::string paramPath;
@@ -480,22 +500,7 @@ void sleep_for_gpu_headroom(
 }
 
 bool is_cancelled(const std::string& taskId) {
-    std::lock_guard<std::mutex> lock(cancel_mutex);
-    const auto found = cancelled_tasks.find(taskId);
-    if (found == cancelled_tasks.end()) {
-        return false;
-    }
-    cancelled_tasks.erase(found);
-    return true;
-}
-
-bool consume_cancellation_locked(const std::string& taskId) {
-    const auto found = cancelled_tasks.find(taskId);
-    if (found == cancelled_tasks.end()) {
-        return false;
-    }
-    cancelled_tasks.erase(found);
-    return true;
+    return task_registry.consume_cancelled(taskId);
 }
 
 std::string path_basename(const std::string& path) {
@@ -1288,6 +1293,11 @@ SuperResNativeCode run_ncnn_image(
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
         return SuperResNativeCode::Unsupported;
     }
+    static const bool atomicPublishChecksPass = run_atomic_publish_runtime_checks();
+    if (!atomicPublishChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Atomic publish runtime checks failed");
+        return SuperResNativeCode::OutputFailed;
+    }
 #ifndef NDEBUG
     static const bool streamingPngChecksPass = run_streaming_png_writer_runtime_checks(
         params.outputPath.c_str()
@@ -1719,20 +1729,19 @@ SuperResNativeCode run_ncnn_image(
         if (finishCode != SuperResNativeCode::Ok) {
             return finishCode;
         }
-        SuperResNativeCode publishCode = SuperResNativeCode::Ok;
-        {
-            // Publication and cancellation share one lock as their linearization point:
-            // cancellation that wins keeps the old destination and deletes .part; publication
-            // that wins commits atomically and this invocation must return Ok.
-            std::lock_guard<std::mutex> cancelLock(cancel_mutex);
-            if (consume_cancellation_locked(params.taskId)) {
-                output.abort_png();
-                return SuperResNativeCode::Cancelled;
-            }
-            publishCode = output.publish_png();
+        // Publication and cancellation share the registry mutex as their linearization point.
+        const SuperResTaskPublishOutcome publishOutcome = task_registry.publish_or_cancel(
+            params.taskId,
+            [&output]() { return output.publish_png() == SuperResNativeCode::Ok; },
+            [&output]() { output.abort_png(); }
+        );
+        if (publishOutcome == SuperResTaskPublishOutcome::Cancelled) {
+            return SuperResNativeCode::Cancelled;
         }
-        if (publishCode != SuperResNativeCode::Ok) {
-            return publishCode;
+        if (publishOutcome != SuperResTaskPublishOutcome::Published) {
+            return output.failure_code() == SuperResNativeCode::Ok
+                ? SuperResNativeCode::OutputFailed
+                : output.failure_code();
         }
         performance.saveMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             output.encoding_duration()
@@ -1978,11 +1987,8 @@ SuperResNativeCode process_superres_internal(
     bool requireInputPath,
     const RunNcnnFunction& runNcnn
 ) {
-    {
-        std::lock_guard<std::mutex> lock(cancel_mutex);
-        cancelled_tasks.erase(params.taskId);
-    }
-
+    static const bool taskRegistryChecksPass = run_task_registry_runtime_checks();
+    if (!taskRegistryChecksPass) return SuperResNativeCode::InvalidParams;
     if (params.taskId.empty() || params.outputPath.empty() ||
         params.modelDir.empty() || params.scale <= 0 || params.tileSize <= 0) {
         return SuperResNativeCode::InvalidParams;
@@ -2011,6 +2017,11 @@ SuperResNativeCode process_superres_internal(
     if (requireInputPath && !is_regular_file(params.inputPath)) {
         return SuperResNativeCode::InputMissing;
     }
+
+    if (!task_registry.register_task(params.taskId)) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    TaskCompletionGuard taskCompletion(task_registry, params.taskId);
 
     emit(onProgress, SuperResNativeStage::Preparing, 0, 0, 0.0f, "Preparing native inference");
 
@@ -2092,8 +2103,7 @@ SuperResNativeCode process_superres_rgb(
 }
 
 void cancel_superres(const std::string& taskId) {
-    std::lock_guard<std::mutex> lock(cancel_mutex);
-    cancelled_tasks.insert(taskId);
+    task_registry.cancel(taskId);
 }
 
 void clear_superres_cache() {
@@ -2110,6 +2120,8 @@ SuperResNativeCode merge_raw_tiles_to_png(
     if (outputPath.empty() || outputWidth <= 0 || outputHeight <= 0 || tiles.empty()) {
         return SuperResNativeCode::InvalidParams;
     }
+    const std::string temporaryPath = outputPath + ".part";
+    std::remove(temporaryPath.c_str());
 
     struct OpenTile {
         SuperResRawTile spec;
@@ -2148,7 +2160,7 @@ SuperResNativeCode merge_raw_tiles_to_png(
         openTiles.push_back(OpenTile{tile, file});
     }
 
-    FILE* output = std::fopen(outputPath.c_str(), "wb");
+    FILE* output = std::fopen(temporaryPath.c_str(), "wb");
     if (output == nullptr) {
         for (OpenTile& openTile : openTiles) {
             std::fclose(openTile.file);
@@ -2159,6 +2171,7 @@ SuperResNativeCode merge_raw_tiles_to_png(
     z_stream stream{};
     if (deflateInit(&stream, Z_BEST_SPEED) != Z_OK) {
         std::fclose(output);
+        std::remove(temporaryPath.c_str());
         for (OpenTile& openTile : openTiles) {
             std::fclose(openTile.file);
         }
@@ -2214,15 +2227,18 @@ SuperResNativeCode merge_raw_tiles_to_png(
     }
     ok = deflateEnd(&stream) == Z_OK && ok;
     ok = ok && write_png_chunk(output, "IEND", nullptr, 0);
+    if (ok && std::fflush(output) != 0) ok = false;
+    if (ok && ::fsync(::fileno(output)) != 0) ok = false;
     ok = std::fclose(output) == 0 && ok;
     for (OpenTile& openTile : openTiles) {
         std::fclose(openTile.file);
     }
 
     if (!ok) {
-        std::error_code error;
-        std::filesystem::remove(outputPath, error);
+        std::remove(temporaryPath.c_str());
         return SuperResNativeCode::OutputFailed;
     }
-    return SuperResNativeCode::Ok;
+    return publish_atomic_file(temporaryPath, outputPath) == SuperResAtomicPublishStatus::Ok
+        ? SuperResNativeCode::Ok
+        : SuperResNativeCode::OutputFailed;
 }

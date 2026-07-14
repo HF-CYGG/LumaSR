@@ -5,16 +5,14 @@
 // This implementation avoids opening every tile at once and avoids O(rows * tiles)
 // coverage scans during the final merge.
 #include "superres_engine.h"
+#include "superres_png_writer.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
-
-#include "zlib.h"
 
 namespace {
 
@@ -22,78 +20,6 @@ struct ActiveTile {
     SuperResRawTile spec;
     FILE* file = nullptr;
 };
-
-bool write_all(FILE* file, const void* data, size_t size) {
-    return size == 0 || std::fwrite(data, 1, size, file) == size;
-}
-
-void put_be32(unsigned char* output, uint32_t value) {
-    output[0] = static_cast<unsigned char>((value >> 24) & 0xff);
-    output[1] = static_cast<unsigned char>((value >> 16) & 0xff);
-    output[2] = static_cast<unsigned char>((value >> 8) & 0xff);
-    output[3] = static_cast<unsigned char>(value & 0xff);
-}
-
-bool write_png_chunk(FILE* file, const char type[4], const unsigned char* data, size_t size) {
-    if (size > 0xffffffffu) {
-        return false;
-    }
-    unsigned char length[4];
-    put_be32(length, static_cast<uint32_t>(size));
-    if (!write_all(file, length, sizeof(length)) ||
-        !write_all(file, type, 4) ||
-        !write_all(file, data, size)) {
-        return false;
-    }
-
-    uLong crc = crc32(0L, Z_NULL, 0);
-    crc = crc32(crc, reinterpret_cast<const Bytef*>(type), 4);
-    if (size > 0) {
-        crc = crc32(crc, reinterpret_cast<const Bytef*>(data), static_cast<uInt>(size));
-    }
-    unsigned char crcBytes[4];
-    put_be32(crcBytes, static_cast<uint32_t>(crc));
-    return write_all(file, crcBytes, sizeof(crcBytes));
-}
-
-bool write_png_signature_and_header(FILE* file, int width, int height) {
-    static const unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
-    unsigned char ihdr[13] = {};
-    put_be32(ihdr, static_cast<uint32_t>(width));
-    put_be32(ihdr + 4, static_cast<uint32_t>(height));
-    ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // truecolor RGB
-    return write_all(file, signature, sizeof(signature)) &&
-        write_png_chunk(file, "IHDR", ihdr, sizeof(ihdr));
-}
-
-bool deflate_png_bytes(
-    FILE* file,
-    z_stream& stream,
-    const unsigned char* data,
-    size_t size,
-    int flush,
-    std::vector<unsigned char>& compressed,
-    bool& finished
-) {
-    stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data));
-    stream.avail_in = static_cast<uInt>(size);
-    do {
-        stream.next_out = compressed.data();
-        stream.avail_out = static_cast<uInt>(compressed.size());
-        const int result = deflate(&stream, flush);
-        if (result == Z_STREAM_END) {
-            finished = true;
-        } else if (result != Z_OK) {
-            return false;
-        }
-        const size_t produced = compressed.size() - stream.avail_out;
-        if (produced > 0 && !write_png_chunk(file, "IDAT", compressed.data(), produced)) {
-            return false;
-        }
-    } while (stream.avail_out == 0);
-    return stream.avail_in == 0;
-}
 
 bool checked_rgb_size(int width, int height, uintmax_t& bytes) {
     if (width <= 0 || height <= 0) {
@@ -113,15 +39,8 @@ bool checked_rgb_size(int width, int height, uintmax_t& bytes) {
 }
 
 bool checked_row_size(int outputWidth, size_t& bytes) {
-    if (outputWidth <= 0) {
-        return false;
-    }
-    const size_t width = static_cast<size_t>(outputWidth);
-    if (width > (std::numeric_limits<size_t>::max() - 1u) / 3u) {
-        return false;
-    }
-    bytes = width * 3u + 1u; // one PNG filter byte + RGB row
-    return true;
+    bytes = streaming_png_rgb_row_bytes(outputWidth);
+    return bytes != 0;
 }
 
 bool validate_tile(const SuperResRawTile& tile, int outputWidth, int outputHeight) {
@@ -150,25 +69,13 @@ void close_active_tiles(std::vector<ActiveTile>& activeTiles) {
     activeTiles.clear();
 }
 
-std::string temporary_output_path(const std::string& outputPath) {
-    return outputPath + ".part";
-}
-
-bool replace_file(const std::string& temporaryPath, const std::string& outputPath) {
-    std::error_code error;
-    std::filesystem::remove(outputPath, error);
-    error.clear();
-    std::filesystem::rename(temporaryPath, outputPath, error);
-    return !error;
-}
-
 bool active_tile_x_order(const ActiveTile& left, const ActiveTile& right) {
     return left.spec.x < right.spec.x;
 }
 
 } // namespace
 
-SuperResNativeCode merge_raw_tiles_to_png_streaming(
+SuperResNativeCode merge_raw_tiles_to_png_streaming_impl(
     const std::string& outputPath,
     int outputWidth,
     int outputHeight,
@@ -198,19 +105,8 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
         }
     );
 
-    const std::string temporaryPath = temporary_output_path(outputPath);
-    std::error_code removeError;
-    std::filesystem::remove(temporaryPath, removeError);
-
-    FILE* output = std::fopen(temporaryPath.c_str(), "wb");
-    if (output == nullptr) {
-        return SuperResNativeCode::OutputFailed;
-    }
-
-    z_stream stream{};
-    if (deflateInit(&stream, Z_BEST_SPEED) != Z_OK) {
-        std::fclose(output);
-        std::filesystem::remove(temporaryPath, removeError);
+    StreamingPngWriter writer;
+    if (writer.open(outputPath, outputWidth, outputHeight) != StreamingPngStatus::Ok) {
         return SuperResNativeCode::OutputFailed;
     }
 
@@ -218,19 +114,14 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
     activeTiles.reserve(16);
     size_t nextTile = 0;
     bool ok = true;
-    bool finished = false;
 
     std::vector<unsigned char> row;
     std::vector<unsigned char> tileRow;
-    std::vector<unsigned char> compressed;
     try {
         row.resize(pngRowBytes, 0);
-        compressed.resize(256 * 1024);
     } catch (...) {
         ok = false;
     }
-
-    ok = ok && write_png_signature_and_header(output, outputWidth, outputHeight);
 
     for (int y = 0; ok && y < outputHeight; ++y) {
         bool activeChanged = false;
@@ -267,7 +158,7 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
         }
 
         int cursorX = 0;
-        row[0] = 0; // PNG filter type: None
+        std::fill(row.begin(), row.end(), 0);
         for (ActiveTile& active : activeTiles) {
             const SuperResRawTile& tile = active.spec;
             if (tile.x != cursorX || active.file == nullptr) {
@@ -288,7 +179,7 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
             std::copy(
                 tileRow.begin(),
                 tileRow.end(),
-                row.begin() + 1u + static_cast<size_t>(cursorX) * 3u
+                row.begin() + static_cast<size_t>(cursorX) * 3u
             );
             cursorX += tile.width;
         }
@@ -297,34 +188,135 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
             break;
         }
 
-        ok = deflate_png_bytes(output, stream, row.data(), row.size(), Z_NO_FLUSH, compressed, finished);
+        ok = writer.write_rgb_rows(row.data(), 1, row.size()) == StreamingPngStatus::Ok;
     }
 
     if (ok && nextTile != sortedTiles.size()) {
         ok = false;
     }
 
-    while (ok && !finished) {
-        ok = deflate_png_bytes(output, stream, nullptr, 0, Z_FINISH, compressed, finished);
-    }
-
-    ok = deflateEnd(&stream) == Z_OK && ok;
-    ok = ok && write_png_chunk(output, "IEND", nullptr, 0);
-    ok = std::fclose(output) == 0 && ok;
-    output = nullptr;
     close_active_tiles(activeTiles);
 
     if (ok) {
-        ok = replace_file(temporaryPath, outputPath);
+        ok = writer.finish_temporary() == StreamingPngStatus::Ok &&
+            writer.publish() == StreamingPngStatus::Ok;
     }
 
     if (!ok) {
-        if (output != nullptr) {
-            std::fclose(output);
-        }
         close_active_tiles(activeTiles);
-        std::filesystem::remove(temporaryPath, removeError);
+        writer.abort();
         return SuperResNativeCode::OutputFailed;
     }
     return SuperResNativeCode::Ok;
+}
+
+namespace {
+
+bool write_test_file(const std::string& path, const std::vector<unsigned char>& bytes) {
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) return false;
+    const bool written = bytes.empty() ||
+        std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    return std::fclose(file) == 0 && written;
+}
+
+bool test_file_equals(const std::string& path, const std::vector<unsigned char>& expected) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::vector<unsigned char> actual(expected.size() + 1u, 0);
+    const size_t read = std::fread(actual.data(), 1, actual.size(), file);
+    std::fclose(file);
+    return read == expected.size() &&
+        std::equal(expected.begin(), expected.end(), actual.begin());
+}
+
+bool has_png_signature(const std::string& path) {
+    static const std::vector<unsigned char> signature{137, 80, 78, 71, 13, 10, 26, 10};
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::vector<unsigned char> actual(signature.size(), 0);
+    const size_t read = std::fread(actual.data(), 1, actual.size(), file);
+    std::fclose(file);
+    return read == signature.size() && actual == signature;
+}
+
+bool run_png_streamer_runtime_checks(const std::string& outputPath) {
+    const std::string base = outputPath + ".streamer-check";
+    const std::string checkOutput = base + ".png";
+    const std::string checkPart = checkOutput + ".part";
+    const std::string gapLeft = base + ".gap-left.rgb";
+    const std::string gapRight = base + ".gap-right.rgb";
+    const std::string completeTile = base + ".complete.rgb";
+    const std::string ioDestination = base + ".io-dir";
+    const std::string ioDestinationPart = ioDestination + ".part";
+    const std::string ioSentinel = ioDestination + "/keep";
+    const std::vector<std::string> files{
+        checkOutput, checkPart, gapLeft, gapRight, completeTile, ioDestinationPart
+    };
+    for (const std::string& file : files) std::remove(file.c_str());
+    std::error_code error;
+    std::filesystem::remove_all(ioDestination, error);
+
+    const std::vector<unsigned char> oldFinal{'o', 'l', 'd'};
+    const bool setup =
+        write_test_file(checkOutput, oldFinal) &&
+        write_test_file(gapLeft, {1, 2, 3}) &&
+        write_test_file(gapRight, {4, 5, 6}) &&
+        write_test_file(completeTile, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    const std::vector<SuperResRawTile> gapTiles{
+        SuperResRawTile{gapLeft, 0, 0, 1, 1},
+        SuperResRawTile{gapRight, 2, 0, 1, 1}
+    };
+    const bool failedMergePreservesOldFinal = setup &&
+        merge_raw_tiles_to_png_streaming_impl(checkOutput, 3, 1, gapTiles) ==
+            SuperResNativeCode::OutputFailed &&
+        test_file_equals(checkOutput, oldFinal) &&
+        !std::filesystem::exists(checkPart);
+
+    const std::vector<SuperResRawTile> completeTiles{
+        SuperResRawTile{completeTile, 0, 0, 3, 1}
+    };
+    const bool successfulMergePublishesAtomically = failedMergePreservesOldFinal &&
+        merge_raw_tiles_to_png_streaming_impl(checkOutput, 3, 1, completeTiles) ==
+            SuperResNativeCode::Ok &&
+        has_png_signature(checkOutput) &&
+        !std::filesystem::exists(checkPart);
+
+    error.clear();
+    const bool ioDestinationReady =
+        std::filesystem::create_directory(ioDestination, error) &&
+        write_test_file(ioSentinel, oldFinal);
+    const bool ioFailureCleansPartAndPreservesDestination =
+        successfulMergePublishesAtomically && ioDestinationReady &&
+        merge_raw_tiles_to_png_streaming_impl(ioDestination, 3, 1, completeTiles) ==
+            SuperResNativeCode::OutputFailed &&
+        std::filesystem::is_directory(ioDestination, error) &&
+        test_file_equals(ioSentinel, oldFinal) &&
+        !std::filesystem::exists(ioDestinationPart);
+
+    for (const std::string& file : files) std::remove(file.c_str());
+    std::remove(ioSentinel.c_str());
+    error.clear();
+    std::filesystem::remove(ioDestination, error);
+    return ioFailureCleansPartAndPreservesDestination;
+}
+
+} // namespace
+
+SuperResNativeCode merge_raw_tiles_to_png_streaming(
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    const std::vector<SuperResRawTile>& tiles
+) {
+#ifndef NDEBUG
+    static const bool checksPass = run_png_streamer_runtime_checks(outputPath);
+    if (!checksPass) return SuperResNativeCode::OutputFailed;
+#endif
+    return merge_raw_tiles_to_png_streaming_impl(
+        outputPath,
+        outputWidth,
+        outputHeight,
+        tiles
+    );
 }

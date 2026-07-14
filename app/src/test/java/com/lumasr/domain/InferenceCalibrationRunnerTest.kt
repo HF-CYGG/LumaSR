@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -146,6 +147,7 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(result is CalibrationRunResult.TimedOut)
         assertTrue("native cancel must fire before the safety release", elapsedMs < 750L)
+        awaitNativeCancel(cancelled)
         assertEquals(1, cancelled.size)
         assertTrue(cancelled.single().startsWith("calibration-"))
         assertTrue(repository.saved.isEmpty())
@@ -188,6 +190,7 @@ class InferenceCalibrationRunnerTest {
 
             assertTrue(result is CalibrationRunResult.TimedOut)
             assertTrue("timeout must not wait for an unresponsive probe", elapsedMs < 750L)
+            awaitNativeCancel(cancelled)
             assertEquals(1, cancelled.size)
             assertTrue(repository.saved.isEmpty())
         } finally {
@@ -198,6 +201,82 @@ class InferenceCalibrationRunnerTest {
                 delay(10L)
             }
             assertFalse(CalibrationExecutionGate.isCalibrationActive)
+        }
+    }
+
+    @Test
+    fun timeoutReturnDoesNotWaitForBlockingNativeCancelCallback() = runBlocking {
+        val releaseProbe = CountDownLatch(1)
+        val releaseCancel = CountDownLatch(1)
+        val cancelStarted = CountDownLatch(1)
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    releaseProbe.await()
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        1L
+                    )
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelStarted.countDown()
+                    releaseCancel.await()
+                }
+            },
+            repository = RecordingBenchmarkRepository(),
+            timeoutMs = 25L
+        )
+        val safetyRelease = launch(Dispatchers.Default) {
+            delay(1_000L)
+            releaseCancel.countDown()
+            releaseProbe.countDown()
+        }
+
+        try {
+            val startedAt = System.nanoTime()
+            val result = runner.run(request(outputScale = 1))
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+
+            assertTrue(result is CalibrationRunResult.TimedOut)
+            assertTrue("timeout must not wait for native cancel callback", elapsedMs < 750L)
+            assertEquals(0L, cancelStarted.count)
+        } finally {
+            releaseCancel.countDown()
+            releaseProbe.countDown()
+            safetyRelease.cancel()
+            awaitCalibrationGateRelease()
+        }
+    }
+
+    @Test
+    fun timeoutCoversSlowPublicationWithoutReleasingCalibrationGateEarly() = runBlocking {
+        val publishStarted = CompletableDeferred<Unit>()
+        val releasePublication = CompletableDeferred<Unit>()
+        val repository = slowPublicationRepository(publishStarted, releasePublication)
+        val runner = successfulRunner(repository = repository, timeoutMs = 25L)
+        val safetyRelease = launch(Dispatchers.Default) {
+            delay(1_000L)
+            releasePublication.complete(Unit)
+        }
+
+        try {
+            val startedAt = System.nanoTime()
+            val result = runner.run(request(outputScale = 1))
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+
+            assertTrue(result is CalibrationRunResult.TimedOut)
+            assertTrue("total calibration timeout must include persistence", elapsedMs < 750L)
+            assertTrue(publishStarted.isCompleted)
+            assertTrue(CalibrationExecutionGate.isCalibrationActive)
+            assertTrue(repository.saved.isEmpty())
+        } finally {
+            releasePublication.complete(Unit)
+            safetyRelease.cancel()
+            awaitCalibrationGateRelease()
         }
     }
 
@@ -254,6 +333,7 @@ class InferenceCalibrationRunnerTest {
         val failure = runCatching { job.await() }.exceptionOrNull()
 
         assertTrue(failure is CancellationException)
+        awaitNativeCancel(cancelled)
         assertEquals(1, cancelled.size)
         assertTrue(repository.saved.isEmpty())
     }
@@ -309,6 +389,82 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(failure is CancellationException)
         assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun callerCancellationDoesNotWaitForSlowPublicationCleanup() = runBlocking {
+        val publishStarted = CompletableDeferred<Unit>()
+        val releasePublication = CompletableDeferred<Unit>()
+        val repository = slowPublicationRepository(publishStarted, releasePublication)
+        val runner = successfulRunner(repository = repository, timeoutMs = 5_000L)
+        val job = async { runner.run(request(outputScale = 1)) }
+        publishStarted.await()
+        val safetyRelease = launch(Dispatchers.Default) {
+            delay(1_000L)
+            releasePublication.complete(Unit)
+        }
+
+        try {
+            job.cancel()
+            val completedPromptly = withTimeoutOrNull(750L) {
+                job.join()
+                true
+            } ?: false
+
+            assertTrue("caller cancellation must not wait for publication cleanup", completedPromptly)
+            assertTrue(CalibrationExecutionGate.isCalibrationActive)
+            assertTrue(repository.saved.isEmpty())
+        } finally {
+            releasePublication.complete(Unit)
+            safetyRelease.cancel()
+            awaitCalibrationGateRelease()
+        }
+    }
+
+    @Test
+    fun callerCancellationDuringCommitRollsBackBeforeCalibrationGateReleases() = runBlocking {
+        val commitStarted = CompletableDeferred<Unit>()
+        val releaseCommit = CompletableDeferred<Unit>()
+        val saved = mutableListOf<InferenceBenchmarkResult>()
+        val repository = object : InferenceBenchmarkRepository {
+            override suspend fun save(result: InferenceBenchmarkResult) {
+                saved += result
+            }
+
+            override suspend fun publish(
+                result: InferenceBenchmarkResult,
+                gate: BenchmarkPublicationGate
+            ): Boolean = withContext(NonCancellable) {
+                gate.tryCommit(
+                    commit = {
+                        saved += result
+                        commitStarted.complete(Unit)
+                        runBlocking { releaseCommit.await() }
+                    },
+                    rollback = { saved.remove(result) }
+                )
+            }
+
+            override suspend fun list(): List<InferenceBenchmarkResult> = saved.toList()
+
+            override suspend fun findValid(
+                identity: BenchmarkIdentity,
+                nowEpochMs: Long
+            ): InferenceBenchmarkResult? = saved.lastOrNull { it.identity == identity }
+        }
+        val runner = successfulRunner(repository = repository, timeoutMs = 5_000L)
+        val job = async { runner.run(request(outputScale = 1)) }
+        commitStarted.await()
+
+        try {
+            job.cancel()
+            assertTrue(withTimeoutOrNull(750L) { job.join(); true } == true)
+            assertTrue(CalibrationExecutionGate.isCalibrationActive)
+        } finally {
+            releaseCommit.complete(Unit)
+            awaitCalibrationGateRelease()
+        }
+        assertTrue(saved.isEmpty())
     }
 
     @Test
@@ -387,6 +543,71 @@ class InferenceCalibrationRunnerTest {
         tta = false,
         outputFormat = OutputFormat.PNG
     )
+
+    private fun successfulRunner(
+        repository: InferenceBenchmarkRepository,
+        timeoutMs: Long
+    ): InferenceCalibrationRunner {
+        val durations = listOf(90L, 40L, 30L, 20L, 25L).iterator()
+        return InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    durations.next()
+                )
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            timeoutMs = timeoutMs
+        )
+    }
+
+    private fun slowPublicationRepository(
+        publishStarted: CompletableDeferred<Unit>,
+        releasePublication: CompletableDeferred<Unit>
+    ) = object : InferenceBenchmarkRepository {
+        val saved = mutableListOf<InferenceBenchmarkResult>()
+
+        override suspend fun save(result: InferenceBenchmarkResult) {
+            saved += result
+        }
+
+        override suspend fun publish(
+            result: InferenceBenchmarkResult,
+            gate: BenchmarkPublicationGate
+        ): Boolean = withContext(NonCancellable) {
+            publishStarted.complete(Unit)
+            releasePublication.await()
+            gate.tryCommit { saved += result }
+        }
+
+        override suspend fun list(): List<InferenceBenchmarkResult> = saved.toList()
+
+        override suspend fun findValid(
+            identity: BenchmarkIdentity,
+            nowEpochMs: Long
+        ): InferenceBenchmarkResult? = saved.lastOrNull { it.identity == identity }
+    }
+
+    private suspend fun awaitCalibrationGateRelease() {
+        for (attempt in 0 until 100) {
+            if (!CalibrationExecutionGate.isCalibrationActive) break
+            delay(10L)
+        }
+        assertFalse(CalibrationExecutionGate.isCalibrationActive)
+    }
+
+    private suspend fun awaitNativeCancel(cancelled: List<String>) {
+        for (attempt in 0 until 100) {
+            if (cancelled.isNotEmpty()) break
+            delay(10L)
+        }
+        assertTrue(cancelled.isNotEmpty())
+    }
 
     private class RecordingBenchmarkRepository : InferenceBenchmarkRepository {
         val saved = mutableListOf<InferenceBenchmarkResult>()

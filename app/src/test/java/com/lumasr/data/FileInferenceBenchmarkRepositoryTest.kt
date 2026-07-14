@@ -5,6 +5,10 @@ import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -14,10 +18,52 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 
 class FileInferenceBenchmarkRepositoryTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun cancellationRequestDoesNotBlockBehindCommitWork() = runBlocking {
+        val gate = BenchmarkPublicationGate()
+        val commitStarted = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val newRecordVisible = AtomicBoolean(false)
+        val commit = async(Dispatchers.Default) {
+            gate.tryCommit(
+                commit = {
+                    newRecordVisible.set(true)
+                    commitStarted.countDown()
+                    releaseCommit.await()
+                },
+                rollback = { newRecordVisible.set(false) }
+            )
+        }
+        commitStarted.await()
+        val safetyRelease = launch(Dispatchers.Default) {
+            delay(1_000L)
+            releaseCommit.countDown()
+        }
+
+        try {
+            val startedAt = System.nanoTime()
+            val cancelAccepted = gate.cancel()
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+
+            assertTrue(cancelAccepted)
+            assertTrue("cancel must not block behind file commit work", elapsedMs < 750L)
+        } finally {
+            releaseCommit.countDown()
+            safetyRelease.cancel()
+            assertFalse(commit.await())
+        }
+        assertFalse(newRecordVisible.get())
+    }
 
     @Test
     fun roundTripsMultipleResultsAndPositiveInfinityPsnr() = runBlocking {
@@ -184,6 +230,77 @@ class FileInferenceBenchmarkRepositoryTest {
     }
 
     @Test
+    fun cancellationDuringCommitRestoresOldRecordBeforeOtherRepositoryCanRead() = runBlocking {
+        val root = temporaryFolder.newFolder("rollback-old-record")
+        val oldResult = result(identity(), batchSize = 1)
+        FileInferenceBenchmarkRepository(root).save(oldResult)
+        val commitApplied = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val publisher = FileInferenceBenchmarkRepository(
+            directory = root,
+            atomicMove = blockingCommitMover(commitApplied, releaseCommit)
+        )
+        val reader = FileInferenceBenchmarkRepository(root)
+        val gate = BenchmarkPublicationGate()
+        val newResult = result(
+            identity(),
+            batchSize = 8,
+            measuredAt = 2_000L,
+            validUntil = 3_000L
+        )
+        val publication = async(Dispatchers.Default) {
+            publisher.publish(newResult, gate)
+        }
+        commitApplied.await()
+        val concurrentRead = async(Dispatchers.Default) { reader.list() }
+        delay(50L)
+
+        try {
+            assertFalse("reader must stay behind repository commit/rollback", concurrentRead.isCompleted)
+            assertTrue(gate.cancel())
+        } finally {
+            releaseCommit.countDown()
+        }
+
+        assertFalse(publication.await())
+        assertEquals(listOf(oldResult), concurrentRead.await())
+        assertEquals(listOf(oldResult), reader.list())
+        assertFalse(root.listFiles().orEmpty().any { it.name.contains("rollback") })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+    }
+
+    @Test
+    fun cancellationDuringFirstCommitRemovesNewRecordBeforeReadersProceed() = runBlocking {
+        val root = temporaryFolder.newFolder("rollback-first-record")
+        val commitApplied = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val publisher = FileInferenceBenchmarkRepository(
+            directory = root,
+            atomicMove = blockingCommitMover(commitApplied, releaseCommit)
+        )
+        val reader = FileInferenceBenchmarkRepository(root)
+        val gate = BenchmarkPublicationGate()
+        val publication = async(Dispatchers.Default) {
+            publisher.publish(result(identity()), gate)
+        }
+        commitApplied.await()
+        val concurrentRead = async(Dispatchers.Default) { reader.list() }
+        delay(50L)
+
+        try {
+            assertFalse(concurrentRead.isCompleted)
+            assertTrue(gate.cancel())
+        } finally {
+            releaseCommit.countDown()
+        }
+
+        assertFalse(publication.await())
+        assertTrue(concurrentRead.await().isEmpty())
+        assertTrue(reader.list().isEmpty())
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
     fun rejectsUnsupportedBatchNonFiniteMetricsAndUnnormalizedIdentity() {
         val root = temporaryFolder.newFolder("invalid")
         val repository = FileInferenceBenchmarkRepository(root)
@@ -241,6 +358,30 @@ class FileInferenceBenchmarkRepositoryTest {
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil
     )
+
+    private fun blockingCommitMover(
+        commitApplied: CountDownLatch,
+        releaseCommit: CountDownLatch
+    ): (File, File) -> Unit = { source, destination ->
+        moveReplacingForTest(source, destination)
+        if (destination.name == "inference-benchmarks.json" && source.name.endsWith(".tmp")) {
+            commitApplied.countDown()
+            releaseCommit.await()
+        }
+    }
+
+    private fun moveReplacingForTest(source: File, destination: File) {
+        try {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
 
     private companion object {
         const val DEVICE_HASH_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

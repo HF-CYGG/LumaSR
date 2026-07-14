@@ -1,14 +1,13 @@
 #include "superres_png_writer.h"
+#include "superres_atomic_publish.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <limits>
 #include <vector>
 
-#include <fcntl.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -57,24 +56,6 @@ bool write_png_header(FILE* file, int width, int height) {
     ihdr[9] = 2;
     return write_all(file, signature, sizeof(signature)) &&
         write_png_chunk(file, "IHDR", ihdr, sizeof(ihdr));
-}
-
-bool sync_parent_directory(const std::string& outputPath) {
-    try {
-        std::filesystem::path parent = std::filesystem::path(outputPath).parent_path();
-        if (parent.empty()) {
-            parent = ".";
-        }
-        const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (directory < 0) {
-            return false;
-        }
-        const bool synced = ::fsync(directory) == 0;
-        const bool closed = ::close(directory) == 0;
-        return synced && closed;
-    } catch (...) {
-        return false;
-    }
 }
 
 StreamingPngStatus deflate_status(int result) {
@@ -261,14 +242,12 @@ StreamingPngStatus StreamingPngWriter::publish() {
         impl_->temporaryPath.empty() || impl_->outputPath.empty()) {
         return StreamingPngStatus::InvalidState;
     }
-    StreamingPngStatus status = StreamingPngStatus::Ok;
-    if (std::rename(impl_->temporaryPath.c_str(), impl_->outputPath.c_str()) != 0) {
-        status = StreamingPngStatus::IoError;
-    } else if (!sync_parent_directory(impl_->outputPath)) {
-        std::remove(impl_->outputPath.c_str());
-        sync_parent_directory(impl_->outputPath);
-        status = StreamingPngStatus::IoError;
-    }
+    const StreamingPngStatus status = publish_atomic_file(
+        impl_->temporaryPath,
+        impl_->outputPath
+    ) == SuperResAtomicPublishStatus::Ok
+        ? StreamingPngStatus::Ok
+        : StreamingPngStatus::IoError;
     if (status != StreamingPngStatus::Ok) {
         abort();
         return status;

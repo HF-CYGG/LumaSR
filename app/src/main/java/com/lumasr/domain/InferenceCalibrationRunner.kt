@@ -3,17 +3,19 @@ package com.lumasr.domain
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 data class CalibrationProbeOutput(
     val image: RgbImage,
@@ -76,59 +78,43 @@ class InferenceCalibrationRunner(
         val executionLease = CalibrationExecutionGate.tryEnterCalibration()
             ?: return CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         val taskId = "calibration-${UUID.randomUUID()}"
-        return coroutineScope {
-            val timedOut = AtomicBoolean(false)
-            val finished = AtomicBoolean(false)
-            val cancelSent = AtomicBoolean(false)
-            val publicationGate = BenchmarkPublicationGate()
-            fun cancelNativeOnce() {
-                if (cancelSent.compareAndSet(false, true)) probe.cancel(taskId)
-            }
-            val preparation = CalibrationProbeRuntime.scope.async {
-                runBounded(request, taskId)
-            }
-            preparation.invokeOnCompletion { executionLease.close() }
-            val cancellationWatcher = launch(Dispatchers.Default) {
-                try {
-                    awaitCancellation()
-                } finally {
-                    if (!finished.get() && publicationGate.cancel()) {
-                        preparation.cancel()
-                        cancelNativeOnce()
-                    }
+        val publicationGate = BenchmarkPublicationGate()
+        val cancelSent = AtomicBoolean(false)
+        fun cancelNativeOnce() {
+            if (cancelSent.compareAndSet(false, true)) {
+                CalibrationProbeRuntime.scope.launch {
+                    runCatching { probe.cancel(taskId) }
                 }
             }
-            val deadlineWatcher = launch(Dispatchers.Default) {
-                delay(timeoutMs)
-                if (publicationGate.cancel()) {
-                    timedOut.set(true)
-                    preparation.cancel()
-                    cancelNativeOnce()
-                }
+        }
+        val operation = try {
+            CalibrationProbeRuntime.scope.async {
+                publish(runBounded(request, taskId), publicationGate)
             }
-            try {
-                val prepared = withTimeoutOrNull(timeoutMs) { preparation.await() }
-                if (prepared == null) {
-                    if (publicationGate.cancel()) timedOut.set(true)
-                    preparation.cancel()
-                    cancelNativeOnce()
-                    return@coroutineScope CalibrationRunResult.TimedOut
-                }
-                if (timedOut.get()) return@coroutineScope CalibrationRunResult.TimedOut
-                publish(prepared, publicationGate, timedOut::get)
-            } catch (cancelled: CancellationException) {
-                if (publicationGate.cancel()) {
-                    preparation.cancel()
-                    cancelNativeOnce()
-                }
-                throw cancelled
-            } catch (_: Exception) {
-                CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
-            } finally {
-                finished.set(true)
-                cancellationWatcher.cancel()
-                deadlineWatcher.cancel()
+        } catch (error: Exception) {
+            executionLease.close()
+            throw error
+        }
+        operation.invokeOnCompletion { executionLease.close() }
+        fun cancelOperation() {
+            publicationGate.cancel()
+            operation.cancel()
+            cancelNativeOnce()
+        }
+
+        return try {
+            withTimeoutOrNull(timeoutMs) {
+                operation.awaitWithCancellation(::cancelOperation)
             }
+                ?: run {
+                    cancelOperation()
+                    CalibrationRunResult.TimedOut
+                }
+        } catch (cancelled: CancellationException) {
+            cancelOperation()
+            throw cancelled
+        } catch (_: Exception) {
+            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         }
     }
 
@@ -197,16 +183,13 @@ class InferenceCalibrationRunner(
 
     private suspend fun publish(
         prepared: CalibrationPreparation,
-        publicationGate: BenchmarkPublicationGate,
-        deadlineReached: () -> Boolean
+        publicationGate: BenchmarkPublicationGate
     ): CalibrationRunResult {
         return when (prepared) {
             is CalibrationPreparation.Failed -> CalibrationRunResult.Failed(prepared.reason)
             is CalibrationPreparation.Ready -> try {
                 if (repository.publish(prepared.benchmark, publicationGate)) {
                     CalibrationRunResult.Completed(prepared.benchmark)
-                } else if (deadlineReached()) {
-                    CalibrationRunResult.TimedOut
                 } else {
                     CalibrationRunResult.Failed(CalibrationFailureReason.PERSISTENCE_FAILED)
                 }
@@ -252,6 +235,21 @@ class InferenceCalibrationRunner(
 
         data class Failed(val reason: CalibrationFailureReason) : CalibrationPreparation
 
+    }
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+private suspend fun <T> Deferred<T>.awaitWithCancellation(
+    onCancellation: () -> Unit
+): T = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { onCancellation() }
+    invokeOnCompletion { failure ->
+        if (!continuation.isActive) return@invokeOnCompletion
+        if (failure == null) {
+            continuation.resume(getCompleted())
+        } else {
+            continuation.resumeWithException(failure)
+        }
     }
 }
 
