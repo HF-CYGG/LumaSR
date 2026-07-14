@@ -15,6 +15,8 @@ import androidx.annotation.RequiresApi
 import com.lumasr.R
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
+import com.lumasr.data.AndroidThermalSignalSource
+import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
 import com.lumasr.domain.ProcessingSnapshotLease
@@ -61,7 +63,11 @@ class SuperResolutionService : Service() {
         coordinator = ProcessingCoordinator(
             taskRepository = FileProcessingTaskRepository(taskDirectory),
             workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory),
-            runner = SuperResProcessingTaskRunner()
+            runner = SuperResProcessingTaskRunner(
+                thermalLevelProvider = ThermalSampler(
+                    AndroidThermalSignalSource(this)
+                )::sampleLevel
+            )
         )
         snapshotLease = checkNotNull(
             ApplicationProcessingSnapshotBridge.acquire(ProcessingSnapshotOwner.SERVICE)
@@ -106,7 +112,7 @@ class SuperResolutionService : Service() {
             }
 
             IncomingProcessingServiceCommand.RECOVER_ONLY -> launchOperation(operation) {
-                ownerSession.runAfterPredecessorRelease {
+                ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
                     coordinator.start()
                 }
             }
