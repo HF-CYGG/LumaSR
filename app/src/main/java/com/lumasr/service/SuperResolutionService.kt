@@ -54,10 +54,13 @@ class SuperResolutionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_CANCEL) {
-            val taskId = intent.getStringExtra(EXTRA_TASK_ID)
-            if (!taskId.isNullOrBlank()) {
-                serviceScope.launch { coordinator.cancel(taskId) }
+        when (intent?.action) {
+            ACTION_RESUME -> serviceScope.launch { coordinator.resumePersistedWork() }
+            ACTION_CANCEL -> {
+                val taskId = intent.getStringExtra(EXTRA_TASK_ID)
+                if (!taskId.isNullOrBlank()) {
+                    serviceScope.launch { coordinator.cancel(taskId) }
+                }
             }
         }
         return START_STICKY

@@ -80,38 +80,54 @@ class ProcessingCoordinator(
 
     suspend fun start() {
         if (!started.compareAndSet(false, true)) return
-        val taskIdsToQueue = try {
-            stateMutex.withLock {
-                val persisted = taskRepository.list()
-                    .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
-                val recovered = persisted.map { task ->
-                    if (task.state == ProcessingTaskState.RUNNING) {
-                        val workSpec = workSpecRepository.find(task.id)
-                        TaskRecoveryPolicy.recover(
-                            task = task,
-                            mode = recoveryMode(task, workSpec),
-                            atEpochMs = safeNow(task)
-                        ).also { taskRepository.save(it) }
-                    } else {
-                        task
-                    }
-                }
-                tasksById.clear()
-                recovered.forEach { tasksById[it.id] = it }
-                publishAll(recovered)
-                recovered
-                    .asSequence()
-                    .filter { it.state == ProcessingTaskState.QUEUED }
-                    .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
-                    .map(ProcessingTask::id)
-                    .filter(enqueuedTaskIds::add)
-                    .toList()
-            }
+        try {
+            workerJob = scope.launch { consumeQueue() }
+            refreshQueue()
         } catch (failure: Throwable) {
+            workerJob?.cancel()
             started.set(false)
             throw failure
         }
-        workerJob = scope.launch { consumeQueue() }
+    }
+
+    suspend fun resumePersistedWork() {
+        if (started.get()) {
+            refreshQueue()
+        } else {
+            start()
+        }
+    }
+
+    suspend fun refreshQueue() {
+        check(started.get()) { "Coordinator must be started before refresh" }
+        val taskIdsToQueue = stateMutex.withLock {
+            val persisted = taskRepository.list()
+                .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
+            val added = mutableListOf<ProcessingTask>()
+            persisted.forEach { task ->
+                if (tasksById.containsKey(task.id)) return@forEach
+                val merged = if (task.state == ProcessingTaskState.RUNNING) {
+                    val workSpec = workSpecRepository.find(task.id)
+                    TaskRecoveryPolicy.recover(
+                        task = task,
+                        mode = recoveryMode(task, workSpec),
+                        atEpochMs = safeNow(task)
+                    ).also { taskRepository.save(it) }
+                } else {
+                    task
+                }
+                tasksById[merged.id] = merged
+                publishTask(merged)
+                added += merged
+            }
+            added
+                .asSequence()
+                .filter { it.state == ProcessingTaskState.QUEUED }
+                .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
+                .map(ProcessingTask::id)
+                .filter(enqueuedTaskIds::add)
+                .toList()
+        }
         taskIdsToQueue.forEach { queue.send(it) }
     }
 
@@ -158,10 +174,13 @@ class ProcessingCoordinator(
     }
 
     suspend fun pauseActive() {
-        val execution = stateMutex.withLock {
-            val current = activeExecution ?: return@withLock null
-            val task = tasksById[current.taskId] ?: return@withLock null
-            if (task.state != ProcessingTaskState.RUNNING) return@withLock null
+        val pausedExecution = stateMutex.withLock {
+            val current = activeExecution
+            val task = current
+                ?.let { tasksById[it.taskId] }
+                ?.takeIf { it.state == ProcessingTaskState.RUNNING }
+                ?: tasksById.values.firstOrNull { it.state == ProcessingTaskState.RUNNING }
+                ?: return@withLock null
             val paused = ProcessingTaskTransitions.transition(
                 task = task,
                 targetState = ProcessingTaskState.PAUSED,
@@ -170,10 +189,10 @@ class ProcessingCoordinator(
             taskRepository.save(paused)
             tasksById[task.id] = paused
             publishTask(paused)
-            current
+            PausedExecution(task.id, current?.takeIf { it.taskId == task.id })
         }
-        execution?.let {
-            runCatching { runner.cancel(it.taskId) }
+        pausedExecution?.active?.let {
+            runCatching { runner.cancel(pausedExecution.taskId) }
             it.result.cancel(CancellationException("Task paused by foreground-service timeout"))
         }
         workerJob?.cancel(CancellationException("Foreground-service timeout"))
@@ -187,7 +206,6 @@ class ProcessingCoordinator(
     private suspend fun consumeQueue() {
         for (taskId in queue) {
             if (!scope.isActive) return
-            stateMutex.withLock { enqueuedTaskIds.remove(taskId) }
             execute(taskId)
         }
     }
@@ -195,8 +213,11 @@ class ProcessingCoordinator(
     private suspend fun execute(taskId: String) {
         val workSpec = workSpecRepository.find(taskId)
         val running = stateMutex.withLock {
-            val task = tasksById[taskId] ?: taskRepository.find(taskId) ?: return
-            if (task.state != ProcessingTaskState.QUEUED) return
+            val task = tasksById[taskId] ?: taskRepository.find(taskId)
+            if (task == null || task.state != ProcessingTaskState.QUEUED) {
+                enqueuedTaskIds.remove(taskId)
+                return
+            }
             ProcessingTaskTransitions.transition(
                 task = task,
                 targetState = ProcessingTaskState.RUNNING,
@@ -204,6 +225,7 @@ class ProcessingCoordinator(
             ).also { transitioned ->
                 taskRepository.save(transitioned)
                 tasksById[taskId] = transitioned
+                enqueuedTaskIds.remove(taskId)
                 publishTask(transitioned)
             }
         }
@@ -282,9 +304,12 @@ class ProcessingCoordinator(
             val terminal = progress.stage in TERMINAL_PROGRESS_STAGES
             val intervalElapsed = previousAt == null || now - previousAt >= PROGRESS_INTERVAL_MS
             if (!stageChanged && !terminal && !intervalElapsed) return
-            lastProgressAtMs[taskId] = now
-            lastProgressStage[taskId] = progress.stage
+            var forwarded = false
             _snapshots.update { snapshots ->
+                forwarded = false
+                val target = snapshots.firstOrNull { it.task.id == taskId }
+                if (target?.task?.state != ProcessingTaskState.RUNNING) return@update snapshots
+                forwarded = true
                 snapshots.map { snapshot ->
                     if (snapshot.task.id == taskId) {
                         snapshot.copy(progress = progress.copy(taskId = taskId))
@@ -293,13 +318,10 @@ class ProcessingCoordinator(
                     }
                 }
             }
+            if (!forwarded) return
+            lastProgressAtMs[taskId] = now
+            lastProgressStage[taskId] = progress.stage
         }
-    }
-
-    private fun publishAll(tasks: List<ProcessingTask>) {
-        _snapshots.value = tasks
-            .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
-            .map { ProcessingTaskSnapshot(task = it, progress = null) }
     }
 
     private fun publishTask(task: ProcessingTask) {
@@ -308,6 +330,16 @@ class ProcessingCoordinator(
             (snapshots.filterNot { it.task.id == task.id } +
                 ProcessingTaskSnapshot(task = task, progress = previous?.progress))
                 .sortedWith(compareBy<ProcessingTaskSnapshot>({ it.task.createdAtEpochMs }, { it.task.id }))
+        }
+        if (task.state.isTerminal || task.state == ProcessingTaskState.PAUSED) {
+            clearProgressThrottle(task.id)
+        }
+    }
+
+    private fun clearProgressThrottle(taskId: String) {
+        synchronized(progressLock) {
+            lastProgressAtMs.remove(taskId)
+            lastProgressStage.remove(taskId)
         }
     }
 
@@ -322,6 +354,11 @@ class ProcessingCoordinator(
     private data class ActiveExecution(
         val taskId: String,
         val result: Deferred<ProcessingRunResult>
+    )
+
+    private data class PausedExecution(
+        val taskId: String,
+        val active: ActiveExecution?
     )
 
     private companion object {

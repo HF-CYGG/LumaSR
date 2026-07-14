@@ -7,11 +7,13 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -36,6 +38,39 @@ class ProcessingCoordinatorTest {
             runner.complete("third")
             coordinator.awaitState("third", ProcessingTaskState.COMPLETED)
             Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun refreshesPersistedQueueIdempotentlyWhileCoordinatorIsAlreadyRunning() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        tasks.seed(task("initial", createdAt = 500L))
+        work.seed(spec("initial"))
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            assertEquals("initial", runner.awaitStarted())
+
+            tasks.seed(
+                task("b-refresh", createdAt = 1_000L),
+                task("a-refresh", createdAt = 1_000L)
+            )
+            work.seed(spec("b-refresh"), spec("a-refresh"))
+            coordinator.resumePersistedWork()
+            coordinator.resumePersistedWork()
+
+            runner.complete("initial")
+            assertEquals("a-refresh", runner.awaitStarted())
+            runner.complete("a-refresh")
+            assertEquals("b-refresh", runner.awaitStarted())
+            runner.complete("b-refresh")
+            coordinator.awaitState("b-refresh", ProcessingTaskState.COMPLETED)
+
+            assertEquals(listOf("initial", "a-refresh", "b-refresh"), runner.startedIds)
         } finally {
             coordinator.close()
         }
@@ -135,6 +170,43 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun pauseCheckpointsRunningTaskDuringPreExecutionRegistrationWindow() = runBlocking {
+        val runningSaved = CompletableDeferred<Unit>()
+        val releaseRunningSave = CompletableDeferred<Unit>()
+        val tasks = InMemoryTaskRepository { saved ->
+            if (saved.state == ProcessingTaskState.RUNNING) {
+                runningSaved.complete(Unit)
+                releaseRunningSave.await()
+            }
+        }
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("pause-window"), spec("pause-window"))
+            withTimeout(5_000L) { runningSaved.await() }
+
+            val pauseAttempted = CompletableDeferred<Unit>()
+            val pause = async {
+                pauseAttempted.complete(Unit)
+                coordinator.pauseActive()
+            }
+            pauseAttempted.await()
+            delay(50L)
+            releaseRunningSave.complete(Unit)
+            pause.await()
+
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("pause-window")?.state)
+            delay(50L)
+            assertTrue(runner.startedIds.isEmpty())
+        } finally {
+            releaseRunningSave.complete(Unit)
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun runnerExceptionBecomesTypedRetryableFailure() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -200,6 +272,56 @@ class ProcessingCoordinatorTest {
         }
     }
 
+    @Test
+    fun ignoresLateNonTerminalProgressAndClearsThrottleStateAfterCancellation() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("cancel-progress"), spec("cancel-progress"))
+            assertEquals("cancel-progress", runner.awaitStarted())
+            runner.emit(progress("cancel-progress", UpscaleStage.PREPARING, 0.25f))
+
+            coordinator.cancel("cancel-progress")
+            runner.emit(progress("cancel-progress", UpscaleStage.PROCESSING_TILE, 0.9f))
+
+            val snapshot = coordinator.snapshots.value.single()
+            assertEquals(ProcessingTaskState.CANCELLED, snapshot.task.state)
+            assertEquals(0.25f, snapshot.progress?.progress)
+            coordinator.assertProgressThrottleCleared("cancel-progress")
+            runner.complete("cancel-progress")
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun ignoresLateNonTerminalProgressAndClearsThrottleStateAfterPause() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("pause-progress"), spec("pause-progress"))
+            assertEquals("pause-progress", runner.awaitStarted())
+            runner.emit(progress("pause-progress", UpscaleStage.PREPARING, 0.2f))
+
+            coordinator.pauseActive()
+            runner.emit(progress("pause-progress", UpscaleStage.PROCESSING_TILE, 0.8f))
+
+            val snapshot = coordinator.snapshots.value.single()
+            assertEquals(ProcessingTaskState.PAUSED, snapshot.task.state)
+            assertEquals(0.2f, snapshot.progress?.progress)
+            coordinator.assertProgressThrottleCleared("pause-progress")
+            runner.complete("pause-progress")
+        } finally {
+            coordinator.close()
+        }
+    }
+
     private fun coordinator(
         tasks: ProcessingTaskRepository,
         work: ProcessingWorkSpecRepository,
@@ -221,6 +343,16 @@ class ProcessingCoordinatorTest {
             if (matched == null) delay(10L)
         } while (matched == null)
         matched
+    }
+
+    private fun ProcessingCoordinator.assertProgressThrottleCleared(taskId: String) {
+        listOf("lastProgressAtMs", "lastProgressStage").forEach { fieldName ->
+            val field = ProcessingCoordinator::class.java.getDeclaredField(fieldName)
+            field.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val values = field.get(this) as Map<String, *>
+            assertFalse("$fieldName retains $taskId", values.containsKey(taskId))
+        }
     }
 
     private fun task(
@@ -283,7 +415,9 @@ class ProcessingCoordinatorTest {
     ) : ProcessingTaskRunner {
         private val started = Channel<String>(Channel.UNLIMITED)
         private val gates = ConcurrentHashMap<String, CompletableDeferred<ProcessingRunResult>>()
+        private val progressCallbacks = ConcurrentHashMap<String, (UpscaleProgress) -> Unit>()
         val cancelled = CopyOnWriteArrayList<String>()
+        val startedIds = CopyOnWriteArrayList<String>()
 
         override suspend fun run(
             task: ProcessingTask,
@@ -292,6 +426,8 @@ class ProcessingCoordinatorTest {
         ): ProcessingRunResult {
             val gate = CompletableDeferred<ProcessingRunResult>()
             gates[task.id] = gate
+            progressCallbacks[task.id] = onProgress
+            startedIds += task.id
             started.send(task.id)
             return if (ignoreCoroutineCancellation) {
                 kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { gate.await() }
@@ -309,9 +445,15 @@ class ProcessingCoordinatorTest {
         fun complete(taskId: String) {
             checkNotNull(gates[taskId]).complete(ProcessingRunResult.Completed)
         }
+
+        fun emit(progress: UpscaleProgress) {
+            checkNotNull(progressCallbacks[progress.taskId]).invoke(progress)
+        }
     }
 
-    private class InMemoryTaskRepository : ProcessingTaskRepository {
+    private class InMemoryTaskRepository(
+        private val afterSave: suspend (ProcessingTask) -> Unit = {}
+    ) : ProcessingTaskRepository {
         private val records = ConcurrentHashMap<String, ProcessingTask>()
         val saved = CopyOnWriteArrayList<ProcessingTask>()
 
@@ -322,6 +464,7 @@ class ProcessingCoordinatorTest {
         override suspend fun save(task: ProcessingTask) {
             records[task.id] = task
             saved += task
+            afterSave(task)
         }
 
         override suspend fun find(taskId: String): ProcessingTask? = records[taskId]
