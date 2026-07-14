@@ -14,6 +14,13 @@ import com.lumasr.service.ProcessingServiceStartResult
 import com.lumasr.service.ProcessingServiceStarter
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -134,6 +141,40 @@ class ProcessingTaskSubmissionStoreTest {
         assertTrue(events.isEmpty())
     }
 
+    @Test
+    fun twoStoreInstancesArbitrateSameTaskWithoutLoserDeletingWinner() = runBlocking {
+        val taskRepository = ConcurrentRaceTaskRepository()
+        val workRepository = ConcurrentWorkRepository(taskRepository.firstTaskSaved)
+        val resumeCount = AtomicInteger(0)
+        fun newStore() = ProcessingTaskSubmissionStore(
+            taskRepository = taskRepository,
+            workSpecRepository = workRepository,
+            serviceClient = ProcessingServiceClient(
+                ProcessingServiceStarter { resumeCount.incrementAndGet() }
+            )
+        )
+        val firstStore = newStore()
+        val secondStore = newStore()
+
+        val firstResult = async(Dispatchers.Default) {
+            runCatching { firstStore.submit(task(), spec()) }
+        }
+        workRepository.firstSaveEntered.await()
+        val secondResult = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            runCatching { secondStore.submit(task(), spec()) }
+        }
+        workRepository.releaseFirstSave.complete(Unit)
+        val results = listOf(firstResult, secondResult).awaitAll()
+
+        assertEquals(1, results.count { it.isSuccess })
+        assertEquals(1, results.count { it.exceptionOrNull() is IllegalStateException })
+        assertEquals(1, resumeCount.get())
+        assertEquals(task(), taskRepository.find("task-1"))
+        assertEquals(spec(), workRepository.find("task-1"))
+        assertEquals(0, taskRepository.deleteCount.get())
+        assertEquals(0, workRepository.deleteCount.get())
+    }
+
     private fun store(
         tasks: ProcessingTaskRepository,
         work: ProcessingWorkSpecRepository,
@@ -222,4 +263,53 @@ class ProcessingTaskSubmissionStoreTest {
             return records.remove(taskId) != null
         }
     }
+
+    private class ConcurrentRaceTaskRepository : ProcessingTaskRepository {
+        private val records = ConcurrentHashMap<String, ProcessingTask>()
+        val firstTaskSaved = CompletableDeferred<Unit>()
+        val deleteCount = AtomicInteger(0)
+
+        override suspend fun save(task: ProcessingTask) {
+            records[task.id] = task
+            firstTaskSaved.complete(Unit)
+        }
+
+        override suspend fun find(taskId: String): ProcessingTask? = records[taskId]
+
+        override suspend fun list(): List<ProcessingTask> = records.values.toList()
+
+        override suspend fun delete(taskId: String): Boolean {
+            deleteCount.incrementAndGet()
+            return records.remove(taskId) != null
+        }
+    }
+
+    private class ConcurrentWorkRepository(
+        private val firstTaskSaved: CompletableDeferred<Unit>
+    ) : ProcessingWorkSpecRepository {
+        private val records = ConcurrentHashMap<String, ProcessingWorkSpec>()
+        private val saveCount = AtomicInteger(0)
+        val firstSaveEntered = CompletableDeferred<Unit>()
+        val releaseFirstSave = CompletableDeferred<Unit>()
+        val deleteCount = AtomicInteger(0)
+
+        override suspend fun save(workSpec: ProcessingWorkSpec) {
+            if (saveCount.incrementAndGet() == 1) {
+                firstSaveEntered.complete(Unit)
+                releaseFirstSave.await()
+                records[workSpec.taskId] = workSpec
+            } else {
+                firstTaskSaved.await()
+                throw IOException("concurrent work write rejected")
+            }
+        }
+
+        override suspend fun find(taskId: String): ProcessingWorkSpec? = records[taskId]
+
+        override suspend fun delete(taskId: String): Boolean {
+            deleteCount.incrementAndGet()
+            return records.remove(taskId) != null
+        }
+    }
+
 }

@@ -17,12 +17,10 @@ class ProcessingTaskSubmissionStore(
     private val workSpecRepository: ProcessingWorkSpecRepository,
     private val serviceClient: ProcessingServiceClient
 ) {
-    private val submissionMutex = Mutex()
-
     suspend fun submit(
         task: ProcessingTask,
         workSpec: ProcessingWorkSpec
-    ): ProcessingServiceStartResult = submissionMutex.withLock {
+    ): ProcessingServiceStartResult = processSubmissionMutex.withLock {
         validate(task, workSpec)
         check(taskRepository.find(task.id) == null && workSpecRepository.find(task.id) == null) {
             "Task ${task.id} has already been submitted"
@@ -50,5 +48,9 @@ class ProcessingTaskSubmissionStore(
         require(task.outputPath == workSpec.params.outputPath) {
             "Task and work spec output paths must match"
         }
+    }
+
+    private companion object {
+        val processSubmissionMutex = Mutex()
     }
 }
