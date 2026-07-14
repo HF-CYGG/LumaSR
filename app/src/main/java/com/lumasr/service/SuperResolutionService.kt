@@ -27,6 +27,7 @@ import kotlinx.coroutines.launch
 
 class SuperResolutionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val lifecycleGate = ProcessingServiceLifecycleGate()
     private lateinit var notificationManager: NotificationManager
     private lateinit var coordinator: ProcessingCoordinator
 
@@ -43,25 +44,30 @@ class SuperResolutionService : Service() {
             runner = SuperResProcessingTaskRunner()
         )
         serviceScope.launch {
-            coordinator.start()
             coordinator.snapshots.collectLatest { snapshots ->
                 val active = snapshots.firstOrNull { it.task.state == ProcessingTaskState.RUNNING }
                     ?: snapshots.firstOrNull { it.task.state == ProcessingTaskState.QUEUED }
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(active))
-                if (active == null) stopSelf()
+                stopIfIdle(snapshots)
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val operation = lifecycleGate.beginOperation(startId)
         when (intent?.action) {
-            ACTION_RESUME -> serviceScope.launch { coordinator.resumePersistedWork() }
+            ACTION_RESUME -> launchOperation(operation) { coordinator.resumePersistedWork() }
             ACTION_CANCEL -> {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID)
                 if (!taskId.isNullOrBlank()) {
-                    serviceScope.launch { coordinator.cancel(taskId) }
+                    launchOperation(operation) { coordinator.cancel(taskId) }
+                } else {
+                    lifecycleGate.completeOperation(operation)
+                    stopIfIdle(coordinator.snapshots.value)
                 }
             }
+
+            else -> launchOperation(operation) { coordinator.resumePersistedWork() }
         }
         return START_STICKY
     }
@@ -72,7 +78,7 @@ class SuperResolutionService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         serviceScope.launch {
             coordinator.pauseActive()
-            stopSelf(startId)
+            stopSelfResult(startId)
         }
     }
 
@@ -92,6 +98,30 @@ class SuperResolutionService : Service() {
             setShowBadge(false)
         }
         notificationManager.createNotificationChannel(channel)
+    }
+
+    private fun launchOperation(
+        operation: ProcessingServiceLifecycleGate.Operation,
+        block: suspend () -> Unit
+    ) {
+        serviceScope.launch {
+            try {
+                block()
+            } finally {
+                lifecycleGate.completeOperation(operation)
+                stopIfIdle(coordinator.snapshots.value)
+            }
+        }
+    }
+
+    private fun stopIfIdle(snapshots: List<ProcessingTaskSnapshot>) {
+        val isIdle = snapshots.none {
+            it.task.state == ProcessingTaskState.RUNNING || it.task.state == ProcessingTaskState.QUEUED
+        }
+        val candidate = lifecycleGate.idleStopCandidate(isIdle) ?: return
+        if (lifecycleGate.isStopStillValid(candidate)) {
+            stopSelfResult(candidate.startId)
+        }
     }
 
     private fun buildNotification(active: ProcessingTaskSnapshot?): Notification {

@@ -3,14 +3,22 @@ package com.lumasr.domain
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -207,6 +215,228 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun pauseWaitsForCancelledExecutionToFinish() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val started = CompletableDeferred<Unit>()
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val runner = object : ProcessingTaskRunner {
+            override suspend fun run(
+                task: ProcessingTask,
+                workSpec: ProcessingWorkSpec,
+                onProgress: (UpscaleProgress) -> Unit
+            ): ProcessingRunResult {
+                started.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    withContext(NonCancellable) {
+                        cleanupStarted.complete(Unit)
+                        releaseCleanup.await()
+                    }
+                }
+            }
+
+            override fun cancel(taskId: String) = Unit
+        }
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("pause-join"), spec("pause-join"))
+            withTimeout(5_000L) { started.await() }
+
+            val pause = async { coordinator.pauseActive() }
+            withTimeout(5_000L) { cleanupStarted.await() }
+
+            assertFalse(pause.isCompleted)
+            releaseCleanup.complete(Unit)
+            withTimeout(5_000L) { pause.await() }
+        } finally {
+            releaseCleanup.complete(Unit)
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun pauseTimeoutReturnsWithoutAllowingResumeToOverlapOldExecution() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner(ignoreCoroutineCancellation = true)
+        val coordinator = coordinator(
+            tasks = tasks,
+            work = work,
+            runner = runner,
+            pauseJoinTimeoutMs = 50L
+        )
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("stuck-runner", createdAt = 500L), spec("stuck-runner"))
+            assertEquals("stuck-runner", runner.awaitStarted())
+
+            withTimeout(1_000L) { coordinator.pauseActive() }
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("stuck-runner")?.state)
+
+            tasks.seed(task("after-timeout", createdAt = 1_000L))
+            work.seed(spec("after-timeout"))
+            val resume = async(Dispatchers.Default) { coordinator.resumePersistedWork() }
+            delay(100L)
+            assertFalse(resume.isCompleted)
+            assertEquals(listOf("stuck-runner"), runner.startedIds)
+
+            runner.complete("stuck-runner")
+            withTimeout(5_000L) { resume.await() }
+            assertEquals("after-timeout", runner.awaitStarted())
+            assertEquals(1, runner.maxActiveExecutions)
+            runner.complete("after-timeout")
+            coordinator.awaitState("after-timeout", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            runner.completeIfStarted("stuck-runner")
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun concurrentResumeRebuildsOneWorkerAfterPause() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("before-pause", createdAt = 500L), spec("before-pause"))
+            assertEquals("before-pause", runner.awaitStarted())
+            coordinator.pauseActive()
+
+            tasks.seed(
+                task("resume-first", createdAt = 1_000L),
+                task("resume-second", createdAt = 1_001L)
+            )
+            work.seed(spec("resume-first"), spec("resume-second"))
+
+            List(4) { async { coordinator.resumePersistedWork() } }.awaitAll()
+
+            assertEquals("resume-first", runner.awaitStarted())
+            delay(50L)
+            assertEquals(1, runner.maxActiveExecutions)
+            assertEquals(1, runner.startedIds.count { it.startsWith("resume-") })
+            runner.complete("resume-first")
+            assertEquals("resume-second", runner.awaitStarted())
+            runner.complete("resume-second")
+            coordinator.awaitState("resume-second", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun refreshExecutesNewerExplicitRetryForExistingTerminalTaskOnce() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("retry-existing"), spec("retry-existing"))
+            assertEquals("retry-existing", runner.awaitStarted())
+            runner.complete("retry-existing")
+            val completed = coordinator.awaitState("retry-existing", ProcessingTaskState.COMPLETED)
+
+            tasks.seed(
+                ProcessingTaskTransitions.retry(
+                    task = completed,
+                    atEpochMs = completed.updatedAtEpochMs + 1L
+                )
+            )
+            List(3) { async { coordinator.resumePersistedWork() } }.awaitAll()
+
+            assertEquals("retry-existing", runner.awaitStarted())
+            delay(50L)
+            assertEquals(2, runner.startedIds.count { it == "retry-existing" })
+            runner.complete("retry-existing")
+            coordinator.awaitState("retry-existing", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun resumeWaitsForConcurrentPauseBeforeRebuildingWorker() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val cancelEntered = CountDownLatch(1)
+        val releaseCancel = CountDownLatch(1)
+        val runner = GateRunner(
+            onCancel = {
+                cancelEntered.countDown()
+                check(releaseCancel.await(5L, TimeUnit.SECONDS))
+            }
+        )
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("pausing", createdAt = 500L), spec("pausing"))
+            assertEquals("pausing", runner.awaitStarted())
+
+            val pause = async(Dispatchers.Default) { coordinator.pauseActive() }
+            assertTrue(cancelEntered.await(5L, TimeUnit.SECONDS))
+            tasks.seed(task("during-pause", createdAt = 1_000L))
+            work.seed(spec("during-pause"))
+
+            val resume = async(Dispatchers.Default) { coordinator.resumePersistedWork() }
+            delay(50L)
+            assertFalse(resume.isCompleted)
+
+            releaseCancel.countDown()
+            withTimeout(5_000L) {
+                pause.await()
+                resume.await()
+            }
+            assertEquals("during-pause", runner.awaitStarted())
+            runner.complete("during-pause")
+            coordinator.awaitState("during-pause", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            releaseCancel.countDown()
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun resumeRecoversQueuedTaskAfterWorkerExitsUnexpectedly() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val failedFind = CompletableDeferred<Unit>()
+        val failOnce = AtomicBoolean(true)
+        val work = InMemoryWorkRepository { taskId ->
+            if (taskId == "worker-exit" && failOnce.compareAndSet(true, false)) {
+                failedFind.complete(Unit)
+                throw IOException("work repository unavailable")
+            }
+        }
+        val runner = GateRunner()
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            coordinator.enqueue(task("worker-exit"), spec("worker-exit"))
+            withTimeout(5_000L) { failedFind.await() }
+            coordinator.awaitWorkerStopped()
+
+            coordinator.resumePersistedWork()
+
+            assertEquals("worker-exit", runner.awaitStarted())
+            runner.complete("worker-exit")
+            coordinator.awaitState("worker-exit", ProcessingTaskState.COMPLETED)
+            assertEquals(1, runner.startedIds.count { it == "worker-exit" })
+            Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun runnerExceptionBecomesTypedRetryableFailure() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -302,7 +532,7 @@ class ProcessingCoordinatorTest {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
         val runner = GateRunner(ignoreCoroutineCancellation = true)
-        val coordinator = coordinator(tasks, work, runner)
+        val coordinator = coordinator(tasks, work, runner, pauseJoinTimeoutMs = 50L)
         try {
             coordinator.start()
             coordinator.enqueue(task("pause-progress"), spec("pause-progress"))
@@ -327,8 +557,9 @@ class ProcessingCoordinatorTest {
         work: ProcessingWorkSpecRepository,
         runner: ProcessingTaskRunner,
         dispatcher: CoroutineDispatcher = Dispatchers.Default,
-        clock: ProcessingClock = FakeClock(10_000L)
-    ) = ProcessingCoordinator(tasks, work, runner, dispatcher, clock)
+        clock: ProcessingClock = FakeClock(10_000L),
+        pauseJoinTimeoutMs: Long = 5_000L
+    ) = ProcessingCoordinator(tasks, work, runner, dispatcher, clock, pauseJoinTimeoutMs)
 
     private suspend fun ProcessingCoordinator.awaitState(
         taskId: String,
@@ -352,6 +583,14 @@ class ProcessingCoordinatorTest {
             @Suppress("UNCHECKED_CAST")
             val values = field.get(this) as Map<String, *>
             assertFalse("$fieldName retains $taskId", values.containsKey(taskId))
+        }
+    }
+
+    private suspend fun ProcessingCoordinator.awaitWorkerStopped() = withTimeout(5_000L) {
+        val field = ProcessingCoordinator::class.java.getDeclaredField("workerJob")
+        field.isAccessible = true
+        while ((field.get(this@awaitWorkerStopped) as? kotlinx.coroutines.Job)?.isCompleted != true) {
+            delay(10L)
         }
     }
 
@@ -411,13 +650,18 @@ class ProcessingCoordinatorTest {
     }
 
     private class GateRunner(
-        private val ignoreCoroutineCancellation: Boolean = false
+        private val ignoreCoroutineCancellation: Boolean = false,
+        private val onCancel: (String) -> Unit = {}
     ) : ProcessingTaskRunner {
         private val started = Channel<String>(Channel.UNLIMITED)
         private val gates = ConcurrentHashMap<String, CompletableDeferred<ProcessingRunResult>>()
         private val progressCallbacks = ConcurrentHashMap<String, (UpscaleProgress) -> Unit>()
+        private val activeExecutions = AtomicInteger(0)
+        private val maximumActiveExecutions = AtomicInteger(0)
         val cancelled = CopyOnWriteArrayList<String>()
         val startedIds = CopyOnWriteArrayList<String>()
+        val maxActiveExecutions: Int
+            get() = maximumActiveExecutions.get()
 
         override suspend fun run(
             task: ProcessingTask,
@@ -429,14 +673,21 @@ class ProcessingCoordinatorTest {
             progressCallbacks[task.id] = onProgress
             startedIds += task.id
             started.send(task.id)
-            return if (ignoreCoroutineCancellation) {
-                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { gate.await() }
-            } else {
-                gate.await()
+            val active = activeExecutions.incrementAndGet()
+            maximumActiveExecutions.updateAndGet { current -> maxOf(current, active) }
+            return try {
+                if (ignoreCoroutineCancellation) {
+                    withContext(NonCancellable) { gate.await() }
+                } else {
+                    gate.await()
+                }
+            } finally {
+                activeExecutions.decrementAndGet()
             }
         }
 
         override fun cancel(taskId: String) {
+            onCancel(taskId)
             cancelled += taskId
         }
 
@@ -444,6 +695,10 @@ class ProcessingCoordinatorTest {
 
         fun complete(taskId: String) {
             checkNotNull(gates[taskId]).complete(ProcessingRunResult.Completed)
+        }
+
+        fun completeIfStarted(taskId: String) {
+            gates[taskId]?.complete(ProcessingRunResult.Completed)
         }
 
         fun emit(progress: UpscaleProgress) {
@@ -474,7 +729,9 @@ class ProcessingCoordinatorTest {
         override suspend fun delete(taskId: String): Boolean = records.remove(taskId) != null
     }
 
-    private class InMemoryWorkRepository : ProcessingWorkSpecRepository {
+    private class InMemoryWorkRepository(
+        private val beforeFind: suspend (String) -> Unit = {}
+    ) : ProcessingWorkSpecRepository {
         private val records = ConcurrentHashMap<String, ProcessingWorkSpec>()
 
         fun seed(vararg specs: ProcessingWorkSpec) {
@@ -485,7 +742,10 @@ class ProcessingCoordinatorTest {
             records[workSpec.taskId] = workSpec
         }
 
-        override suspend fun find(taskId: String): ProcessingWorkSpec? = records[taskId]
+        override suspend fun find(taskId: String): ProcessingWorkSpec? {
+            beforeFind(taskId)
+            return records[taskId]
+        }
 
         override suspend fun delete(taskId: String): Boolean = records.remove(taskId) != null
     }
