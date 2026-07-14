@@ -15,7 +15,10 @@ import androidx.annotation.RequiresApi
 import com.lumasr.R
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
+import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
+import com.lumasr.domain.ProcessingSnapshotLease
+import com.lumasr.domain.ProcessingSnapshotOwner
 import com.lumasr.domain.ProcessingTaskSnapshot
 import com.lumasr.domain.ProcessingTaskState
 import java.io.File
@@ -34,12 +37,16 @@ class SuperResolutionService : Service() {
     }
     private lateinit var notificationManager: NotificationManager
     private lateinit var coordinator: ProcessingCoordinator
+    private lateinit var snapshotLease: ProcessingSnapshotLease
 
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
         createNotificationChannel()
         startForegroundImmediately(buildNotification(active = null))
+        snapshotLease = checkNotNull(
+            ApplicationProcessingSnapshotBridge.acquire(ProcessingSnapshotOwner.SERVICE)
+        )
 
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
         coordinator = ProcessingCoordinator(
@@ -49,6 +56,7 @@ class SuperResolutionService : Service() {
         )
         serviceScope.launch {
             coordinator.snapshots.collectLatest { snapshots ->
+                snapshotLease.publish(snapshots)
                 val active = snapshots.firstOrNull { it.task.state == ProcessingTaskState.RUNNING }
                     ?: snapshots.firstOrNull { it.task.state == ProcessingTaskState.QUEUED }
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(active))
@@ -92,6 +100,7 @@ class SuperResolutionService : Service() {
     }
 
     override fun onDestroy() {
+        if (::snapshotLease.isInitialized) snapshotLease.release()
         if (::coordinator.isInitialized) coordinator.close()
         serviceScope.cancel()
         super.onDestroy()

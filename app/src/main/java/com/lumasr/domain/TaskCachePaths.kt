@@ -11,7 +11,14 @@ data class TaskCachePaths(
 ) {
     companion object {
         fun create(cacheRoot: File, taskId: String, mimeType: String?): TaskCachePaths {
-            val taskDir = File(File(cacheRoot, "upscale"), taskId)
+            return createStable(File(cacheRoot, "upscale"), taskId, mimeType)
+        }
+
+        fun createStable(stableRoot: File, taskId: String, mimeType: String?): TaskCachePaths {
+            return forTaskDirectory(File(stableRoot, taskId), mimeType)
+        }
+
+        fun forTaskDirectory(taskDir: File, mimeType: String?): TaskCachePaths {
             val extension = when (mimeType?.lowercase()) {
                 "image/jpeg", "image/jpg" -> "jpg"
                 "image/webp" -> "webp"

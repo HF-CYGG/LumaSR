@@ -5,9 +5,11 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.lumasr.domain.TaskCachePaths
+import java.io.File
 
 class ImageCacheRepository(
-    private val context: Context
+    private val context: Context,
+    private val taskRoot: File = File(context.cacheDir, DEFAULT_CACHE_DIRECTORY)
 ) {
     fun readImageInfo(uri: Uri): CachedImageInfo {
         val resolver = context.contentResolver
@@ -39,13 +41,30 @@ class ImageCacheRepository(
     }
 
     fun copyToTaskCache(uri: Uri, taskId: String, mimeType: String?): TaskCachePaths {
-        val paths = TaskCachePaths.create(context.cacheDir, taskId, mimeType)
-        paths.taskDir.mkdirs()
-        context.contentResolver.openInputStream(uri).use { input ->
-            requireNotNull(input) { "Input image cannot be opened." }
-            paths.inputFile.outputStream().use { output -> input.copyTo(output) }
+        return copyToTaskRoot(uri, taskId, mimeType, taskRoot)
+    }
+
+    fun copyToTaskRoot(
+        uri: Uri,
+        taskId: String,
+        mimeType: String?,
+        stableRoot: File
+    ): TaskCachePaths {
+        return StableTaskFileCopier(stableRoot).copy(taskId, mimeType) {
+            context.contentResolver.openInputStream(uri)
         }
-        return paths
+    }
+
+    companion object {
+        private const val DEFAULT_CACHE_DIRECTORY = "upscale"
+        const val PERSISTENT_TASK_DIRECTORY = "lumasr-tasks"
+
+        fun persistent(context: Context): ImageCacheRepository {
+            return ImageCacheRepository(
+                context = context,
+                taskRoot = File(context.noBackupFilesDir, PERSISTENT_TASK_DIRECTORY)
+            )
+        }
     }
 }
 
