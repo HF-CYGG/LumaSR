@@ -12,3 +12,4 @@ artifacts/
 *.apk
 *.aab
 .trae/
+.worktrees/
