@@ -14,6 +14,7 @@ add_library(localsr SHARED
     superres_png_streamer.cpp
     superres_d4_tta_checks.cpp
     superres_tile_geometry_checks.cpp
+    superres_pixel_io_checks.cpp
 )
 
 target_compile_features(localsr PRIVATE cxx_std_17)

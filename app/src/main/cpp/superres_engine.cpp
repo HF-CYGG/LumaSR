@@ -2,6 +2,7 @@
 #include "superres_engine.h"
 #include "superres_d4_tta_ncnn.h"
 #include "superres_execution_profile.h"
+#include "superres_pixel_io.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -438,20 +439,6 @@ void emit(
     }
 }
 
-float clamp01(float value) {
-    if (value < 0.0f) {
-        return 0.0f;
-    }
-    if (value > 1.0f) {
-        return 1.0f;
-    }
-    return value;
-}
-
-unsigned char to_u8(float normalized) {
-    return static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, normalized * 255.0f + 0.5f)));
-}
-
 int waifu2x_prepadding(const SuperResNativeParams& params) {
     if (params.engineType != kEngineWaifu2x) {
         return 0;
@@ -571,16 +558,26 @@ ncnn::Mat make_input_tile(
     int inputH
 ) {
     ncnn::Mat tile(inputW, inputH, 3, sizeof(float));
-    for (int c = 0; c < 3; ++c) {
-        ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < inputH; ++y) {
-            float* row = channel.row(y);
-            const int sourceY = std::min(image.height - 1, std::max(0, tileY + y));
-            for (int x = 0; x < inputW; ++x) {
-                const int sourceX = std::min(image.width - 1, std::max(0, tileX + x));
-                const size_t offset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3 + c;
-                row[x] = static_cast<float>(image.rgb[offset]) / 255.0f;
-            }
+    if (tile.empty()) {
+        return tile;
+    }
+    ncnn::Mat redChannel = tile.channel(0);
+    ncnn::Mat greenChannel = tile.channel(1);
+    ncnn::Mat blueChannel = tile.channel(2);
+    for (int y = 0; y < inputH; ++y) {
+        const int sourceY = std::min(image.height - 1, std::max(0, tileY + y));
+        const unsigned char* const sourceRow =
+            image.rgb.data() + static_cast<size_t>(sourceY) * image.width * 3;
+        if (!copy_clamped_rgb8_row_to_planar(
+                sourceRow,
+                image.width,
+                tileX,
+                inputW,
+                redChannel.row(y),
+                greenChannel.row(y),
+                blueChannel.row(y)
+            )) {
+            return ncnn::Mat{};
         }
     }
     return tile;
@@ -672,21 +669,34 @@ bool copy_output_tile(
     const int fullDstBaseX = useCroppedOutput ? cropLeft + window.dstX : window.dstX;
     const int fullDstBaseY = useCroppedOutput ? cropTop + window.dstY : window.dstY;
 
-    for (int c = 0; c < 3; ++c) {
-        const ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < window.copyH; ++y) {
-            const float* row = channel.row(window.srcY + y);
-            for (int x = 0; x < window.copyW; ++x) {
-                const size_t offset = (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX + x) * 3 + c;
-                float value = row[window.srcX + x];
-                if (addRealCugan4xResidualBase) {
-                    const int baseX = realcugan_4x_residual_source_coord(fullDstBaseX + x, residualBaseImage->width);
-                    const int baseY = realcugan_4x_residual_source_coord(fullDstBaseY + y, residualBaseImage->height);
-                    const size_t baseOffset = (static_cast<size_t>(baseY) * residualBaseImage->width + baseX) * 3 + c;
-                    value += static_cast<float>(residualBaseImage->rgb[baseOffset]) / 255.0f;
-                }
-                output[offset] = to_u8(clamp01(value));
-            }
+    const ncnn::Mat redChannel = tile.channel(0);
+    const ncnn::Mat greenChannel = tile.channel(1);
+    const ncnn::Mat blueChannel = tile.channel(2);
+    for (int y = 0; y < window.copyH; ++y) {
+        unsigned char* const destinationRow = output.data() +
+            (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX) * 3;
+        const unsigned char* residualRow = nullptr;
+        int residualWidth = 0;
+        if (addRealCugan4xResidualBase) {
+            const int baseY = realcugan_4x_residual_source_coord(
+                fullDstBaseY + y,
+                residualBaseImage->height
+            );
+            residualWidth = residualBaseImage->width;
+            residualRow = residualBaseImage->rgb.data() +
+                static_cast<size_t>(baseY) * residualWidth * 3;
+        }
+        if (!copy_planar_float_row_to_rgb8(
+                redChannel.row(window.srcY + y) + window.srcX,
+                greenChannel.row(window.srcY + y) + window.srcX,
+                blueChannel.row(window.srcY + y) + window.srcX,
+                destinationRow,
+                window.copyW,
+                residualRow,
+                residualWidth,
+                fullDstBaseX
+            )) {
+            return false;
         }
     }
     coveredPixels += static_cast<long long>(window.copyW) * window.copyH;
@@ -1053,6 +1063,11 @@ SuperResNativeCode run_ncnn_image(
     if (!executionProfileChecksPass) {
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Execution profile runtime checks failed");
         return SuperResNativeCode::InvalidParams;
+    }
+    static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
+    if (!pixelIoChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
+        return SuperResNativeCode::TileOutputMismatch;
     }
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
