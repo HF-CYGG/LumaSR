@@ -260,6 +260,31 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun explicitResumeRunsPausedTaskWhileProcessStartAlonePreservesIt() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        tasks.seed(task("resume-paused", state = ProcessingTaskState.PAUSED))
+        work.seed(spec("resume-paused"))
+        val coordinator = coordinator(tasks, work, runner)
+        try {
+            coordinator.start()
+            delay(50L)
+            assertTrue(runner.startedIds.isEmpty())
+            assertEquals(ProcessingTaskState.PAUSED, tasks.find("resume-paused")?.state)
+
+            coordinator.resumePersistedWork()
+
+            assertEquals("resume-paused", runner.awaitStarted())
+            runner.complete("resume-paused")
+            coordinator.awaitState("resume-paused", ProcessingTaskState.COMPLETED)
+            Unit
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun ownerHandoffCancelsNativeAndWaitsForQueuedRecoveryBeforeReturning() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -361,6 +386,10 @@ class ProcessingCoordinatorTest {
 
             runner.complete("stuck-runner")
             withTimeout(5_000L) { resume.await() }
+            assertEquals("stuck-runner", runner.awaitStarted())
+            assertEquals(1, runner.maxActiveExecutions)
+            runner.complete("stuck-runner")
+            coordinator.awaitState("stuck-runner", ProcessingTaskState.COMPLETED)
             assertEquals("after-timeout", runner.awaitStarted())
             assertEquals(1, runner.maxActiveExecutions)
             runner.complete("after-timeout")
@@ -392,6 +421,11 @@ class ProcessingCoordinatorTest {
 
             List(4) { async { coordinator.resumePersistedWork() } }.awaitAll()
 
+            assertEquals("before-pause", runner.awaitStarted())
+            delay(50L)
+            assertEquals(1, runner.maxActiveExecutions)
+            assertEquals(2, runner.startedIds.count { it == "before-pause" })
+            runner.complete("before-pause")
             assertEquals("resume-first", runner.awaitStarted())
             delay(50L)
             assertEquals(1, runner.maxActiveExecutions)
@@ -470,6 +504,10 @@ class ProcessingCoordinatorTest {
                 pause.await()
                 resume.await()
             }
+            assertEquals("pausing", runner.awaitStarted())
+            assertEquals(1, runner.maxActiveExecutions)
+            runner.complete("pausing")
+            coordinator.awaitState("pausing", ProcessingTaskState.COMPLETED)
             assertEquals("during-pause", runner.awaitStarted())
             runner.complete("during-pause")
             coordinator.awaitState("during-pause", ProcessingTaskState.COMPLETED)

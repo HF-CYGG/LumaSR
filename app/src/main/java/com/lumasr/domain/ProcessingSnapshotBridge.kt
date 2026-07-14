@@ -20,25 +20,27 @@ class ProcessingSnapshotBridge {
     private val lock = Any()
     private var nextEpoch = 0L
     private var activeOwner: LeaseState? = null
+    private var pendingPredecessorResult: ProcessingOwnerHandoffResult? = null
     private val _snapshots = MutableStateFlow<List<ProcessingTaskSnapshot>>(emptyList())
 
     val snapshots: StateFlow<List<ProcessingTaskSnapshot>> = _snapshots.asStateFlow()
 
     fun acquire(owner: ProcessingSnapshotOwner): ProcessingSnapshotLease? = synchronized(lock) {
         val predecessor = activeOwner
-        if (predecessor?.owner == ProcessingSnapshotOwner.SERVICE) {
-            return@synchronized null
-        }
         if (owner == ProcessingSnapshotOwner.FOREGROUND_FALLBACK && predecessor != null) {
             return@synchronized null
         }
         predecessor?.revoked?.complete(Unit)
+        val predecessorReleased = predecessor?.released ?: completedSignal(
+            pendingPredecessorResult ?: ProcessingOwnerHandoffResult.Released
+        )
+        if (predecessor == null) pendingPredecessorResult = null
         val active = LeaseState(owner = owner, epoch = ++nextEpoch)
         activeOwner = active
         ProcessingSnapshotLease(
             bridge = this,
             state = active,
-            predecessorReleased = predecessor?.released ?: completedSignal()
+            predecessorReleased = predecessorReleased
         )
     }
 
@@ -61,8 +63,8 @@ class ProcessingSnapshotBridge {
     ): Boolean = synchronized(lock) {
         state.released.complete(result)
         if (activeOwner !== state) return@synchronized false
-        if (result == ProcessingOwnerHandoffResult.Failed) return@synchronized false
         activeOwner = null
+        pendingPredecessorResult = result
         true
     }
 
@@ -78,9 +80,11 @@ class ProcessingSnapshotBridge {
         val released: CompletableDeferred<ProcessingOwnerHandoffResult> = CompletableDeferred()
     )
 
-    private fun completedSignal(): CompletableDeferred<ProcessingOwnerHandoffResult> =
+    private fun completedSignal(
+        result: ProcessingOwnerHandoffResult
+    ): CompletableDeferred<ProcessingOwnerHandoffResult> =
         CompletableDeferred<ProcessingOwnerHandoffResult>().apply {
-            complete(ProcessingOwnerHandoffResult.Released)
+            complete(result)
         }
 }
 

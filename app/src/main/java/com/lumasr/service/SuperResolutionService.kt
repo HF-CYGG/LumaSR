@@ -38,23 +38,27 @@ class SuperResolutionService : Service() {
     private lateinit var notificationManager: NotificationManager
     private lateinit var coordinator: ProcessingCoordinator
     private lateinit var snapshotLease: ProcessingSnapshotLease
-    private lateinit var ownerHandoff: ProcessingServiceOwnerHandoff
+    private lateinit var ownerSession: ProcessingServiceOwnerSession
 
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
         createNotificationChannel()
         startForegroundImmediately(buildNotification(active = null))
-        snapshotLease = checkNotNull(
-            ApplicationProcessingSnapshotBridge.acquire(ProcessingSnapshotOwner.SERVICE)
-        )
-        ownerHandoff = ProcessingServiceOwnerHandoff(snapshotLease)
-
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
         coordinator = ProcessingCoordinator(
             taskRepository = FileProcessingTaskRepository(taskDirectory),
             workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory),
             runner = SuperResProcessingTaskRunner()
+        )
+        snapshotLease = checkNotNull(
+            ApplicationProcessingSnapshotBridge.acquire(ProcessingSnapshotOwner.SERVICE)
+        )
+        ownerSession = ProcessingServiceOwnerSession(
+            serviceLease = snapshotLease,
+            cleanupScope = ApplicationProcessingServiceCleanupScope.scope,
+            relinquishForOwnerHandoff = coordinator::relinquishForOwnerHandoff,
+            closeCoordinator = coordinator::close
         )
         serviceScope.launch {
             coordinator.snapshots.collectLatest { snapshots ->
@@ -71,7 +75,7 @@ class SuperResolutionService : Service() {
         val operation = lifecycleGate.beginOperation(startId)
         when (intent?.action) {
             ACTION_RESUME -> launchOperation(operation) {
-                ownerHandoff.runAfterPredecessorRelease {
+                ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
                     coordinator.resumePersistedWork()
                 }
             }
@@ -79,7 +83,7 @@ class SuperResolutionService : Service() {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID)
                 if (!taskId.isNullOrBlank()) {
                     launchOperation(operation) {
-                        ownerHandoff.runAfterPredecessorRelease {
+                        ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
                             coordinator.cancel(taskId)
                         }
                     }
@@ -90,7 +94,7 @@ class SuperResolutionService : Service() {
             }
 
             else -> launchOperation(operation) {
-                ownerHandoff.runAfterPredecessorRelease {
+                ownerSession.runAfterPredecessorRelease(resolvesRecoveryFailure = true) {
                     coordinator.resumePersistedWork()
                 }
             }
@@ -105,7 +109,9 @@ class SuperResolutionService : Service() {
         serviceScope.launch {
             failureBoundary.run(ProcessingServiceFailureCode.TIMEOUT_FAILED) {
                 try {
-                    coordinator.pauseActive()
+                    ownerSession.runAfterPredecessorRelease {
+                        coordinator.pauseActive()
+                    }
                 } finally {
                     stopSelfResult(startId)
                 }
@@ -114,8 +120,7 @@ class SuperResolutionService : Service() {
     }
 
     override fun onDestroy() {
-        if (::snapshotLease.isInitialized) snapshotLease.release()
-        if (::coordinator.isInitialized) coordinator.close()
+        if (::ownerSession.isInitialized) ownerSession.scheduleCleanup()
         serviceScope.cancel()
         super.onDestroy()
     }

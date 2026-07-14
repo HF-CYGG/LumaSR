@@ -90,29 +90,17 @@ class ProcessingCoordinator(
     val snapshots: StateFlow<List<ProcessingTaskSnapshot>> = _snapshots.asStateFlow()
 
     suspend fun start() {
-        check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
-        if (!started.compareAndSet(false, true)) return
-        try {
-            ensureWorker()
-            refreshQueue()
-        } catch (failure: Throwable) {
-            workerJob?.cancel()
-            started.set(false)
-            throw failure
-        }
+        startIfNeeded(resumePaused = false)
     }
 
     suspend fun resumePersistedWork() {
         check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
-        if (started.get()) {
-            ensureWorker()
-            refreshQueue()
-        } else {
-            start()
-        }
+        if (startIfNeeded(resumePaused = true)) return
+        ensureWorker()
+        refreshQueue(resumePaused = true)
     }
 
-    suspend fun refreshQueue() {
+    suspend fun refreshQueue(resumePaused: Boolean = false) {
         check(started.get()) { "Coordinator must be started before refresh" }
         val taskIdsToQueue = stateMutex.withLock {
             val persisted = taskRepository.list()
@@ -138,7 +126,10 @@ class ProcessingCoordinator(
             }
             tasksById.values
                 .asSequence()
-                .filter { it.state == ProcessingTaskState.QUEUED }
+                .filter {
+                    it.state == ProcessingTaskState.QUEUED ||
+                        (resumePaused && it.state == ProcessingTaskState.PAUSED)
+                }
                 .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
                 .map(ProcessingTask::id)
                 .filter(enqueuedTaskIds::add)
@@ -352,11 +343,29 @@ class ProcessingCoordinator(
         }
     }
 
+    private suspend fun startIfNeeded(resumePaused: Boolean): Boolean {
+        check(!relinquishing.get()) { "Coordinator is relinquishing ownership" }
+        if (!started.compareAndSet(false, true)) return false
+        try {
+            ensureWorker()
+            refreshQueue(resumePaused = resumePaused)
+            return true
+        } catch (failure: Throwable) {
+            workerJob?.cancel()
+            started.set(false)
+            throw failure
+        }
+    }
+
     private suspend fun execute(taskId: String) {
         val workSpec = workSpecRepository.find(taskId)
         val running = stateMutex.withLock {
             val task = tasksById[taskId] ?: taskRepository.find(taskId)
-            if (relinquishing.get() || task == null || task.state != ProcessingTaskState.QUEUED) {
+            if (
+                relinquishing.get() ||
+                task == null ||
+                task.state !in setOf(ProcessingTaskState.QUEUED, ProcessingTaskState.PAUSED)
+            ) {
                 enqueuedTaskIds.remove(taskId)
                 return
             }

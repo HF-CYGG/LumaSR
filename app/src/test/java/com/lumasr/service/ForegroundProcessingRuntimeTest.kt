@@ -26,6 +26,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -212,16 +213,18 @@ class ForegroundProcessingRuntimeTest {
     }
 
     @Test
-    fun recoveryFailureCompletesBarrierWithFailureInsteadOfWaitingForever() = runBlocking {
+    fun recoveryFailureStopsOldRunnerAndAllowsFallbackToRetryWithoutOverlap() = runBlocking {
         val bridge = ProcessingSnapshotBridge()
         val taskRepository = InMemoryTaskRepository()
         val workRepository = InMemoryWorkRepository()
-        val runner = BlockingRunner()
+        val runner = RestartableRunner()
+        val coordinatorCreations = AtomicInteger(0)
         taskRepository.save(task("failed-handoff"))
         workRepository.save(spec("failed-handoff"))
         val runtime = ForegroundProcessingRuntime(
             leaseAcquirer = bridge::acquire,
             coordinatorFactory = {
+                coordinatorCreations.incrementAndGet()
                 ProcessingCoordinator(
                     taskRepository = taskRepository,
                     workSpecRepository = workRepository,
@@ -233,29 +236,57 @@ class ForegroundProcessingRuntimeTest {
         )
         try {
             assertTrue(runtime.resumePersistedWork())
-            withTimeout(5_000L) { runner.started.await() }
+            assertEquals(1, runner.awaitStarted())
             taskRepository.failQueuedSave = true
 
             val stop = async(Dispatchers.Default) { runtime.stopForForegroundExit() }
-            withTimeout(5_000L) { runner.cancelled.await() }
-            runner.release.complete(Unit)
-            assertTrue(withTimeout(5_000L) { stop.await() } is ForegroundRuntimeStopResult.Failed)
-
-            val service = requireNotNull(bridge.acquire(ProcessingSnapshotOwner.SERVICE))
-            assertEquals(
-                ProcessingOwnerHandoffResult.Failed,
-                withTimeout(1_000L) { service.awaitPredecessorRelease() }
-            )
-            val operation = runCatching {
-                ProcessingServiceOwnerHandoff(service).runAfterPredecessorRelease { Unit }
+            withTimeout(5_000L) {
+                while (runner.cancelCount.get() == 0) delay(10L)
             }
-            assertTrue(operation.exceptionOrNull() is ProcessingOwnerHandoffException)
-            service.release()
+            runner.release(1)
+            assertTrue(withTimeout(5_000L) { stop.await() } is ForegroundRuntimeStopResult.Failed)
+            assertEquals(ProcessingTaskState.RUNNING, taskRepository.find("failed-handoff")?.state)
+
+            taskRepository.failQueuedSave = false
+            assertTrue(runtime.resumePersistedWork())
+            assertEquals(2, runner.awaitStarted())
+            assertEquals(2, coordinatorCreations.get())
+            assertEquals(1, runner.maxActiveExecutions.get())
+            runner.release(2)
+            withTimeout(5_000L) {
+                while (taskRepository.find("failed-handoff")?.state != ProcessingTaskState.COMPLETED) {
+                    delay(10L)
+                }
+            }
         } finally {
-            runner.release.complete(Unit)
+            runner.releaseAll()
             runtime.closeAndJoin()
         }
         Unit
+    }
+
+    @Test
+    fun coordinatorFactoryFailureReleasesLeaseWithoutOrphaningBarrier() = runBlocking {
+        val bridge = ProcessingSnapshotBridge()
+        val runtime = ForegroundProcessingRuntime(
+            leaseAcquirer = bridge::acquire,
+            coordinatorFactory = { throw IllegalStateException("factory unavailable") }
+        )
+        try {
+            val failure = runCatching { runtime.resumePersistedWork() }.exceptionOrNull()
+            assertTrue(failure is IllegalStateException)
+
+            val successor = requireNotNull(
+                bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK)
+            )
+            assertEquals(
+                ProcessingOwnerHandoffResult.Released,
+                withTimeout(1_000L) { successor.awaitPredecessorRelease() }
+            )
+            assertTrue(successor.release())
+        } finally {
+            runtime.closeAndJoin()
+        }
     }
 
     private fun task(id: String): ProcessingTask {
@@ -327,6 +358,50 @@ class ForegroundProcessingRuntimeTest {
 
         override fun cancel(taskId: String) {
             cancelled.complete(Unit)
+        }
+    }
+
+    private class RestartableRunner : ProcessingTaskRunner {
+        private val attempts = AtomicInteger(0)
+        private val activeExecutions = AtomicInteger(0)
+        private val releases = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
+        private val startedAttempts = Channel<Int>(Channel.UNLIMITED)
+        val cancelCount = AtomicInteger(0)
+        val maxActiveExecutions = AtomicInteger(0)
+
+        override suspend fun run(
+            task: ProcessingTask,
+            workSpec: ProcessingWorkSpec,
+            onProgress: (UpscaleProgress) -> Unit
+        ): ProcessingRunResult {
+            val attempt = attempts.incrementAndGet()
+            val release = CompletableDeferred<Unit>()
+            releases[attempt] = release
+            val active = activeExecutions.incrementAndGet()
+            maxActiveExecutions.updateAndGet { current -> maxOf(current, active) }
+            startedAttempts.send(attempt)
+            return try {
+                withContext(NonCancellable) {
+                    release.await()
+                    ProcessingRunResult.Completed
+                }
+            } finally {
+                activeExecutions.decrementAndGet()
+            }
+        }
+
+        override fun cancel(taskId: String) {
+            cancelCount.incrementAndGet()
+        }
+
+        suspend fun awaitStarted(): Int = withTimeout(5_000L) { startedAttempts.receive() }
+
+        fun release(attempt: Int) {
+            checkNotNull(releases[attempt]).complete(Unit)
+        }
+
+        fun releaseAll() {
+            releases.values.forEach { it.complete(Unit) }
         }
     }
 

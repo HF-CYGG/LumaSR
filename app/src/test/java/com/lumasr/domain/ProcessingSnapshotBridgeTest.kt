@@ -69,6 +69,49 @@ class ProcessingSnapshotBridgeTest {
         assertTrue(service.publish(listOf(snapshot("service-after-release"))))
     }
 
+    @Test
+    fun newerServiceRevokesOlderServiceAndChainsItsReleaseBarrier() = runBlocking {
+        val bridge = ProcessingSnapshotBridge()
+        val firstService = requireNotNull(bridge.acquire(ProcessingSnapshotOwner.SERVICE))
+        val firstRevoked = async { firstService.awaitRevocation() }
+
+        val secondService = requireNotNull(bridge.acquire(ProcessingSnapshotOwner.SERVICE))
+        withTimeout(1_000L) { firstRevoked.await() }
+        assertNull(bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK))
+
+        val secondReady = async { secondService.awaitPredecessorRelease() }
+        delay(50L)
+        assertFalse(secondReady.isCompleted)
+        assertFalse(firstService.release())
+        assertEquals(
+            ProcessingOwnerHandoffResult.Released,
+            withTimeout(1_000L) { secondReady.await() }
+        )
+
+        assertFalse(firstService.publish(listOf(snapshot("stale-first-service"))))
+        assertTrue(secondService.publish(listOf(snapshot("second-service"))))
+        assertNull(bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK))
+        assertTrue(secondService.release())
+    }
+
+    @Test
+    fun failedCurrentGenerationDoesNotOrphanOwnershipAndIsVisibleToNextOwner() = runBlocking {
+        val bridge = ProcessingSnapshotBridge()
+        val failedFallback = requireNotNull(
+            bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK)
+        )
+
+        assertTrue(failedFallback.failRelease())
+        val retryFallback = requireNotNull(
+            bridge.acquire(ProcessingSnapshotOwner.FOREGROUND_FALLBACK)
+        )
+        assertEquals(
+            ProcessingOwnerHandoffResult.Failed,
+            retryFallback.awaitPredecessorRelease()
+        )
+        assertTrue(retryFallback.release())
+    }
+
     private fun snapshot(id: String): ProcessingTaskSnapshot {
         val taskDirectory = File("build/bridge/$id")
         return ProcessingTaskSnapshot(

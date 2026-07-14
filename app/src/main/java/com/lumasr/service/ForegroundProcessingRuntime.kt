@@ -4,6 +4,7 @@ import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
+import com.lumasr.domain.ProcessingOwnerHandoffResult
 import com.lumasr.domain.ProcessingSnapshotLease
 import com.lumasr.domain.ProcessingSnapshotOwner
 import java.io.File
@@ -54,10 +55,16 @@ class ForegroundProcessingRuntime(
             if (session != null) return true
             val lease = leaseAcquirer(ProcessingSnapshotOwner.FOREGROUND_FALLBACK)
                 ?: return false
+            val coordinator = try {
+                coordinatorFactory()
+            } catch (failure: Exception) {
+                lease.release()
+                throw failure
+            }
             Session(
                 id = nextSessionId.incrementAndGet(),
                 lease = lease,
-                coordinator = coordinatorFactory()
+                coordinator = coordinator
             ).also { created ->
                 val job = scope.launch(start = CoroutineStart.LAZY) {
                     runSession(created)
@@ -101,7 +108,7 @@ class ForegroundProcessingRuntime(
     }
 
     private suspend fun runSession(activeSession: Session) {
-        var result: ForegroundRuntimeStopResult = ForegroundRuntimeStopResult.Failed
+        var sessionFailed = false
         try {
             coroutineScope {
                 val publisher = launch {
@@ -113,23 +120,36 @@ class ForegroundProcessingRuntime(
                     activeSession.coordinator.resumePersistedWork()
                     // Foreground exit and Service takeover share the same fail-closed shutdown path.
                     awaitExitRequest(activeSession)
-                    withContext(NonCancellable) {
-                        activeSession.coordinator.relinquishForOwnerHandoff()
-                    }
-                    result = ForegroundRuntimeStopResult.Stopped
                 } finally {
                     publisher.cancelAndJoin()
                 }
             }
         } catch (_: Exception) {
-            result = ForegroundRuntimeStopResult.Failed
+            sessionFailed = true
         } finally {
             withContext(NonCancellable) {
-                activeSession.coordinator.close()
-                when (result) {
-                    ForegroundRuntimeStopResult.Stopped -> activeSession.lease.release()
-                    // Complete the predecessor barrier with failure so Service can stop instead of hanging.
-                    ForegroundRuntimeStopResult.Failed -> activeSession.lease.failRelease()
+                var handoffResult: ProcessingOwnerHandoffResult = ProcessingOwnerHandoffResult.Released
+                try {
+                    activeSession.coordinator.relinquishForOwnerHandoff()
+                } catch (_: Exception) {
+                    sessionFailed = true
+                    handoffResult = ProcessingOwnerHandoffResult.Failed
+                }
+                try {
+                    activeSession.coordinator.close()
+                } catch (_: Exception) {
+                    sessionFailed = true
+                    handoffResult = ProcessingOwnerHandoffResult.Failed
+                }
+                when (handoffResult) {
+                    ProcessingOwnerHandoffResult.Released -> activeSession.lease.release()
+                    // A failed state recovery is published only after native execution has stopped.
+                    ProcessingOwnerHandoffResult.Failed -> activeSession.lease.failRelease()
+                }
+                val result = if (sessionFailed) {
+                    ForegroundRuntimeStopResult.Failed
+                } else {
+                    ForegroundRuntimeStopResult.Stopped
                 }
                 sessionMutex.withLock {
                     if (session?.id == activeSession.id) session = null
