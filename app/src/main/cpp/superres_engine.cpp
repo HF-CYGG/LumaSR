@@ -1,5 +1,6 @@
 // 这个文件负责在原生层执行基于 ncnn 的超分推理，包括模型选择、图像分块、推理拼接与结果输出。
 #include "superres_engine.h"
+#include "superres_d4_tta_ncnn.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -722,6 +723,14 @@ SuperResNativeCode run_ncnn_image(
         return SuperResNativeCode::Unsupported;
     }
 
+    if (params.tta) {
+        static const bool d4RuntimeChecksPass = run_d4_tta_runtime_checks();
+        if (!d4RuntimeChecksPass) {
+            __android_log_print(ANDROID_LOG_ERROR, kLogTag, "D4 TTA runtime checks failed");
+            return SuperResNativeCode::TileOutputMismatch;
+        }
+    }
+
     if (is_cancelled(params.taskId)) {
         return SuperResNativeCode::Cancelled;
     }
@@ -822,30 +831,137 @@ SuperResNativeCode run_ncnn_image(
             ncnn::Mat input = make_input_tile(image, region.inputX, region.inputY, region.inputW, region.inputH);
             performance.tileInputMs += elapsed_ms(inputStart);
             ncnn::Mat result;
+            ncnn::Mat copySource;
             const auto tileStart = std::chrono::steady_clock::now();
 
-            ncnn::Extractor extractor = net->create_extractor();
-            const auto extractStart = std::chrono::steady_clock::now();
-            if (extractor.input(files.inputBlob, input) != 0 ||
-                extractor.extract(files.outputBlob, result) != 0) {
-                return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
-            }
-            performance.tileExtractMs += elapsed_ms(extractStart);
-            ncnn::Mat copySource;
-            if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
-                log_tile_output_mismatch(
-                    params,
-                    useVulkan,
-                    "normalize",
-                    tileX,
-                    tileY,
-                    tileW,
-                    tileH,
-                    region,
-                    result,
-                    copySource
-                );
-                return SuperResNativeCode::TileOutputMismatch;
+            if (!params.tta) {
+                ncnn::Extractor extractor = net->create_extractor();
+                const auto extractStart = std::chrono::steady_clock::now();
+                if (extractor.input(files.inputBlob, input) != 0 ||
+                    extractor.extract(files.outputBlob, result) != 0) {
+                    return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
+                }
+                performance.tileExtractMs += elapsed_ms(extractStart);
+                if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
+                    log_tile_output_mismatch(
+                        params,
+                        useVulkan,
+                        "normalize",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        result,
+                        copySource
+                    );
+                    return SuperResNativeCode::TileOutputMismatch;
+                }
+            } else {
+                // Fusion stays in canonical float space; crop/copy and the RealCUGAN x4 residual run only after all passes succeed.
+                D4FloatFusion fusion;
+                for (size_t pass = 0; pass < kD4Transforms.size(); ++pass) {
+                    const D4Transform transform = kD4Transforms[pass];
+                    ncnn::Mat transformedInput;
+                    if (!d4_transform_ncnn_mat(input, transform, transformedInput)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-input-transform",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            transformedInput,
+                            ncnn::Mat{}
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+
+                    ncnn::Extractor extractor = net->create_extractor();
+                    ncnn::Mat passResult;
+                    const auto extractStart = std::chrono::steady_clock::now();
+                    if (extractor.input(files.inputBlob, transformedInput) != 0 ||
+                        extractor.extract(files.outputBlob, passResult) != 0) {
+                        performance.tileExtractMs += elapsed_ms(extractStart);
+                        if (is_cancelled(params.taskId)) {
+                            return SuperResNativeCode::Cancelled;
+                        }
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-extract",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            ncnn::Mat{}
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+                    performance.tileExtractMs += elapsed_ms(extractStart);
+
+                    ncnn::Mat normalizedPass;
+                    if (!normalize_output_tile_for_copy(passResult, normalizedPass, performance.tileCopyMs)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-normalize",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            normalizedPass
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+                    if (!d4_add_ncnn_to_fusion(normalizedPass, transform, fusion)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-inverse-shape",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            normalizedPass
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+
+                    normalizedPass.release();
+                    passResult.release();
+                    transformedInput.release();
+                    // Progress remains tile-based, while cancellation can stop before the next expensive TTA inference.
+                    if (pass + 1 < kD4Transforms.size() && is_cancelled(params.taskId)) {
+                        return SuperResNativeCode::Cancelled;
+                    }
+                }
+                if (!d4_finish_ncnn_fusion(fusion, copySource)) {
+                    log_tile_output_mismatch(
+                        params,
+                        useVulkan,
+                        "tta-fusion",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        result,
+                        copySource
+                    );
+                    return SuperResNativeCode::TileOutputMismatch;
+                }
+                if (is_cancelled(params.taskId)) {
+                    return SuperResNativeCode::Cancelled;
+                }
             }
 
             const auto copyStart = std::chrono::steady_clock::now();
