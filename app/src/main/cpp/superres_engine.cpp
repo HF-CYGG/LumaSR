@@ -3,6 +3,8 @@
 #include "superres_d4_tta_ncnn.h"
 #include "superres_execution_profile.h"
 #include "superres_pixel_io.h"
+#include "superres_png_writer.h"
+#include "superres_png_writer_checks.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,8 +30,6 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 namespace {
 constexpr const char* kLogTag = "LumaSRNative";
@@ -67,6 +68,154 @@ struct NetCacheEntry {
 struct LoadedNet {
     std::shared_ptr<ncnn::Net> net;
     bool cacheHit = false;
+};
+
+class OutputAssembly {
+public:
+    SuperResNativeCode initialize(
+        const std::string& outputPath,
+        int width,
+        int height,
+        bool croppedRaw,
+        int maximumBandHeight
+    ) {
+        width_ = width;
+        height_ = height;
+        croppedRaw_ = croppedRaw;
+        rowBytes_ = streaming_png_rgb_row_bytes(width);
+        if (rowBytes_ == 0 || height <= 0) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        const int allocatedRows = croppedRaw ? height : std::min(height, maximumBandHeight);
+        if (allocatedRows <= 0 ||
+            static_cast<size_t>(allocatedRows) > std::numeric_limits<size_t>::max() / rowBytes_) {
+            return SuperResNativeCode::OutOfMemory;
+        }
+        try {
+            bytes_.resize(rowBytes_ * static_cast<size_t>(allocatedRows));
+        } catch (...) {
+            return SuperResNativeCode::OutOfMemory;
+        }
+        if (croppedRaw) {
+            return SuperResNativeCode::Ok;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.open(outputPath, width, height);
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    bool prepare_window(int destinationY, int windowHeight) {
+        if (croppedRaw_) {
+            return destinationY >= 0 && windowHeight > 0 && destinationY <= height_ - windowHeight;
+        }
+        if (destinationY == bandStartY_) {
+            return windowHeight == bandHeight_;
+        }
+        if (bandStartY_ >= 0 && !flush_band()) {
+            return false;
+        }
+        if (destinationY != writtenRows_ || windowHeight <= 0 ||
+            destinationY > height_ - windowHeight ||
+            static_cast<size_t>(windowHeight) > bytes_.size() / rowBytes_) {
+            return false;
+        }
+        bandStartY_ = destinationY;
+        bandHeight_ = windowHeight;
+        std::fill(bytes_.begin(), bytes_.begin() + rowBytes_ * static_cast<size_t>(windowHeight), 0);
+        return true;
+    }
+
+    unsigned char* row(int destinationY, int destinationX) {
+        if (destinationX < 0 || destinationX >= width_) {
+            return nullptr;
+        }
+        const int localY = croppedRaw_ ? destinationY : destinationY - bandStartY_;
+        const int availableRows = croppedRaw_ ? height_ : bandHeight_;
+        if (localY < 0 || localY >= availableRows) {
+            return nullptr;
+        }
+        return bytes_.data() + static_cast<size_t>(localY) * rowBytes_ +
+            static_cast<size_t>(destinationX) * 3u;
+    }
+
+    SuperResNativeCode finish_png() {
+        if (croppedRaw_) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        if (!flush_band() || writtenRows_ != height_) {
+            return lastFailure_ == SuperResNativeCode::Ok
+                ? SuperResNativeCode::TileOutputMismatch
+                : lastFailure_;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.finish();
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    const std::vector<unsigned char>& bytes() const {
+        return bytes_;
+    }
+
+    std::chrono::steady_clock::duration encoding_duration() const {
+        return encodingDuration_;
+    }
+
+    SuperResNativeCode failure_code() const {
+        return lastFailure_;
+    }
+
+private:
+    bool flush_band() {
+        if (bandStartY_ < 0) {
+            return true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.write_rgb_rows(
+            bytes_.data(),
+            bandHeight_,
+            rowBytes_
+        );
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        if (status != StreamingPngStatus::Ok) {
+            lastFailure_ = native_code(status);
+            return false;
+        }
+        writtenRows_ += bandHeight_;
+        bandStartY_ = -1;
+        bandHeight_ = 0;
+        return true;
+    }
+
+    static SuperResNativeCode native_code(StreamingPngStatus status) {
+        switch (status) {
+            case StreamingPngStatus::Ok:
+                return SuperResNativeCode::Ok;
+            case StreamingPngStatus::OutOfMemory:
+                return SuperResNativeCode::OutOfMemory;
+            case StreamingPngStatus::InvalidParams:
+            case StreamingPngStatus::InvalidState:
+                return SuperResNativeCode::InvalidParams;
+            case StreamingPngStatus::IoError:
+                return SuperResNativeCode::OutputFailed;
+        }
+        return SuperResNativeCode::OutputFailed;
+    }
+
+    bool croppedRaw_ = false;
+    int width_ = 0;
+    int height_ = 0;
+    int writtenRows_ = 0;
+    int bandStartY_ = -1;
+    int bandHeight_ = 0;
+    size_t rowBytes_ = 0;
+    std::vector<unsigned char> bytes_;
+    StreamingPngWriter writer_;
+    std::chrono::steady_clock::duration encodingDuration_{};
+    SuperResNativeCode lastFailure_ = SuperResNativeCode::Ok;
 };
 
 class InvocationVulkanAllocators {
@@ -160,6 +309,18 @@ SuperResNativeBackend native_backend_from_code(int code) {
     return code == static_cast<int>(SuperResNativeBackend::Optimized)
         ? SuperResNativeBackend::Optimized
         : SuperResNativeBackend::LegacySafe;
+}
+
+void record_tile_copy_duration(
+    SuperResNativePerformance& performance,
+    const std::chrono::steady_clock::time_point& start,
+    const OutputAssembly& output,
+    std::chrono::steady_clock::duration encodingBefore
+) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto encoding = output.encoding_duration() - encodingBefore;
+    const auto copyOnly = elapsed > encoding ? elapsed - encoding : std::chrono::steady_clock::duration{};
+    performance.tileCopyMs += std::chrono::duration_cast<std::chrono::milliseconds>(copyOnly).count();
 }
 
 SuperResInferencePrecision inference_precision_from_code(int code) {
@@ -585,7 +746,7 @@ ncnn::Mat make_input_tile(
 
 bool copy_output_tile(
     const ncnn::Mat& tile,
-    std::vector<unsigned char>& output,
+    OutputAssembly& output,
     long long& coveredPixels,
     const LoadedImage* residualBaseImage,
     int bufferW,
@@ -672,9 +833,14 @@ bool copy_output_tile(
     const ncnn::Mat redChannel = tile.channel(0);
     const ncnn::Mat greenChannel = tile.channel(1);
     const ncnn::Mat blueChannel = tile.channel(2);
+    if (!output.prepare_window(window.dstY, window.copyH)) {
+        return false;
+    }
     for (int y = 0; y < window.copyH; ++y) {
-        unsigned char* const destinationRow = output.data() +
-            (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX) * 3;
+        unsigned char* const destinationRow = output.row(window.dstY + y, window.dstX);
+        if (destinationRow == nullptr) {
+            return false;
+        }
         const unsigned char* residualRow = nullptr;
         int residualWidth = 0;
         if (addRealCugan4xResidualBase) {
@@ -832,7 +998,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     int outputW,
     int outputH,
     bool useCroppedOutput,
-    std::vector<unsigned char>& output,
+    OutputAssembly& output,
     long long& coveredPixels,
     int& completed,
     SuperResNativePerformance& performance
@@ -982,6 +1148,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             }
 
             const auto copyStart = std::chrono::steady_clock::now();
+            const auto encodingBefore = output.encoding_duration();
             if (!copy_output_tile(
                     copySource,
                     output,
@@ -1005,7 +1172,10 @@ SuperResNativeCode run_optimized_vulkan_tiles(
                     params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
                     params.engineType == kEngineRealCugan && params.scale == 4
                 )) {
-                performance.tileCopyMs += elapsed_ms(copyStart);
+                record_tile_copy_duration(performance, copyStart, output, encodingBefore);
+                if (output.failure_code() != SuperResNativeCode::Ok) {
+                    return output.failure_code();
+                }
                 log_tile_output_mismatch(
                     params,
                     true,
@@ -1020,7 +1190,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
                 );
                 return SuperResNativeCode::TileOutputMismatch;
             }
-            performance.tileCopyMs += elapsed_ms(copyStart);
+            record_tile_copy_duration(performance, copyStart, output, encodingBefore);
 
             completed += 1;
             const float progress = 0.12f + 0.78f * (static_cast<float>(completed) / totalTiles);
@@ -1069,6 +1239,15 @@ SuperResNativeCode run_ncnn_image(
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
         return SuperResNativeCode::Unsupported;
     }
+#ifndef NDEBUG
+    static const bool streamingPngChecksPass = run_streaming_png_writer_runtime_checks(
+        params.outputPath.c_str()
+    );
+    if (!streamingPngChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Streaming PNG writer runtime checks failed");
+        return SuperResNativeCode::Unsupported;
+    }
+#endif
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
     performance.decodeMs = decodeMs;
@@ -1164,14 +1343,16 @@ SuperResNativeCode run_ncnn_image(
     const int bufferW = useCroppedOutput ? params.outputCropWidth : outputW;
     const int bufferH = useCroppedOutput ? params.outputCropHeight : outputH;
 
-    std::vector<unsigned char> output;
-    try {
-        output.resize(static_cast<size_t>(bufferW) * bufferH * 3);
-    } catch (...) {
-        return SuperResNativeCode::OutOfMemory;
-    }
-    if (output.empty()) {
-        return SuperResNativeCode::OutOfMemory;
+    OutputAssembly output;
+    const SuperResNativeCode outputInitialization = output.initialize(
+            params.outputPath,
+            bufferW,
+            bufferH,
+            useCroppedOutput,
+            tileSize * params.scale
+        );
+    if (outputInitialization != SuperResNativeCode::Ok) {
+        return outputInitialization;
     }
 
     int completed = 0;
@@ -1369,6 +1550,7 @@ SuperResNativeCode run_ncnn_image(
             }
 
             const auto copyStart = std::chrono::steady_clock::now();
+            const auto encodingBefore = output.encoding_duration();
             if (!copy_output_tile(
                     copySource,
                     output,
@@ -1392,6 +1574,10 @@ SuperResNativeCode run_ncnn_image(
                     params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
                     params.engineType == kEngineRealCugan && params.scale == 4
                 )) {
+                record_tile_copy_duration(performance, copyStart, output, encodingBefore);
+                if (output.failure_code() != SuperResNativeCode::Ok) {
+                    return output.failure_code();
+                }
                 log_tile_output_mismatch(
                     params,
                     useVulkan,
@@ -1406,7 +1592,7 @@ SuperResNativeCode run_ncnn_image(
                 );
                 return SuperResNativeCode::TileOutputMismatch;
             }
-            performance.tileCopyMs += elapsed_ms(copyStart);
+            record_tile_copy_duration(performance, copyStart, output, encodingBefore);
             copySource.release();
             result.release();
             input.release();
@@ -1460,19 +1646,22 @@ SuperResNativeCode run_ncnn_image(
     if (params.outputMode == kNativeOutputRawCroppedRgbTile) {
         if (!write_cropped_raw_rgb_tile(
                 params.outputPath,
-                output,
+                output.bytes(),
                 params.outputCropWidth,
                 params.outputCropHeight
             )) {
             return SuperResNativeCode::OutputFailed;
         }
+        performance.saveMs = elapsed_ms(saveStart);
     } else {
-        // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
-        if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {
-            return SuperResNativeCode::OutputFailed;
+        const SuperResNativeCode finishCode = output.finish_png();
+        if (finishCode != SuperResNativeCode::Ok) {
+            return finishCode;
         }
+        performance.saveMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            output.encoding_duration()
+        ).count();
     }
-    performance.saveMs = elapsed_ms(saveStart);
     performance.preprocessMs = performance.tileInputMs;
     if (!useExplicitVulkanPath) {
         performance.inferenceMs = performance.tileExtractMs;
