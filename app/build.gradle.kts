@@ -85,6 +85,13 @@ android {
                 abiFilters += "arm64-v8a"
             }
         }
+        create("benchmark") {
+            initWith(getByName("release"))
+            buildConfigField("boolean", "LUMASR_CRASH_ON_PROCESSING_FAILURE", "true")
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+        }
     }
 
     externalNativeBuild {
