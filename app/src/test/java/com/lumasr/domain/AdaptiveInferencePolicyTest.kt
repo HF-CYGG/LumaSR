@@ -2,6 +2,7 @@ package com.lumasr.domain
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -329,7 +330,9 @@ class AdaptiveInferencePolicyTest {
         val benchmark = InferenceBenchmarkResult(
             identity = identity,
             fp16Quality = passingQuality(),
-            recommendedCommandBatchSize = 3
+            recommendedCommandBatchSize = 3,
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 2_000L
         )
 
         val optimized = AdaptiveInferencePolicy.selectExecutionProfile(
@@ -338,7 +341,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = false,
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity.copy(),
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
 
         assertEquals(NativeBackend.OPTIMIZED, optimized.backend)
@@ -353,7 +357,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = false,
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity.copy(gpuDriverVersion = "driver-v2"),
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
 
         assertEquals(NativeBackend.LEGACY_SAFE, stale.backend)
@@ -382,7 +387,8 @@ class AdaptiveInferencePolicyTest {
                 ttaEnabled = false,
                 benchmarkResult = benchmark,
                 currentBenchmarkIdentity = identity,
-                currentSafeTileSize = 256
+                currentSafeTileSize = 256,
+                nowEpochMs = NOW_EPOCH_MS
             )
 
             assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
@@ -419,7 +425,8 @@ class AdaptiveInferencePolicyTest {
                 ttaEnabled = false,
                 benchmarkResult = benchmark,
                 currentBenchmarkIdentity = identity,
-                currentSafeTileSize = 256
+                currentSafeTileSize = 256,
+                nowEpochMs = NOW_EPOCH_MS
             )
 
             assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
@@ -435,7 +442,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = false,
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
-            currentSafeTileSize = 256
+            currentSafeTileSize = 256,
+            nowEpochMs = NOW_EPOCH_MS
         )
         assertEquals(AccelerationMode.CPU, explicitCpu.accelerationMode)
     }
@@ -451,7 +459,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = false,
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
         val uncalibrated = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -459,7 +468,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = false,
             benchmarkResult = null,
             currentBenchmarkIdentity = identity,
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
 
         assertEquals(AccelerationMode.CPU, cpu.accelerationMode)
@@ -479,7 +489,8 @@ class AdaptiveInferencePolicyTest {
             ttaEnabled = true,
             benchmarkResult = benchmarkResult(identity),
             currentBenchmarkIdentity = identity,
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
 
         assertEquals(NativeBackend.OPTIMIZED, selected.backend)
@@ -491,20 +502,97 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
-    fun lowGpuRoughScoreCannotEnableOptimizedBatching() {
+    fun gpuRoughScoreThresholdIsInclusiveAt75() {
         val identity = benchmarkIdentity()
-        val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+        val belowThreshold = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device().copy(gpuRoughScore = AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE - 1),
             accelerationMode = AccelerationMode.VULKAN,
             ttaEnabled = false,
             benchmarkResult = benchmarkResult(identity),
             currentBenchmarkIdentity = identity,
-            currentSafeTileSize = 512
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
+        )
+        val atThreshold = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmarkResult(identity),
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS
         )
 
-        assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
-        assertEquals(InferencePrecision.FP32, selected.precision)
-        assertEquals(1, selected.commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, belowThreshold.backend)
+        assertEquals(InferencePrecision.FP32, belowThreshold.precision)
+        assertEquals(1, belowThreshold.commandBatchSize)
+        assertEquals(NativeBackend.OPTIMIZED, atThreshold.backend)
+        assertEquals(InferencePrecision.FP16, atThreshold.precision)
+    }
+
+    @Test
+    fun acceptsBenchmarkOnlyInsideInclusiveValidityWindow() {
+        val identity = benchmarkIdentity()
+        val benchmark = benchmarkResult(
+            identity = identity,
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 2_000L
+        )
+
+        fun selectAt(nowEpochMs: Long) = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device(),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512,
+            nowEpochMs = nowEpochMs
+        )
+
+        assertEquals(NativeBackend.OPTIMIZED, selectAt(1_000L).backend)
+        assertEquals(NativeBackend.OPTIMIZED, selectAt(2_000L).backend)
+        assertEquals(NativeBackend.LEGACY_SAFE, selectAt(999L).backend)
+        assertEquals(InferencePrecision.FP32, selectAt(999L).precision)
+        assertEquals(NativeBackend.LEGACY_SAFE, selectAt(2_001L).backend)
+        assertEquals(InferencePrecision.FP32, selectAt(2_001L).precision)
+    }
+
+    @Test
+    fun rejectsInvalidBenchmarkValidityFields() {
+        val identity = benchmarkIdentity()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            benchmarkResult(identity = identity, measuredAtEpochMs = -1L)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            benchmarkResult(
+                identity = identity,
+                measuredAtEpochMs = 2_000L,
+                validUntilEpochMs = 1_999L
+            )
+        }
+    }
+
+    @Test
+    fun clampsMeasuredCommandBatchRecommendationToNativeBounds() {
+        val identity = benchmarkIdentity()
+        listOf(0 to 1, 1 to 1, 8 to 8, 9 to 8).forEach { (recommended, expected) ->
+            val selected = AdaptiveInferencePolicy.selectExecutionProfile(
+                device = device(),
+                accelerationMode = AccelerationMode.VULKAN,
+                ttaEnabled = false,
+                benchmarkResult = benchmarkResult(
+                    identity = identity,
+                    recommendedCommandBatchSize = recommended
+                ),
+                currentBenchmarkIdentity = identity,
+                currentSafeTileSize = 512,
+                nowEpochMs = NOW_EPOCH_MS
+            )
+
+            assertEquals(NativeBackend.OPTIMIZED, selected.backend)
+            assertEquals(expected, selected.commandBatchSize)
+        }
     }
 
     private fun executionProfile(
@@ -555,9 +643,20 @@ class AdaptiveInferencePolicyTest {
         p99ChannelError = 3
     )
 
-    private fun benchmarkResult(identity: BenchmarkIdentity) = InferenceBenchmarkResult(
+    private fun benchmarkResult(
+        identity: BenchmarkIdentity,
+        recommendedCommandBatchSize: Int = 4,
+        measuredAtEpochMs: Long = 1_000L,
+        validUntilEpochMs: Long = 2_000L
+    ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = passingQuality(),
-        recommendedCommandBatchSize = 4
+        recommendedCommandBatchSize = recommendedCommandBatchSize,
+        measuredAtEpochMs = measuredAtEpochMs,
+        validUntilEpochMs = validUntilEpochMs
     )
+
+    private companion object {
+        const val NOW_EPOCH_MS = 1_500L
+    }
 }

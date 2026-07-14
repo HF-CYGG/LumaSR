@@ -43,7 +43,7 @@ std::mutex cancel_mutex;
 std::mutex gpu_mutex;
 std::mutex net_cache_mutex;
 std::unordered_set<std::string> cancelled_tasks;
-bool gpu_instance_created = false;
+SuperResGpuInitState gpu_init_state = SuperResGpuInitState::Uninitialized;
 
 struct ModelFiles {
     std::string paramPath;
@@ -194,14 +194,17 @@ SuperResExecutionProfile resolve_execution_profile(
 }
 
 bool ensure_gpu_instance() {
-    if (gpu_instance_created) {
-        return ncnn::get_gpu_count() > 0;
+    if (!should_attempt_gpu_initialization(gpu_init_state)) {
+        return gpu_init_state == SuperResGpuInitState::Available;
     }
-    if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0) {
-        return false;
+
+    const int createResult = ncnn::create_gpu_instance();
+    const int gpuCount = createResult == 0 ? ncnn::get_gpu_count() : 0;
+    if (should_destroy_empty_gpu_instance(createResult, gpuCount)) {
+        ncnn::destroy_gpu_instance();
     }
-    gpu_instance_created = true;
-    return true;
+    gpu_init_state = transition_gpu_init_state(gpu_init_state, createResult, gpuCount);
+    return gpu_init_state == SuperResGpuInitState::Available;
 }
 
 std::string make_net_cache_key(

@@ -8,6 +8,33 @@
 constexpr std::size_t kMaxCapabilityStringLength = 128;
 constexpr std::size_t kMaxCapabilityInputBytes = 512;
 
+enum class SuperResGpuInitState {
+    Uninitialized,
+    Available,
+    Unavailable
+};
+
+constexpr bool should_attempt_gpu_initialization(SuperResGpuInitState state) {
+    return state == SuperResGpuInitState::Uninitialized;
+}
+
+constexpr SuperResGpuInitState transition_gpu_init_state(
+    SuperResGpuInitState currentState,
+    int createResult,
+    int gpuCount
+) {
+    if (!should_attempt_gpu_initialization(currentState)) {
+        return currentState;
+    }
+    return createResult == 0 && gpuCount > 0
+        ? SuperResGpuInitState::Available
+        : SuperResGpuInitState::Unavailable;
+}
+
+constexpr bool should_destroy_empty_gpu_instance(int createResult, int gpuCount) {
+    return createResult == 0 && gpuCount <= 0;
+}
+
 struct SuperResCpuTopology {
     int physicalCoreCount;
     int bigCoreCount;

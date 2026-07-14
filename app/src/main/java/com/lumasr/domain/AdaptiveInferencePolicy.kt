@@ -56,8 +56,17 @@ data class BenchmarkIdentity(
 data class InferenceBenchmarkResult(
     val identity: BenchmarkIdentity,
     val fp16Quality: Fp16QualityMetrics,
-    val recommendedCommandBatchSize: Int
-)
+    val recommendedCommandBatchSize: Int,
+    val measuredAtEpochMs: Long,
+    val validUntilEpochMs: Long
+) {
+    init {
+        require(measuredAtEpochMs >= 0L) { "Benchmark measurement time must be non-negative" }
+        require(validUntilEpochMs >= measuredAtEpochMs) {
+            "Benchmark validity end must not precede its measurement time"
+        }
+    }
+}
 
 enum class ThermalLevel {
     NORMAL,
@@ -125,7 +134,8 @@ object AdaptiveInferencePolicy {
         ttaEnabled: Boolean,
         benchmarkResult: InferenceBenchmarkResult?,
         currentBenchmarkIdentity: BenchmarkIdentity?,
-        currentSafeTileSize: Int
+        currentSafeTileSize: Int,
+        nowEpochMs: Long
     ): InferenceExecutionProfile {
         val safeTileSize = UpscaleParamsFactory.sanitizeTileSize(currentSafeTileSize)
         val isCapabilityUnknown = device.physicalCoreCount <= 0 || device.memoryBucketMb <= 0
@@ -141,7 +151,9 @@ object AdaptiveInferencePolicy {
             val canUseVulkan = accelerationMode != AccelerationMode.CPU && device.supportsVulkan
             val benchmarkIsValid = benchmarkResult != null &&
                 currentBenchmarkIdentity != null &&
-                isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity)
+                isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity) &&
+                nowEpochMs >= benchmarkResult.measuredAtEpochMs &&
+                nowEpochMs <= benchmarkResult.validUntilEpochMs
             val qualityAllowsFp16 = benchmarkResult?.fp16Quality?.let { quality ->
                 isFp16Eligible(device, quality)
             } == true

@@ -4,6 +4,53 @@
 
 namespace {
 
+constexpr int gpu_initialization_attempts_for_two_requests(
+    int createResult,
+    int gpuCount
+) {
+    int attempts = 0;
+    SuperResGpuInitState state = SuperResGpuInitState::Uninitialized;
+    if (should_attempt_gpu_initialization(state)) {
+        ++attempts;
+        state = transition_gpu_init_state(state, createResult, gpuCount);
+    }
+    if (should_attempt_gpu_initialization(state)) {
+        ++attempts;
+    }
+    return attempts;
+}
+
+constexpr SuperResGpuInitState kFailedGpuState = transition_gpu_init_state(
+    SuperResGpuInitState::Uninitialized,
+    -1,
+    0
+);
+static_assert(should_attempt_gpu_initialization(SuperResGpuInitState::Uninitialized));
+static_assert(kFailedGpuState == SuperResGpuInitState::Unavailable);
+static_assert(!should_attempt_gpu_initialization(kFailedGpuState));
+static_assert(transition_gpu_init_state(kFailedGpuState, 0, 1) == kFailedGpuState);
+static_assert(gpu_initialization_attempts_for_two_requests(-1, 0) == 1);
+
+constexpr SuperResGpuInitState kAvailableGpuState = transition_gpu_init_state(
+    SuperResGpuInitState::Uninitialized,
+    0,
+    1
+);
+static_assert(kAvailableGpuState == SuperResGpuInitState::Available);
+static_assert(!should_attempt_gpu_initialization(kAvailableGpuState));
+static_assert(transition_gpu_init_state(kAvailableGpuState, -1, 0) == kAvailableGpuState);
+static_assert(gpu_initialization_attempts_for_two_requests(0, 1) == 1);
+
+constexpr SuperResGpuInitState kEmptyGpuState = transition_gpu_init_state(
+    SuperResGpuInitState::Uninitialized,
+    0,
+    0
+);
+static_assert(kEmptyGpuState == SuperResGpuInitState::Unavailable);
+static_assert(should_destroy_empty_gpu_instance(0, 0));
+static_assert(!should_destroy_empty_gpu_instance(-1, 0));
+static_assert(!should_destroy_empty_gpu_instance(0, 1));
+
 constexpr SuperResCpuTopology kNormalizedTopology = normalize_cpu_topology(8, 3, 5);
 static_assert(kNormalizedTopology.physicalCoreCount == 8);
 static_assert(kNormalizedTopology.bigCoreCount == 3);
