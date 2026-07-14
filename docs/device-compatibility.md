@@ -48,8 +48,11 @@ Snapdragon 8 系与 Dimensity 9 系，兼容组至少包含一台 4–6 GB 内�
 - 每个任务的输出通过原子发布；失败或取消不得留下可被图库识别的不完整最终文件。
 - Macrobenchmark 的三个优化场景分别达到 `>= 1.15x`，总体几何平均达到 `>= 1.50x`。数值只在命名的
   物理设备、相同电量/温控/系统设置和相同校准状态下比较。
+- warm 基准先保留 1 次明确标记为 `phase=warmup_discarded` 的冷 App/native 样本，再统计恰好 3 次 warm
+  样本；不得把 Macrobenchmark 编译预热或校准推理当作 native cache 预热。
 - 保存设备厂商、型号、ROM/Build ID、API、ABI、fingerprint SHA-256、GPU driver、实际 backend、
-  precision、batch、fallback、三次耗时和 Perfetto/logcat 文件；不得记录用户图片路径或内容。
+  precision、batch、fallback、三次耗时和 Perfetto/logcat 文件。每个样本还必须绑定唯一 task、场景
+  `modelKey`、`region=-1/retry=0`、`profileIdentity` 与 `calibrationIdentity`；不得记录用户图片路径或内容。
 
 构建与测量命令见 [performance-benchmark.md](performance-benchmark.md)。没有对应真机证据的厂商/ROM
 只能标记为“待验证”，不能标记为“已兼容”。

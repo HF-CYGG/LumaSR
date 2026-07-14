@@ -49,11 +49,32 @@ class SuperResolutionMacrobenchmark {
 
     @After
     fun cleanGeneratedData() {
+        val failures = mutableListOf<String>()
         generatedAssets.forEach { uri ->
             runCatching { context.contentResolver.delete(uri, null, null) }
+                .onSuccess { deletedRows ->
+                    if (deletedRows != 1) {
+                        failures += "media delete returned $deletedRows for $uri"
+                    }
+                }
+                .onFailure { error ->
+                    failures += "media delete failed for $uri: ${error.message}"
+                }
         }
         generatedAssets.clear()
         runCatching { device.executeShellCommand("pm clear $TARGET_PACKAGE") }
+            .onSuccess { output ->
+                val cleared = output.trim() == "Success"
+                if (!cleared) {
+                    failures += "pm clear returned '${output.trim()}'"
+                }
+            }
+            .onFailure { error ->
+                failures += "pm clear failed: ${error.message}"
+            }
+        check(failures.isEmpty()) {
+            "Cleanup failure(s): ${failures.joinToString("; ")}"
+        }
     }
 
     @Test
@@ -90,14 +111,15 @@ class SuperResolutionMacrobenchmark {
         benchmarkRule.measureRepeated(
             packageName = TARGET_PACKAGE,
             metrics = listOf(FrameTimingMetric()),
-            compilationMode = CompilationMode.Partial(warmupIterations = WARMUP_ITERATIONS),
-            iterations = MEASURED_ITERATIONS,
+            compilationMode = CompilationMode.Full(),
+            iterations = cacheMode.totalIterations,
             startupMode = null,
             setupBlock = {
                 prepareScenario(
                     scenario = scenario,
                     cacheMode = cacheMode,
-                    prepareCalibration = profileMode == ProfileMode.OPTIMIZED && !calibrationPrepared
+                    prepareCalibration = profileMode == ProfileMode.OPTIMIZED && !calibrationPrepared,
+                    isFirstSample = samples.isEmpty()
                 )
                 if (profileMode == ProfileMode.OPTIMIZED) {
                     calibrationPrepared = true
@@ -108,22 +130,44 @@ class SuperResolutionMacrobenchmark {
             }
         )
 
+        check(samples.size == cacheMode.totalIterations) {
+            "Expected ${cacheMode.totalIterations} app samples, got ${samples.size}"
+        }
+        if (cacheMode.discardedSamples > 0) {
+            emitDiscardedWarmupResult(scenario, profileMode, samples.first())
+        }
         emitMeasuredResults(
             scenario = scenario,
             cacheMode = cacheMode,
             profileMode = profileMode,
-            measured = samples.takeLast(MEASURED_ITERATIONS)
+            measured = samples.drop(cacheMode.discardedSamples).take(MEASURED_ITERATIONS)
         )
     }
 
     private fun MacrobenchmarkScope.prepareScenario(
         scenario: Scenario,
         cacheMode: CacheMode,
-        prepareCalibration: Boolean
+        prepareCalibration: Boolean,
+        isFirstSample: Boolean
     ) {
-        if (cacheMode == CacheMode.COLD) {
+        if (cacheMode == CacheMode.COLD || isFirstSample) {
             killProcess()
         }
+        launchAndSelectScenario(scenario)
+        if (prepareCalibration) {
+            calibrateSelectedModelThroughSettings(scenario)
+            // Calibration itself performs native inference. Restart so the first benchmark sample is cold.
+            killProcess()
+            launchAndSelectScenario(scenario)
+        }
+        selectStableProcessingDefaults()
+        scrollToStartButton().also { start ->
+            check(start.isEnabled) { "Start button stayed disabled for ${scenario.id}" }
+        }
+        device.executeShellCommand("logcat -c")
+    }
+
+    private fun MacrobenchmarkScope.launchAndSelectScenario(scenario: Scenario) {
         pressHome()
         startActivityAndWait()
         device.waitForIdle()
@@ -132,14 +176,6 @@ class SuperResolutionMacrobenchmark {
         openPhotoPicker()
         selectNewestGeneratedImage(scenario.id)
         selectModel(scenario.modelCardText)
-        if (prepareCalibration) {
-            calibrateSelectedModelThroughSettings(scenario)
-        }
-        selectStableProcessingDefaults()
-        scrollToStartButton().also { start ->
-            check(start.isEnabled) { "Start button stayed disabled for ${scenario.id}" }
-        }
-        device.executeShellCommand("logcat -c")
     }
 
     private fun MacrobenchmarkScope.measureScenario(
@@ -156,9 +192,7 @@ class SuperResolutionMacrobenchmark {
         assertNotNull("${scenario.id} did not reach the result screen", completed)
         val elapsedNanos = SystemClock.elapsedRealtimeNanos() - startedAt
         device.waitForIdle()
-        val nativeLine = waitForNativePerformanceLine()
-        assertNotNull("${scenario.id} did not emit native stage timings", nativeLine)
-        val nativeFields = parseNativeFields(requireNotNull(nativeLine))
+        val nativeFields = waitForNativePerformanceEvidence(scenario)
         assertExpectedNativeProfile(scenario, profileMode, nativeFields)
         return ScenarioSample(
             elapsedMs = elapsedNanos / 1_000_000.0,
@@ -218,6 +252,24 @@ class SuperResolutionMacrobenchmark {
                 "but native precision=${nativeFields["precision"] ?: "missing"} " +
                 "fallback=${nativeFields["fallback"] ?: "missing"}"
         }
+        check(nativeFields["accel"] == "vulkan") {
+            "${scenario.id} expected the requested AUTO GPU path, accel=${nativeFields["accel"]}"
+        }
+        check(nativeFields["region"] == "-1") {
+            "${scenario.id} expected a whole-task native record, region=${nativeFields["region"]}"
+        }
+        check(nativeFields["retry"] == "0") {
+            "${scenario.id} must not publish fallback/retry evidence as the measured run"
+        }
+        check(nativeFields["modelKey"] == scenario.expectedNativeModelKey) {
+            "${scenario.id} expected native modelKey=${scenario.expectedNativeModelKey}, " +
+                "got ${nativeFields["modelKey"] ?: "missing"}"
+        }
+        listOf("driverId", "driverVersion").forEach { field ->
+            check(nativeFields[field] !in INVALID_DRIVER_IDENTITY_VALUES) {
+                "${scenario.id} requires a non-zero Vulkan $field, got ${nativeFields[field]}"
+            }
+        }
     }
 
     private fun dismissOptionalFirstRunPrompt() {
@@ -261,6 +313,7 @@ class SuperResolutionMacrobenchmark {
     }
 
     private fun selectNewestGeneratedImage(scenarioId: String) {
+        openBenchmarkAlbum()
         val displayName = SyntheticMediaAsset.displayName(scenarioId)
         val exactAsset = waitForAny(
             selectors = listOf(
@@ -269,15 +322,7 @@ class SuperResolutionMacrobenchmark {
             ),
             timeoutMillis = 1_500L
         )
-        val thumbnail = exactAsset ?: run {
-            openBenchmarkAlbum()
-            val thumbnailSelector = By.res(
-                Pattern.compile(".*:id/(icon_thumbnail|thumbnail|photo_thumbnail|image_thumbnail)")
-            )
-            device.wait(Until.findObject(thumbnailSelector), PICKER_TIMEOUT_MS)
-                ?: firstLargePickerItem()
-                ?: error("Cannot locate the generated image inside $BENCHMARK_ALBUM")
-        }
+        val thumbnail = exactAsset ?: singleBenchmarkAlbumThumbnail()
         thumbnail.click()
 
         if (!device.hasObject(By.pkg(TARGET_PACKAGE))) {
@@ -323,22 +368,38 @@ class SuperResolutionMacrobenchmark {
             ) ?: error("Cannot locate the private-safe $BENCHMARK_ALBUM album")
         }
         album.click()
-        device.waitForIdle()
+        verifyBenchmarkAlbumTitle()
     }
 
-    private fun firstLargePickerItem(): UiObject2? {
-        val screenWidth = device.displayWidth
-        val screenHeight = device.displayHeight
-        return device.findObjects(By.clickable(true))
-            .asSequence()
-            .filter { candidate ->
-                val bounds = candidate.visibleBounds
-                bounds.top > screenHeight / 10 &&
-                    bounds.bottom < screenHeight * 9 / 10 &&
-                    bounds.width() in (screenWidth / 6)..(screenWidth * 3 / 4) &&
-                    bounds.height() in (screenWidth / 6)..(screenWidth * 3 / 4)
-            }
-            .minWithOrNull(compareBy({ it.visibleBounds.top }, { it.visibleBounds.left }))
+    private fun verifyBenchmarkAlbumTitle() {
+        device.waitForIdle()
+        val deadline = SystemClock.uptimeMillis() + PICKER_TIMEOUT_MS
+        while (SystemClock.uptimeMillis() < deadline) {
+            val title = listOf(
+                By.text(BENCHMARK_ALBUM),
+                By.desc(BENCHMARK_ALBUM)
+            ).asSequence()
+                .flatMap { selector -> device.findObjects(selector).asSequence() }
+                .firstOrNull { candidate -> !candidate.isClickable }
+            if (title != null) return
+            SystemClock.sleep(100)
+        }
+        error("Photo Picker did not expose a verified $BENCHMARK_ALBUM page title")
+    }
+
+    private fun singleBenchmarkAlbumThumbnail(): UiObject2 {
+        val thumbnailSelector = By.res(
+            Pattern.compile(".*:id/(icon_thumbnail|thumbnail|photo_thumbnail|image_thumbnail)")
+        )
+        check(device.wait(Until.hasObject(thumbnailSelector), PICKER_TIMEOUT_MS)) {
+            "Cannot locate the generated image inside verified album $BENCHMARK_ALBUM"
+        }
+        val thumbnails = device.findObjects(thumbnailSelector)
+        check(thumbnails.size == 1) {
+            "Expected one generated image in $BENCHMARK_ALBUM, found ${thumbnails.size}; " +
+                "refusing an ambiguous picker selection"
+        }
+        return thumbnails.single()
     }
 
     private fun selectModel(cardText: String) {
@@ -380,21 +441,76 @@ class SuperResolutionMacrobenchmark {
         return null
     }
 
-    private fun waitForNativePerformanceLine(): String? {
+    private fun waitForNativePerformanceEvidence(scenario: Scenario): Map<String, String> {
         val deadline = SystemClock.uptimeMillis() + NATIVE_LOG_TIMEOUT_MS
         while (SystemClock.uptimeMillis() < deadline) {
-            val line = device.executeShellCommand("logcat -d -v raw -s LumaSRNative:I")
+            val lines = device.executeShellCommand("logcat -d -v raw -s LumaSRNative:I")
                 .lineSequence()
-                .lastOrNull { it.startsWith("Performance task=") }
-            if (line != null) return line
+                .filter { it.startsWith("Performance task=") }
+                .toList()
+            if (lines.isNotEmpty()) {
+                // Completion UI is already visible; a short settle avoids accepting a partial log snapshot.
+                SystemClock.sleep(NATIVE_LOG_SETTLE_MS)
+                return validateNativePerformanceEvidence(
+                    scenario = scenario,
+                    lines = device.executeShellCommand("logcat -d -v raw -s LumaSRNative:I")
+                        .lineSequence()
+                        .filter { it.startsWith("Performance task=") }
+                        .toList()
+                )
+            }
             SystemClock.sleep(250)
         }
-        return null
+        error("${scenario.id} did not emit native stage timings")
+    }
+
+    private fun validateNativePerformanceEvidence(
+        scenario: Scenario,
+        lines: List<String>
+    ): Map<String, String> {
+        val evidence = lines.map(::parseNativeFields)
+        val taskIds = evidence.mapNotNull { fields -> fields["task"] }
+            .filter(String::isNotBlank)
+            .distinct()
+        check(taskIds.size == 1 && evidence.all { fields -> fields["task"] == taskIds.single() }) {
+            "${scenario.id} expected one native task after log reset, got $taskIds"
+        }
+        val finalEvidence = evidence.filter { fields ->
+            fields["region"] == "-1" && fields["retry"] == "0"
+        }
+        check(finalEvidence.size == 1) {
+            "${scenario.id} expected exactly one final region=-1 retry=0 record, " +
+                "got ${finalEvidence.size} from ${lines.size} lines"
+        }
+        val nativeFields = finalEvidence.single()
+        REQUIRED_NATIVE_EVIDENCE_FIELDS.forEach { field ->
+            val value = nativeFields[field]
+            check(!value.isNullOrBlank() && value != "missing" && value != "unknown") {
+                "${scenario.id} native evidence is missing required field '$field'"
+            }
+        }
+        return nativeFields
     }
 
     private fun parseNativeFields(line: String): Map<String, String> {
         return NATIVE_FIELD_PATTERN.findAll(line)
             .associate { match -> match.groupValues[1] to match.groupValues[2] }
+    }
+
+    private fun emitDiscardedWarmupResult(
+        scenario: Scenario,
+        profileMode: ProfileMode,
+        sample: ScenarioSample
+    ) {
+        val native = formatNativeFields(sample.nativeFields)
+        val runtimeIdentity = runtimeIdentityFields(scenario, profileMode, sample.nativeFields)
+        Log.i(
+            OUTPUT_TAG,
+            "LUMASR_BENCHMARK schema=1 phase=warmup_discarded scenario=${scenario.id} " +
+                "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
+                "cache=warm width=${scenario.width} height=${scenario.height} tta=false iteration=0 " +
+                "elapsedMs=${format(sample.elapsedMs)} ${deviceIdentityFields()} $runtimeIdentity $native"
+        )
     }
 
     private fun emitMeasuredResults(
@@ -407,17 +523,22 @@ class SuperResolutionMacrobenchmark {
             "Expected $MEASURED_ITERATIONS measured samples, got ${measured.size}"
         }
         val identity = deviceIdentityFields()
+        val runtimeIdentities = measured.map { sample ->
+            runtimeIdentityFields(scenario, profileMode, sample.nativeFields)
+        }.distinct()
+        check(runtimeIdentities.size == 1) {
+            "${scenario.id} runtime identity changed across measured samples: $runtimeIdentities"
+        }
+        val runtimeIdentity = runtimeIdentities.single()
         measured.forEachIndexed { index, sample ->
-            val native = NATIVE_OUTPUT_FIELDS.joinToString(" ") { key ->
-                "$key=${sample.nativeFields[key] ?: "missing"}"
-            }
+            val native = formatNativeFields(sample.nativeFields)
             Log.i(
                 OUTPUT_TAG,
                 "LUMASR_BENCHMARK schema=1 phase=measured scenario=${scenario.id} " +
                     "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
                     "cache=${cacheMode.name.lowercase()} " +
                     "width=${scenario.width} height=${scenario.height} tta=false iteration=${index + 1} " +
-                    "elapsedMs=${format(sample.elapsedMs)} $identity $native"
+                    "elapsedMs=${format(sample.elapsedMs)} $identity $runtimeIdentity $native"
             )
         }
         val elapsed = measured.map(ScenarioSample::elapsedMs)
@@ -431,8 +552,34 @@ class SuperResolutionMacrobenchmark {
                 "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
                 "cache=${cacheMode.name.lowercase()} " +
                 "samples=${elapsed.size} medianMs=${format(median)} geometricMeanMs=${format(geometricMean)} " +
-                "thirdVsFirst=${format(thirdVsFirst)} $identity"
+                "thirdVsFirst=${format(thirdVsFirst)} $identity $runtimeIdentity"
         )
+    }
+
+    private fun formatNativeFields(nativeFields: Map<String, String>): String {
+        return NATIVE_OUTPUT_FIELDS.joinToString(" ") { key ->
+            "$key=${nativeFields[key] ?: "missing"}"
+        }
+    }
+
+    private fun runtimeIdentityFields(
+        scenario: Scenario,
+        profileMode: ProfileMode,
+        nativeFields: Map<String, String>
+    ): String {
+        val backend = nativeFields.getValue("backend")
+        val precision = nativeFields.getValue("precision")
+        val modelKey = nativeFields.getValue("modelKey")
+        val driverId = nativeFields.getValue("driverId")
+        val driverVersion = nativeFields.getValue("driverVersion")
+        val calibrationIdentity = if (profileMode == ProfileMode.OPTIMIZED) {
+            "${scenario.modelId}:$modelKey:$driverId:$driverVersion"
+        } else {
+            "none"
+        }
+        return "profileIdentity=${profileMode.outputLabel}:$backend:$precision " +
+            "calibrationIdentity=$calibrationIdentity gpuDriverId=$driverId " +
+            "gpuDriverVersion=$driverVersion"
     }
 
     private fun deviceIdentityFields(): String {
@@ -488,9 +635,12 @@ class SuperResolutionMacrobenchmark {
 
     private fun format(value: Double): String = String.format(Locale.US, "%.3f", value)
 
-    private enum class CacheMode {
-        COLD,
-        WARM
+    private enum class CacheMode(val discardedSamples: Int) {
+        COLD(discardedSamples = 0),
+        WARM(discardedSamples = 1);
+
+        val totalIterations: Int
+            get() = MEASURED_ITERATIONS + discardedSamples
     }
 
     private enum class ProfileMode(
@@ -511,6 +661,7 @@ class SuperResolutionMacrobenchmark {
         val id: String,
         val modelId: String,
         val modelCardText: String,
+        val expectedNativeModelKey: String,
         val width: Int,
         val height: Int,
         val timeoutMillis: Long
@@ -524,15 +675,19 @@ class SuperResolutionMacrobenchmark {
         const val CALIBRATION_READY_TEXT = "已校准，高性能模式可用"
         const val PROFILE_ARGUMENT = "lumasrBenchmarkProfile"
         const val MEASURED_ITERATIONS = 3
-        const val WARMUP_ITERATIONS = 1
         const val UI_TIMEOUT_MS = 20_000L
         const val PICKER_TIMEOUT_MS = 30_000L
         const val NATIVE_LOG_TIMEOUT_MS = 5_000L
+        const val NATIVE_LOG_SETTLE_MS = 250L
         const val CALIBRATION_TIMEOUT_MS = 70_000L
         const val FIRST_RUN_PROMPT_TIMEOUT_MS = 3_000L
         val NATIVE_FIELD_PATTERN = Regex("([A-Za-z][A-Za-z0-9]*)=([^\\s]+)")
         val NATIVE_OUTPUT_FIELDS = listOf(
+            "task",
+            "modelKey",
             "model",
+            "driverId",
+            "driverVersion",
             "accel",
             "backend",
             "precision",
@@ -544,6 +699,7 @@ class SuperResolutionMacrobenchmark {
             "cacheHit",
             "cacheSize",
             "retry",
+            "region",
             "tile",
             "decodeMs",
             "modelLoadMs",
@@ -559,10 +715,30 @@ class SuperResolutionMacrobenchmark {
             "encodeMs",
             "totalMs"
         )
+        val REQUIRED_NATIVE_EVIDENCE_FIELDS = listOf(
+            "task",
+            "modelKey",
+            "driverId",
+            "driverVersion",
+            "region",
+            "retry",
+            "backend",
+            "precision",
+            "totalMs"
+        )
+        val INVALID_DRIVER_IDENTITY_VALUES = setOf(
+            null,
+            "",
+            "0",
+            "0x00000000",
+            "missing",
+            "unknown"
+        )
         val REALCUGAN_12_MP = Scenario(
             id = "realcugan_12mp_2x",
             modelId = "realcugan-standard",
             modelCardText = "标准",
+            expectedNativeModelKey = "realcugan-standard",
             width = 4_000,
             height = 3_000,
             timeoutMillis = 30 * 60 * 1_000L
@@ -571,6 +747,7 @@ class SuperResolutionMacrobenchmark {
             id = "waifu2x_4mp_2x",
             modelId = "waifu2x-cunet",
             modelCardText = "CUnet",
+            expectedNativeModelKey = "waifu2x-cunet",
             width = 2_000,
             height = 2_000,
             timeoutMillis = 20 * 60 * 1_000L
@@ -579,6 +756,7 @@ class SuperResolutionMacrobenchmark {
             id = "animevideo_4mp_2x",
             modelId = "realesrgan-animevideo-x2",
             modelCardText = "视频",
+            expectedNativeModelKey = "realesr-animevideov3-x2",
             width = 2_000,
             height = 2_000,
             timeoutMillis = 20 * 60 * 1_000L
