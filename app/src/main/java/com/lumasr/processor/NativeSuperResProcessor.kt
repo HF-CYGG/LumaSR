@@ -3,6 +3,9 @@ package com.lumasr.processor
 import android.graphics.Bitmap
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.NativeBackend
+import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.UpscaleErrorCode
@@ -55,7 +58,13 @@ data class NativeProcessRequest(
     val outputCropWidth: Int,
     val outputCropHeight: Int,
     val retryCount: Int,
-    val regionIndex: Int
+    val regionIndex: Int,
+    val nativeBackend: Int = NativeBackend.LEGACY_SAFE.ordinal,
+    val inferencePrecision: Int = InferencePrecision.FP32.ordinal,
+    val cpuThreads: Int = 0,
+    val openmpBlocktimeMs: Int = 20,
+    val commandBatchSize: Int = 1,
+    val modelCacheCapacity: Int = 1
 )
 
 data class NativeRawTile(
@@ -148,6 +157,12 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
                 outputCropHeight = request.outputCropHeight,
                 retryCount = request.retryCount,
                 regionIndex = request.regionIndex,
+                nativeBackend = request.nativeBackend,
+                inferencePrecision = request.inferencePrecision,
+                cpuThreads = request.cpuThreads,
+                openmpBlocktimeMs = request.openmpBlocktimeMs,
+                commandBatchSize = request.commandBatchSize,
+                modelCacheCapacity = request.modelCacheCapacity,
                 progressSink = NativeProgressSink(onProgress)
             )
         )
@@ -204,6 +219,12 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
                 outputCropHeight = request.outputCropHeight,
                 retryCount = request.retryCount,
                 regionIndex = request.regionIndex,
+                nativeBackend = request.nativeBackend,
+                inferencePrecision = request.inferencePrecision,
+                cpuThreads = request.cpuThreads,
+                openmpBlocktimeMs = request.openmpBlocktimeMs,
+                commandBatchSize = request.commandBatchSize,
+                modelCacheCapacity = request.modelCacheCapacity,
                 progressSink = NativeProgressSink(onProgress)
             )
         )
@@ -229,6 +250,12 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
         outputCropHeight: Int,
         retryCount: Int,
         regionIndex: Int,
+        nativeBackend: Int,
+        inferencePrecision: Int,
+        cpuThreads: Int,
+        openmpBlocktimeMs: Int,
+        commandBatchSize: Int,
+        modelCacheCapacity: Int,
         progressSink: NativeProgressSink
     ): Int
 
@@ -264,6 +291,12 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
         outputCropHeight: Int,
         retryCount: Int,
         regionIndex: Int,
+        nativeBackend: Int,
+        inferencePrecision: Int,
+        cpuThreads: Int,
+        openmpBlocktimeMs: Int,
+        commandBatchSize: Int,
+        modelCacheCapacity: Int,
         progressSink: NativeProgressSink
     ): Int
 }
@@ -291,7 +324,16 @@ class NativeProgressSink(
         tileSize: Int,
         cacheSize: Int,
         retryCount: Int,
-        regionIndex: Int
+        regionIndex: Int,
+        preprocessMs: Long,
+        uploadMs: Long,
+        inferenceMs: Long,
+        downloadMs: Long,
+        postprocessMs: Long,
+        encodeMs: Long,
+        effectiveBackendOrdinal: Int,
+        effectivePrecisionOrdinal: Int,
+        fallbackReasonOrdinal: Int
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -317,7 +359,20 @@ class NativeProgressSink(
                         tileSize = tileSize,
                         cacheSize = cacheSize,
                         retryCount = retryCount,
-                        regionIndex = regionIndex
+                        regionIndex = regionIndex,
+                        preprocessMs = preprocessMs,
+                        uploadMs = uploadMs,
+                        inferenceMs = inferenceMs,
+                        downloadMs = downloadMs,
+                        postprocessMs = postprocessMs,
+                        encodeMs = encodeMs,
+                        effectiveBackend = NativeBackend.entries.getOrElse(effectiveBackendOrdinal) {
+                            NativeBackend.LEGACY_SAFE
+                        },
+                        effectivePrecision = InferencePrecision.entries.getOrElse(effectivePrecisionOrdinal) {
+                            InferencePrecision.FP32
+                        },
+                        fallbackReason = NativeFallbackReason.entries.getOrNull(fallbackReasonOrdinal)
                     )
                 } else {
                     null
@@ -520,7 +575,12 @@ class NativeSuperResProcessor(
                     "cacheSize=${snapshot.cacheSize} retry=${snapshot.retryCount} region=${snapshot.regionIndex} " +
                     "decodeMs=${snapshot.decodeMs} modelLoadMs=${snapshot.modelLoadMs} " +
                     "tileInputMs=${snapshot.tileInputMs} tileExtractMs=${snapshot.tileExtractMs} " +
-                    "tileCopyMs=${snapshot.tileCopyMs} saveMs=${snapshot.saveMs} totalMs=${snapshot.totalMs}"
+                    "tileCopyMs=${snapshot.tileCopyMs} saveMs=${snapshot.saveMs} totalMs=${snapshot.totalMs} " +
+                    "preprocessMs=${snapshot.preprocessMs} uploadMs=${snapshot.uploadMs} " +
+                    "inferenceMs=${snapshot.inferenceMs} downloadMs=${snapshot.downloadMs} " +
+                    "postprocessMs=${snapshot.postprocessMs} encodeMs=${snapshot.encodeMs} " +
+                    "backend=${snapshot.effectiveBackend} precision=${snapshot.effectivePrecision} " +
+                    "fallback=${snapshot.fallbackReason}"
             )
         }
     }
@@ -545,7 +605,13 @@ private fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     outputCropWidth = outputCropWidth,
     outputCropHeight = outputCropHeight,
     retryCount = retryCount,
-    regionIndex = regionIndex
+    regionIndex = regionIndex,
+    nativeBackend = nativeBackend.ordinal,
+    inferencePrecision = inferencePrecision.ordinal,
+    cpuThreads = cpuThreads,
+    openmpBlocktimeMs = openmpBlocktimeMs,
+    commandBatchSize = commandBatchSize,
+    modelCacheCapacity = modelCacheCapacity
 )
 
 internal val SuperResEngine.nativeCode: Int

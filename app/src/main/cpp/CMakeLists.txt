@@ -9,6 +9,7 @@ endif()
 add_library(localsr SHARED
     superres_jni.cpp
     superres_engine.cpp
+    superres_execution_profile_checks.cpp
     superres_png_streamer.cpp
     superres_d4_tta_checks.cpp
     superres_tile_geometry_checks.cpp

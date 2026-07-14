@@ -50,6 +50,12 @@ struct SuperResNativeParams {
     int outputCropHeight;
     int retryCount;
     int regionIndex;
+    int nativeBackend = 0;
+    int inferencePrecision = 0;
+    int cpuThreads = 0;
+    int openmpBlocktimeMs = 20;
+    int commandBatchSize = 1;
+    int modelCacheCapacity = 1;
 };
 
 struct SuperResRawTile {
@@ -75,6 +81,15 @@ struct SuperResNativePerformance {
     int cacheSize = 0;
     int retryCount = 0;
     int regionIndex = -1;
+    long long preprocessMs = 0;
+    long long uploadMs = 0;
+    long long inferenceMs = 0;
+    long long downloadMs = 0;
+    long long postprocessMs = 0;
+    long long encodeMs = 0;
+    int effectiveBackend = 0;
+    int effectivePrecision = 0;
+    int fallbackReason = -1;
 };
 
 using SuperResProgressCallback = std::function<void(

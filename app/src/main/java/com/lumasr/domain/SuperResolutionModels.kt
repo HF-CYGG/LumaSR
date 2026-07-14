@@ -80,7 +80,13 @@ data class UpscaleParams(
     val retryCount: Int = 0,
     val regionIndex: Int = -1,
     val pipelinePasses: List<UpscaleParams> = emptyList(),
-    val pipelineLabel: String? = null
+    val pipelineLabel: String? = null,
+    val nativeBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
+    val inferencePrecision: InferencePrecision = InferencePrecision.FP32,
+    val cpuThreads: Int = 0,
+    val openmpBlocktimeMs: Int = 20,
+    val commandBatchSize: Int = 1,
+    val modelCacheCapacity: Int = 1
 )
 
 data class UpscalePipelinePlan(
@@ -126,8 +132,23 @@ data class NativePerformanceSnapshot(
     val tileSize: Int,
     val cacheSize: Int = 0,
     val retryCount: Int = 0,
-    val regionIndex: Int = -1
+    val regionIndex: Int = -1,
+    val preprocessMs: Long = tileInputMs,
+    val uploadMs: Long = 0,
+    val inferenceMs: Long = tileExtractMs,
+    val downloadMs: Long = 0,
+    val postprocessMs: Long = tileCopyMs,
+    val encodeMs: Long = saveMs,
+    val effectiveBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
+    val effectivePrecision: InferencePrecision = InferencePrecision.FP32,
+    val fallbackReason: NativeFallbackReason? = null
 )
+
+enum class NativeFallbackReason {
+    LEGACY_SAFE_REQUIRES_FP32,
+    CPU_REQUIRES_FP32,
+    FP16_UNSUPPORTED
+}
 
 enum class UpscaleStage {
     PREPARING,

@@ -1,6 +1,9 @@
 package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.NativeBackend
+import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
@@ -66,6 +69,12 @@ class NativeSuperResProcessorTest {
         assertEquals(0, bridge.lastRequest?.engineType)
         assertEquals(128, bridge.lastRequest?.tileSize)
         assertEquals(8, bridge.lastRequest?.gpuHeadroomPercent)
+        assertEquals(NativeBackend.LEGACY_SAFE.ordinal, bridge.lastRequest?.nativeBackend)
+        assertEquals(InferencePrecision.FP32.ordinal, bridge.lastRequest?.inferencePrecision)
+        assertEquals(0, bridge.lastRequest?.cpuThreads)
+        assertEquals(20, bridge.lastRequest?.openmpBlocktimeMs)
+        assertEquals(1, bridge.lastRequest?.commandBatchSize)
+        assertEquals(1, bridge.lastRequest?.modelCacheCapacity)
         assertEquals(listOf(UpscaleStage.PREPARING, UpscaleStage.LOADING_MODEL, UpscaleStage.DONE), stages)
     }
 
@@ -131,7 +140,16 @@ class NativeSuperResProcessorTest {
             tileSize = 256,
             cacheSize = 3,
             retryCount = 1,
-            regionIndex = 7
+            regionIndex = 7,
+            preprocessMs = 77,
+            uploadMs = 88,
+            inferenceMs = 99,
+            downloadMs = 111,
+            postprocessMs = 122,
+            encodeMs = 133,
+            effectiveBackend = NativeBackend.OPTIMIZED,
+            effectivePrecision = InferencePrecision.FP16,
+            fallbackReason = NativeFallbackReason.FP16_UNSUPPORTED
         )
         val bridge = FakeNativeBridge(
             code = NativeProcessCode.OK,
@@ -163,6 +181,61 @@ class NativeSuperResProcessorTest {
         assertEquals(3, progressSnapshots.single().cacheSize)
         assertEquals(1, progressSnapshots.single().retryCount)
         assertEquals(7, progressSnapshots.single().regionIndex)
+        assertEquals(77, progressSnapshots.single().preprocessMs)
+        assertEquals(99, progressSnapshots.single().inferenceMs)
+        assertEquals(122, progressSnapshots.single().postprocessMs)
+        assertEquals(133, progressSnapshots.single().encodeMs)
+        assertEquals(NativeBackend.OPTIMIZED, progressSnapshots.single().effectiveBackend)
+        assertEquals(InferencePrecision.FP16, progressSnapshots.single().effectivePrecision)
+        assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, progressSnapshots.single().fallbackReason)
+    }
+
+    @Test
+    fun decodesExtendedNativePerformanceSnapshotFromProgressJniContract() {
+        val events = mutableListOf<NativeProgressEvent>()
+        val sink = NativeProgressSink(events::add)
+
+        sink.onProgress(
+            stageOrdinal = UpscaleStage.SAVING.ordinal,
+            currentTile = 4,
+            totalTiles = 4,
+            progress = 0.99f,
+            message = "Performance sample",
+            hasPerformanceSnapshot = true,
+            decodeMs = 1,
+            modelLoadMs = 2,
+            tileInputMs = 3,
+            tileExtractMs = 4,
+            tileCopyMs = 5,
+            saveMs = 6,
+            totalMs = 21,
+            cacheHit = true,
+            accelerationModeOrdinal = AccelerationMode.VULKAN.ordinal,
+            tileSize = 256,
+            cacheSize = 2,
+            retryCount = 1,
+            regionIndex = 7,
+            preprocessMs = 30,
+            uploadMs = 0,
+            inferenceMs = 40,
+            downloadMs = 0,
+            postprocessMs = 50,
+            encodeMs = 60,
+            effectiveBackendOrdinal = NativeBackend.OPTIMIZED.ordinal,
+            effectivePrecisionOrdinal = InferencePrecision.FP32.ordinal,
+            fallbackReasonOrdinal = NativeFallbackReason.FP16_UNSUPPORTED.ordinal
+        )
+
+        val snapshot = events.single().performanceSnapshot!!
+        assertEquals(30, snapshot.preprocessMs)
+        assertEquals(0, snapshot.uploadMs)
+        assertEquals(40, snapshot.inferenceMs)
+        assertEquals(0, snapshot.downloadMs)
+        assertEquals(50, snapshot.postprocessMs)
+        assertEquals(60, snapshot.encodeMs)
+        assertEquals(NativeBackend.OPTIMIZED, snapshot.effectiveBackend)
+        assertEquals(InferencePrecision.FP32, snapshot.effectivePrecision)
+        assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, snapshot.fallbackReason)
     }
 
     @Test
@@ -258,7 +331,13 @@ class NativeSuperResProcessorTest {
                 outputCropWidth = 256,
                 outputCropHeight = 128,
                 regionIndex = 3,
-                retryCount = 1
+                retryCount = 1,
+                nativeBackend = NativeBackend.OPTIMIZED,
+                inferencePrecision = InferencePrecision.FP16,
+                cpuThreads = 6,
+                openmpBlocktimeMs = 35,
+                commandBatchSize = 4,
+                modelCacheCapacity = 2
             )
         ) {}
 
@@ -269,6 +348,12 @@ class NativeSuperResProcessorTest {
         assertEquals(128, bridge.lastRequest?.outputCropHeight)
         assertEquals(3, bridge.lastRequest?.regionIndex)
         assertEquals(1, bridge.lastRequest?.retryCount)
+        assertEquals(NativeBackend.OPTIMIZED.ordinal, bridge.lastRequest?.nativeBackend)
+        assertEquals(InferencePrecision.FP16.ordinal, bridge.lastRequest?.inferencePrecision)
+        assertEquals(6, bridge.lastRequest?.cpuThreads)
+        assertEquals(35, bridge.lastRequest?.openmpBlocktimeMs)
+        assertEquals(4, bridge.lastRequest?.commandBatchSize)
+        assertEquals(2, bridge.lastRequest?.modelCacheCapacity)
     }
 
     @Test
@@ -288,7 +373,13 @@ class NativeSuperResProcessorTest {
                 outputCropWidth = 512,
                 outputCropHeight = 384,
                 regionIndex = 5,
-                retryCount = 2
+                retryCount = 2,
+                nativeBackend = NativeBackend.OPTIMIZED,
+                inferencePrecision = InferencePrecision.FP16,
+                cpuThreads = 5,
+                openmpBlocktimeMs = 45,
+                commandBatchSize = 3,
+                modelCacheCapacity = 2
             ),
             bitmap = null
         ) {}
@@ -303,6 +394,12 @@ class NativeSuperResProcessorTest {
         assertEquals(384, bridge.lastBitmapRegionRequest?.outputCropHeight)
         assertEquals(5, bridge.lastBitmapRegionRequest?.regionIndex)
         assertEquals(2, bridge.lastBitmapRegionRequest?.retryCount)
+        assertEquals(NativeBackend.OPTIMIZED.ordinal, bridge.lastBitmapRegionRequest?.nativeBackend)
+        assertEquals(InferencePrecision.FP16.ordinal, bridge.lastBitmapRegionRequest?.inferencePrecision)
+        assertEquals(5, bridge.lastBitmapRegionRequest?.cpuThreads)
+        assertEquals(45, bridge.lastBitmapRegionRequest?.openmpBlocktimeMs)
+        assertEquals(3, bridge.lastBitmapRegionRequest?.commandBatchSize)
+        assertEquals(2, bridge.lastBitmapRegionRequest?.modelCacheCapacity)
     }
 
     @Test

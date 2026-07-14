@@ -1,6 +1,7 @@
 // 这个文件负责在原生层执行基于 ncnn 的超分推理，包括模型选择、图像分块、推理拼接与结果输出。
 #include "superres_engine.h"
 #include "superres_d4_tta_ncnn.h"
+#include "superres_execution_profile.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "net.h"
+#include "cpu.h"
 #include "gpu.h"
 #include "mat.h"
 #include "zlib.h"
@@ -67,7 +69,6 @@ struct LoadedNet {
 
 NetCacheEntry net_cache;
 std::vector<NetCacheEntry> net_cache_entries;
-constexpr size_t kNetCacheCapacity = 3;
 
 long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -88,13 +89,42 @@ int clamp_gpu_headroom_percent(int value) {
     return std::min(10, std::max(5, value));
 }
 
-int inference_threads(bool useVulkan) {
+SuperResNativeBackend native_backend_from_code(int code) {
+    return code == static_cast<int>(SuperResNativeBackend::Optimized)
+        ? SuperResNativeBackend::Optimized
+        : SuperResNativeBackend::LegacySafe;
+}
+
+SuperResInferencePrecision inference_precision_from_code(int code) {
+    return code == static_cast<int>(SuperResInferencePrecision::Fp16)
+        ? SuperResInferencePrecision::Fp16
+        : SuperResInferencePrecision::Fp32;
+}
+
+SuperResExecutionProfile resolve_execution_profile(
+    const SuperResNativeParams& params,
+    bool useVulkan
+) {
+    bool gpuSupportsFp16Arithmetic = false;
     if (useVulkan) {
-        return 1;
+        gpuSupportsFp16Arithmetic = ncnn::get_gpu_info(
+            ncnn::get_default_gpu_index()
+        ).support_fp16_arithmetic();
     }
-    const unsigned int hardware = std::thread::hardware_concurrency();
-    const int available = hardware == 0 ? 2 : static_cast<int>(hardware);
-    return std::min(4, std::max(1, available - 1));
+    return sanitize_execution_profile(
+        SuperResExecutionProfileRequest{
+            native_backend_from_code(params.nativeBackend),
+            inference_precision_from_code(params.inferencePrecision),
+            params.cpuThreads,
+            params.openmpBlocktimeMs,
+            params.commandBatchSize,
+            params.modelCacheCapacity
+        },
+        useVulkan,
+        ncnn::get_big_cpu_count(),
+        ncnn::get_physical_cpu_count(),
+        gpuSupportsFp16Arithmetic
+    );
 }
 
 bool ensure_gpu_instance() {
@@ -108,18 +138,38 @@ bool ensure_gpu_instance() {
     return true;
 }
 
-std::string make_net_cache_key(const ModelFiles& files, bool useVulkan, int threadCount) {
-    return files.paramPath + "|" + files.binPath + "|" + (useVulkan ? "vulkan" : "cpu") + "|" + std::to_string(threadCount);
+std::string make_net_cache_key(
+    const ModelFiles& files,
+    bool useVulkan,
+    const SuperResExecutionProfile& profile
+) {
+    return files.paramPath + "|" + files.binPath + "|" +
+        (useVulkan ? "vulkan" : "cpu") + "|" +
+        std::to_string(static_cast<int>(profile.effectiveBackend)) + "|" +
+        std::to_string(static_cast<int>(profile.effectivePrecision)) + "|" +
+        std::to_string(profile.cpuThreads) + "|" +
+        std::to_string(profile.openmpBlocktimeMs);
+}
+
+void trim_cached_nets_locked(int requestedCapacity) {
+    const std::size_t trimCount = cache_entries_to_trim(net_cache_entries.size(), requestedCapacity);
+    if (trimCount > 0) {
+        net_cache_entries.erase(
+            net_cache_entries.begin(),
+            net_cache_entries.begin() + static_cast<std::ptrdiff_t>(trimCount)
+        );
+    }
 }
 
 LoadedNet load_cached_net(
     const ModelFiles& files,
     bool useVulkan,
-    int threadCount
+    const SuperResExecutionProfile& profile
 ) {
-    const std::string key = make_net_cache_key(files, useVulkan, threadCount);
+    const std::string key = make_net_cache_key(files, useVulkan, profile);
     {
         std::lock_guard<std::mutex> lock(net_cache_mutex);
+        trim_cached_nets_locked(profile.modelCacheCapacity);
         for (auto it = net_cache_entries.begin(); it != net_cache_entries.end(); ++it) {
             if (it->key == key && it->net) {
                 auto cached = *it;
@@ -131,15 +181,16 @@ LoadedNet load_cached_net(
     }
 
     auto net = std::make_shared<ncnn::Net>();
-    net->opt.num_threads = threadCount;
+    net->opt.num_threads = profile.cpuThreads;
+    net->opt.openmp_blocktime = profile.openmpBlocktimeMs;
     net->opt.use_packing_layout = true;
     net->opt.use_vulkan_compute = useVulkan;
     if (useVulkan) {
         net->opt.use_fp16_packed = true;
         net->opt.use_fp16_storage = true;
-        // Keep arithmetic in fp32 like the upstream waifu2x/RealCUGAN Vulkan pipelines.
-        // Some desktop/emulator Vulkan stacks advertise fp16 arithmetic but crash on CUnet.
-        net->opt.use_fp16_arithmetic = false;
+        // Legacy-safe remains on FP32 arithmetic; optimized FP16 is gated by the GPU capability check.
+        net->opt.use_fp16_arithmetic =
+            profile.effectivePrecision == SuperResInferencePrecision::Fp16;
         net->set_vulkan_device(ncnn::get_default_gpu_index());
     }
     if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
@@ -155,7 +206,8 @@ LoadedNet load_cached_net(
         ),
         net_cache_entries.end()
     );
-    if (net_cache_entries.size() >= kNetCacheCapacity) {
+    trim_cached_nets_locked(profile.modelCacheCapacity);
+    if (net_cache_entries.size() >= static_cast<std::size_t>(profile.modelCacheCapacity)) {
         net_cache_entries.erase(net_cache_entries.begin());
     }
     net_cache_entries.push_back(NetCacheEntry{key, net});
@@ -758,9 +810,12 @@ SuperResNativeCode run_ncnn_image(
     }
 
     emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
-    const int threadCount = inference_threads(useVulkan);
+    const SuperResExecutionProfile executionProfile = resolve_execution_profile(params, useVulkan);
+    performance.effectiveBackend = static_cast<int>(executionProfile.effectiveBackend);
+    performance.effectivePrecision = static_cast<int>(executionProfile.effectivePrecision);
+    performance.fallbackReason = static_cast<int>(executionProfile.fallbackReason);
     const auto modelLoadStart = std::chrono::steady_clock::now();
-    LoadedNet loadedNet = load_cached_net(files, useVulkan, threadCount);
+    LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
     performance.cacheSize = cached_net_count();
@@ -1068,15 +1123,26 @@ SuperResNativeCode run_ncnn_image(
         }
     }
     performance.saveMs = elapsed_ms(saveStart);
+    performance.preprocessMs = performance.tileInputMs;
+    performance.inferenceMs = performance.tileExtractMs;
+    performance.postprocessMs = performance.tileCopyMs;
+    performance.encodeMs = performance.saveMs;
     performance.totalMs = elapsed_ms(totalStart);
     performance.hasValue = true;
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s accel=%s cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld totalMs=%lld",
+        "Performance task=%s model=%s accel=%s backend=%d precision=%d fallback=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld",
         params.taskId.c_str(),
         params.modelFileBase.c_str(),
         acceleration_name(useVulkan),
+        performance.effectiveBackend,
+        performance.effectivePrecision,
+        performance.fallbackReason,
+        executionProfile.cpuThreads,
+        executionProfile.openmpBlocktimeMs,
+        executionProfile.commandBatchSize,
+        executionProfile.modelCacheCapacity,
         performance.cacheHit ? 1 : 0,
         performance.cacheSize,
         performance.retryCount,
@@ -1088,6 +1154,12 @@ SuperResNativeCode run_ncnn_image(
         performance.tileExtractMs,
         performance.tileCopyMs,
         performance.saveMs,
+        performance.preprocessMs,
+        performance.uploadMs,
+        performance.inferenceMs,
+        performance.downloadMs,
+        performance.postprocessMs,
+        performance.encodeMs,
         performance.totalMs
     );
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);

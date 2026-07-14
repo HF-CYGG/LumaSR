@@ -38,7 +38,11 @@ void emit_progress(
         return;
     }
 
-    jmethodID method = env->GetMethodID(sink_class, "onProgress", "(IIIFLjava/lang/String;ZJJJJJJJZIIIII)V");
+    jmethodID method = env->GetMethodID(
+        sink_class,
+        "onProgress",
+        "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIII)V"
+    );
     env->DeleteLocalRef(sink_class);
     if (method == nullptr || env->ExceptionCheck()) {
         return;
@@ -66,7 +70,16 @@ void emit_progress(
         static_cast<jint>(performance.tileSize),
         static_cast<jint>(performance.cacheSize),
         static_cast<jint>(performance.retryCount),
-        static_cast<jint>(performance.regionIndex)
+        static_cast<jint>(performance.regionIndex),
+        static_cast<jlong>(performance.preprocessMs),
+        static_cast<jlong>(performance.uploadMs),
+        static_cast<jlong>(performance.inferenceMs),
+        static_cast<jlong>(performance.downloadMs),
+        static_cast<jlong>(performance.postprocessMs),
+        static_cast<jlong>(performance.encodeMs),
+        static_cast<jint>(performance.effectiveBackend),
+        static_cast<jint>(performance.effectivePrecision),
+        static_cast<jint>(performance.fallbackReason)
     );
     env->DeleteLocalRef(j_message);
 }
@@ -144,6 +157,12 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
     jint output_crop_height,
     jint retry_count,
     jint region_index,
+    jint native_backend,
+    jint inference_precision,
+    jint cpu_threads,
+    jint openmp_blocktime_ms,
+    jint command_batch_size,
+    jint model_cache_capacity,
     jobject progress_sink
 ) {
     SuperResNativeParams params{
@@ -165,7 +184,13 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
         static_cast<int>(output_crop_width),
         static_cast<int>(output_crop_height),
         static_cast<int>(retry_count),
-        static_cast<int>(region_index)
+        static_cast<int>(region_index),
+        static_cast<int>(native_backend),
+        static_cast<int>(inference_precision),
+        static_cast<int>(cpu_threads),
+        static_cast<int>(openmp_blocktime_ms),
+        static_cast<int>(command_batch_size),
+        static_cast<int>(model_cache_capacity)
     };
     return static_cast<jint>(process_superres(
         params,
@@ -206,6 +231,12 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
     jint output_crop_height,
     jint retry_count,
     jint region_index,
+    jint native_backend,
+    jint inference_precision,
+    jint cpu_threads,
+    jint openmp_blocktime_ms,
+    jint command_batch_size,
+    jint model_cache_capacity,
     jobject progress_sink
 ) {
     std::vector<unsigned char> rgb;
@@ -234,7 +265,13 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
         static_cast<int>(output_crop_width),
         static_cast<int>(output_crop_height),
         static_cast<int>(retry_count),
-        static_cast<int>(region_index)
+        static_cast<int>(region_index),
+        static_cast<int>(native_backend),
+        static_cast<int>(inference_precision),
+        static_cast<int>(cpu_threads),
+        static_cast<int>(openmp_blocktime_ms),
+        static_cast<int>(command_batch_size),
+        static_cast<int>(model_cache_capacity)
     };
     return static_cast<jint>(process_superres_rgb(
         params,
