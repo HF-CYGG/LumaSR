@@ -179,6 +179,7 @@ object PersistentProcessingUiMapper {
         "WORK_SPEC_MISSING" -> "Processing work details are missing. Please submit the image again."
         "RUNNER_EXCEPTION" -> "Processing stopped unexpectedly. Try a smaller tile size or CPU mode."
         "PROCESSOR_FAILED" -> "Processing failed. Try a smaller tile size or CPU mode."
+        "THERMAL_CRITICAL" -> "Device temperature is too high. Let it cool down, then try again."
         else -> "Processing failed. Please try again."
     }
 

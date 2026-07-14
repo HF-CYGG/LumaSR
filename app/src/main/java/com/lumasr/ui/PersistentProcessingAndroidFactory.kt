@@ -5,6 +5,8 @@ import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ProcessingTaskSubmissionStore
+import com.lumasr.data.AndroidThermalSignalSource
+import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.service.ApplicationForegroundProcessingRuntime
 import com.lumasr.service.ForegroundProcessingRuntime
@@ -26,7 +28,11 @@ internal fun createPersistentProcessingController(context: Context): PersistentP
         workSpecRepository = workSpecRepository,
         serviceClient = serviceClient
     )
-    val foregroundRuntime = ApplicationForegroundProcessingRuntime.getOrCreate(taskDirectory)
+    val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
+    val foregroundRuntime = ApplicationForegroundProcessingRuntime.getOrCreate(
+        taskDirectory = taskDirectory,
+        thermalLevelProvider = thermalSampler::sampleLevel
+    )
     return PersistentProcessingController(
         taskRepository = taskRepository,
         workSpecRepository = workSpecRepository,

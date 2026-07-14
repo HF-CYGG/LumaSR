@@ -2,6 +2,7 @@ package com.lumasr.service
 
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
+import com.lumasr.domain.ThermalLevel
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
 import com.lumasr.domain.ProcessingOwnerHandoffResult
@@ -209,7 +210,10 @@ object ApplicationForegroundProcessingRuntime {
     @Volatile
     private var instance: ForegroundProcessingRuntime? = null
 
-    fun getOrCreate(taskDirectory: File): ForegroundProcessingRuntime {
+    fun getOrCreate(
+        taskDirectory: File,
+        thermalLevelProvider: () -> ThermalLevel? = { null }
+    ): ForegroundProcessingRuntime {
         val normalizedDirectory = taskDirectory.absoluteFile.normalize()
         val normalizedPath = normalizedDirectory.path
         return synchronized(lock) {
@@ -226,7 +230,9 @@ object ApplicationForegroundProcessingRuntime {
                     ProcessingCoordinator(
                         taskRepository = FileProcessingTaskRepository(normalizedDirectory),
                         workSpecRepository = FileProcessingWorkSpecRepository(normalizedDirectory),
-                        runner = SuperResProcessingTaskRunner()
+                        runner = SuperResProcessingTaskRunner(
+                            thermalLevelProvider = thermalLevelProvider
+                        )
                     )
                 }
             ).also { instance = it }

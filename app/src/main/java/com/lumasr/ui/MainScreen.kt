@@ -48,10 +48,12 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -169,6 +171,21 @@ fun MainScreen(viewModel: LumaViewModel) {
                     .zIndex(2f)
             )
         }
+    }
+    if (state.showCalibrationPrompt) {
+        AlertDialog(
+            onDismissRequest = viewModel::skipCalibrationPrompt,
+            title = { Text("启用安全高性能模式") },
+            text = {
+                Text("可选的本机校准仅使用应用生成的测试图，约 40 秒；不会读取或上传你的照片。")
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::runCalibration) { Text("开始校准") }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::skipCalibrationPrompt) { Text("暂不校准") }
+            }
+        )
     }
 }
 
@@ -406,7 +423,8 @@ private fun LumaNavHost(
                 state = state,
                 onAccelerationChanged = viewModel::setAccelerationMode,
                 onTileSizeChanged = viewModel::setTileSize,
-                onTileSizeAutoSelected = viewModel::setTileSizeAuto
+                onTileSizeAutoSelected = viewModel::setTileSizeAuto,
+                onRunCalibration = viewModel::runCalibration
             )
         }
     }

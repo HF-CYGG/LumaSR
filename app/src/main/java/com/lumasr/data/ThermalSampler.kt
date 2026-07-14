@@ -104,6 +104,8 @@ class ThermalSampler(
         )
     }
 
+    fun sampleLevel(): ThermalLevel? = sample().level
+
     private fun shouldReadHeadroom(nowMs: Long): Boolean {
         val lastReadAtMs = lastHeadroomReadAtMs ?: return true
         if (nowMs < lastReadAtMs) return false

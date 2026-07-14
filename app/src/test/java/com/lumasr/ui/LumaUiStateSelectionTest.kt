@@ -112,6 +112,46 @@ class LumaUiStateSelectionTest {
     }
 
     @Test
+    fun calibrationAndProcessingAreMutuallyExclusive() {
+        val selectedImage = SelectedImageInfo(
+            sourceUri = "content://image",
+            displayName = "one.png",
+            sizeBytes = null,
+            width = 64,
+            height = 64,
+            mimeType = "image/png"
+        )
+        val calibrating = LumaUiState(
+            selectedModelId = "realcugan-standard",
+            selectedImage = selectedImage,
+            calibrationStatus = CalibrationUiStatus.RUNNING
+        )
+        val processing = calibrating.copy(
+            calibrationStatus = CalibrationUiStatus.NOT_RUN,
+            screen = LumaScreen.PROCESSING
+        )
+
+        assertFalse(calibrating.canStartProcessing)
+        assertFalse(canStartCalibration(processing))
+        assertTrue(canStartCalibration(processing.copy(screen = LumaScreen.EDITING)))
+    }
+
+    @Test
+    fun firstRunPromptRequiresPreferenceModelAndSupportedDevice() {
+        assertFalse(shouldShowCalibrationPrompt(true, hasSelectedModel = false, deviceSupported = true))
+        assertFalse(shouldShowCalibrationPrompt(true, hasSelectedModel = true, deviceSupported = false))
+        assertFalse(shouldShowCalibrationPrompt(false, hasSelectedModel = true, deviceSupported = true))
+        assertTrue(shouldShowCalibrationPrompt(true, hasSelectedModel = true, deviceSupported = true))
+    }
+
+    @Test
+    fun calibrationStatusBelongsOnlyToTheModelThatWasMeasured() {
+        assertTrue(isCurrentCalibrationModel("model-a", "model-a"))
+        assertFalse(isCurrentCalibrationModel("model-a", "model-b"))
+        assertFalse(isCurrentCalibrationModel("model-a", null))
+    }
+
+    @Test
     fun defaultTileSizeUsesBalancedPerformancePreset() {
         val state = LumaUiState()
 

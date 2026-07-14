@@ -21,6 +21,9 @@ import com.lumasr.data.UserPreferencesRepository
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.AutoTileSizePolicy
 import com.lumasr.domain.ExportMode
+import com.lumasr.domain.CalibrationFailureReason
+import com.lumasr.domain.CalibrationRunResult
+import com.lumasr.domain.DeviceCalibrationCoordinator
 import com.lumasr.domain.ExtremeExportEstimate
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
@@ -30,6 +33,7 @@ import com.lumasr.domain.ProcessingTask
 import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.ProcessingResourceProfile
+import com.lumasr.domain.ProcessingExecutionProfileResolver
 import com.lumasr.domain.ResourceBudgetPolicy
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
@@ -65,6 +69,11 @@ class LumaViewModel(
     private val galleryRepository: GalleryRepository = GalleryRepository(application),
     private val userPreferencesRepository: UserPreferencesRepository = UserPreferencesRepository.fromContext(application),
     private val persistentController: PersistentProcessingController = createPersistentProcessingController(application),
+    private val executionProfileResolver: ProcessingExecutionProfileResolver =
+        createInferenceExecutionProfileResolver(application),
+    private val calibrationCoordinatorFactory: () -> DeviceCalibrationCoordinator = {
+        createDeviceCalibrationCoordinator(application)
+    },
     private val modelRuntimePolicy: ModelRuntimePolicy = ModelRuntimePolicy(Build.SUPPORTED_ABIS.toList()),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : AndroidViewModel(application) {
@@ -73,9 +82,23 @@ class LumaViewModel(
 
     private var currentJob: Job? = null
     private var currentTaskId: String? = null
+    private var calibrationJob: Job? = null
+    private val calibrationCoordinator: DeviceCalibrationCoordinator by lazy(
+        LazyThreadSafetyMode.SYNCHRONIZED,
+        calibrationCoordinatorFactory
+    )
 
     init {
-        _uiState.update { it.withTileSizePreferences(userPreferencesRepository.loadTileSizePreferences()) }
+        _uiState.update {
+            it.withTileSizePreferences(userPreferencesRepository.loadTileSizePreferences()).copy(
+                showCalibrationPrompt = false,
+                calibrationStatus = if (userPreferencesRepository.wasCalibrationSkipped()) {
+                    CalibrationUiStatus.SKIPPED
+                } else {
+                    CalibrationUiStatus.NOT_RUN
+                }
+            )
+        }
         persistentController.startObserving(viewModelScope)
         viewModelScope.launch {
             persistentController.state.collect { processingState ->
@@ -168,6 +191,7 @@ class LumaViewModel(
             ).withAutoTileSizeForCurrentSelection(model = model, scale = scale)
         }
         persistTileSizePreferences(_uiState.value)
+        refreshCalibrationStatus()
     }
 
     fun setScale(scale: Int) {
@@ -238,6 +262,12 @@ class LumaViewModel(
 
     fun startProcessing() {
         val state = _uiState.value
+        if (state.calibrationStatus == CalibrationUiStatus.RUNNING) {
+            _uiState.update {
+                it.withResultMessage("请等待本机性能校准完成后再开始处理。")
+            }
+            return
+        }
         val images = state.selectedImages.ifEmpty { state.selectedImage?.let(::listOf).orEmpty() }
         if (images.isEmpty()) return
         val model = state.selectedModel ?: return
@@ -345,7 +375,7 @@ class LumaViewModel(
                         )
                     }
                     preparedTaskDirectories += paths.taskDir
-                    val params = UpscaleParamsFactory.createPipeline(
+                    val unresolvedParams = UpscaleParamsFactory.createPipeline(
                         taskId = taskId,
                         inputPath = paths.inputFile.absolutePath,
                         outputPath = paths.outputFile.absolutePath,
@@ -363,6 +393,11 @@ class LumaViewModel(
                         outputFormat = OutputFormat.PNG,
                         exportMode = budgetDecision.exportMode
                     ).processorParams
+                    val params = executionProfileResolver.resolve(
+                        modelId = model.id,
+                        params = unresolvedParams,
+                        nowEpochMs = System.currentTimeMillis()
+                    )
                     val createdAt = baseCreatedAt + index
                     val task = ProcessingTask(
                         id = taskId,
@@ -406,6 +441,111 @@ class LumaViewModel(
                 }
                 currentJob = null
                 if (!published) currentTaskId = null
+            }
+        }
+    }
+
+    fun skipCalibrationPrompt() {
+        userPreferencesRepository.markCalibrationPromptHandled(skipped = true)
+        _uiState.update {
+            it.copy(
+                showCalibrationPrompt = false,
+                calibrationStatus = CalibrationUiStatus.SKIPPED
+            )
+        }
+    }
+
+    fun runCalibration() {
+        if (calibrationJob?.isActive == true) return
+        val state = _uiState.value
+        if (!canStartCalibration(state)) {
+            _uiState.update {
+                it.copy(showCalibrationPrompt = false)
+                    .withResultMessage("请等待当前图片处理完成后再校准。")
+            }
+            return
+        }
+        val model = state.selectedModel ?: return
+        userPreferencesRepository.markCalibrationPromptHandled(skipped = false)
+        _uiState.update {
+            it.copy(
+                showCalibrationPrompt = false,
+                calibrationStatus = CalibrationUiStatus.RUNNING
+            )
+        }
+        calibrationJob = viewModelScope.launch {
+            val result = try {
+                withContext(ioDispatcher) {
+                    if (!calibrationCoordinator.isSupported) {
+                        CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
+                    } else {
+                        val modelDir = modelAssetRepository.prepareModel(model).absolutePath
+                        calibrationCoordinator.run(model, modelDir)
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+            }
+            _uiState.update { state ->
+                if (!isCurrentCalibrationModel(model.id, state.selectedModelId)) {
+                    return@update state.copy(calibrationStatus = CalibrationUiStatus.NOT_RUN)
+                }
+                state.copy(
+                    calibrationStatus = when (result) {
+                        is CalibrationRunResult.Completed -> CalibrationUiStatus.READY
+                        is CalibrationRunResult.Failed -> {
+                            if (result.reason == CalibrationFailureReason.UNSUPPORTED_DEVICE) {
+                                CalibrationUiStatus.UNSUPPORTED
+                            } else {
+                                CalibrationUiStatus.FAILED
+                            }
+                        }
+                        CalibrationRunResult.TimedOut -> CalibrationUiStatus.FAILED
+                    }
+                ).withResultMessage(
+                    when (result) {
+                        is CalibrationRunResult.Completed -> "本机校准完成，高性能模式已安全启用。"
+                        is CalibrationRunResult.Failed,
+                        CalibrationRunResult.TimedOut -> "校准未通过，将继续使用兼容模式。"
+                    }
+                )
+            }
+            calibrationJob = null
+            refreshCalibrationStatus()
+        }
+    }
+
+    private fun refreshCalibrationStatus() {
+        val model = _uiState.value.selectedModel ?: return
+        if (calibrationJob?.isActive == true) return
+        viewModelScope.launch {
+            val (supported, valid) = try {
+                withContext(ioDispatcher) {
+                    calibrationCoordinator.isSupported to calibrationCoordinator.hasValidCalibration(model)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false to false
+            }
+            _uiState.update { state ->
+                if (state.calibrationStatus == CalibrationUiStatus.RUNNING) return@update state
+                if (!isCurrentCalibrationModel(model.id, state.selectedModelId)) return@update state
+                state.copy(
+                    showCalibrationPrompt = shouldShowCalibrationPrompt(
+                        preferencePending = userPreferencesRepository.shouldShowCalibrationPrompt(),
+                        hasSelectedModel = state.selectedModelId != null,
+                        deviceSupported = supported
+                    ),
+                    calibrationStatus = when {
+                        !supported -> CalibrationUiStatus.UNSUPPORTED
+                        valid -> CalibrationUiStatus.READY
+                        userPreferencesRepository.wasCalibrationSkipped() -> CalibrationUiStatus.SKIPPED
+                        else -> CalibrationUiStatus.NOT_RUN
+                    }
+                )
             }
         }
     }
@@ -500,6 +640,7 @@ class LumaViewModel(
             }.onSuccess { manifest ->
                 val runtimeManifest = manifest.copy(models = modelRuntimePolicy.visibleModels(manifest.models))
                 _uiState.update { it.withLoadedManifest(runtimeManifest) }
+                refreshCalibrationStatus()
             }.onFailure { error ->
                 _uiState.update { it.withResultMessage("Model manifest failed: ${error.message}") }
             }
@@ -563,7 +704,9 @@ data class LumaUiState(
     val savedOutputUri: String? = null,
     val savedOutputUris: List<String> = emptyList(),
     val resultMessage: String? = null,
-    val resultMessageEventId: Long = 0L
+    val resultMessageEventId: Long = 0L,
+    val calibrationStatus: CalibrationUiStatus = CalibrationUiStatus.NOT_RUN,
+    val showCalibrationPrompt: Boolean = false
 ) {
     val selectedModel: ModelPack?
         get() = models.firstOrNull { it.id == selectedModelId }
@@ -572,7 +715,9 @@ data class LumaUiState(
         get() = selectedImages.ifEmpty { selectedImage?.let(::listOf).orEmpty() }.size
 
     val canStartProcessing: Boolean
-        get() = selectedImageCount > 0 && selectedModelId != null
+        get() = selectedImageCount > 0 &&
+            selectedModelId != null &&
+            calibrationStatus != CalibrationUiStatus.RUNNING
 
     val startButtonLabel: String
         get() = if (selectedImageCount > 1) {

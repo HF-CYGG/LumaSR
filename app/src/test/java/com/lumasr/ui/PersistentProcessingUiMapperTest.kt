@@ -94,6 +94,28 @@ class PersistentProcessingUiMapperTest {
     }
 
     @Test
+    fun criticalThermalFailureIsPresentedAsRetryableCoolingState() {
+        val mapped = PersistentProcessingUiMapper.apply(
+            LumaUiState(screen = LumaScreen.PROCESSING),
+            PersistentProcessingState(
+                records = listOf(
+                    record(
+                        "thermal",
+                        0,
+                        ProcessingTaskState.FAILED,
+                        retryableErrorCode = "THERMAL_CRITICAL"
+                    )
+                ),
+                trackedBatchId = BATCH_ID
+            )
+        )
+
+        assertEquals(LumaScreen.EDITING, mapped.screen)
+        assertTrue(mapped.resultMessage.orEmpty().contains("cool", ignoreCase = true))
+        assertTrue(mapped.resultMessage.orEmpty().contains("try again", ignoreCase = true))
+    }
+
+    @Test
     fun historicalTerminalRecordsStayDiscoverableWithoutOpeningCompare() {
         val previous = LumaUiState(screen = LumaScreen.EDITING)
 

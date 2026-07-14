@@ -32,7 +32,8 @@ fun interface ProcessingClock {
 enum class ProcessingFailureCode(val stableCode: String) {
     PROCESSOR_FAILED("PROCESSOR_FAILED"),
     RUNNER_EXCEPTION("RUNNER_EXCEPTION"),
-    WORK_SPEC_MISSING("WORK_SPEC_MISSING")
+    WORK_SPEC_MISSING("WORK_SPEC_MISSING"),
+    THERMAL_CRITICAL("THERMAL_CRITICAL")
 }
 
 sealed interface ProcessingRunResult {

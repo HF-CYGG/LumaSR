@@ -58,6 +58,7 @@ fun SettingsScreenV2(
     onAccelerationChanged: (AccelerationMode) -> Unit,
     onTileSizeChanged: (Int) -> Unit,
     onTileSizeAutoSelected: () -> Unit,
+    onRunCalibration: () -> Unit,
     appVersionLabel: String? = null
 ) {
     var notifications by remember { mutableStateOf(true) }
@@ -95,6 +96,14 @@ fun SettingsScreenV2(
                 subtitle = if (gpuEnabled) "优先使用 Vulkan，失败时回退 CPU" else "仅使用 CPU 推理",
                 onClick = {
                     onAccelerationChanged(if (gpuEnabled) AccelerationMode.CPU else AccelerationMode.AUTO)
+                }
+            )
+            SettingsClickableRowV2(
+                icon = Icons.Rounded.Memory,
+                title = "本机性能校准",
+                subtitle = calibrationStatusText(state.calibrationStatus),
+                onClick = {
+                    if (state.calibrationStatus != CalibrationUiStatus.RUNNING) onRunCalibration()
                 }
             )
             SettingsInfoRowV2(
