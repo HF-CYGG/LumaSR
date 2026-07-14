@@ -1067,7 +1067,7 @@ SuperResNativeCode run_ncnn_image(
     static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
     if (!pixelIoChecksPass) {
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
-        return SuperResNativeCode::TileOutputMismatch;
+        return SuperResNativeCode::Unsupported;
     }
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
