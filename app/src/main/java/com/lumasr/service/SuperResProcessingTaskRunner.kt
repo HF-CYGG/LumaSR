@@ -1,5 +1,6 @@
 package com.lumasr.service
 
+import android.util.Log
 import com.lumasr.domain.AdaptiveInferencePolicy
 import com.lumasr.domain.CalibrationExecutionGate
 import com.lumasr.domain.InferenceExecutionProfileMapper
@@ -12,13 +13,18 @@ import com.lumasr.domain.ProcessingRunResult
 import com.lumasr.domain.ProcessingTask
 import com.lumasr.domain.ProcessingTaskRunner
 import com.lumasr.domain.ProcessingWorkSpec
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResProcessor
+import com.lumasr.domain.ThermalPolicyState
 import com.lumasr.domain.ThermalLevel
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleParamsFactory
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import com.lumasr.processor.HybridSuperResProcessor
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 class SuperResProcessingTaskRunner(
     private val processor: SuperResProcessor = HybridSuperResProcessor(),
@@ -46,7 +52,9 @@ class SuperResProcessingTaskRunner(
         workSpec: ProcessingWorkSpec,
         onProgress: (UpscaleProgress) -> Unit
     ): ProcessingRunResult {
-        val thermalLevel = thermalLevelProvider() ?: ThermalLevel.NORMAL
+        val thermalLevel = runCatching { thermalLevelProvider() }
+            .getOrNull()
+            ?: ThermalLevel.NORMAL
         if (thermalLevel == ThermalLevel.CRITICAL) {
             return ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL)
         }
@@ -55,24 +63,46 @@ class SuperResProcessingTaskRunner(
             params = workSpec.toUpscaleParams(),
             nowEpochMs = clock.nowEpochMs()
         )
-        var stoppedForCriticalThermal = false
+        val thermalState = AtomicReference(
+            AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+                state = AdaptiveInferencePolicy.initialThermalState(
+                    InferenceExecutionProfileMapper.from(currentParams)
+                ),
+                thermalLevel = thermalLevel
+            )
+        )
+        val lastThermalLevel = AtomicReference(thermalLevel)
+        val stoppedForCriticalThermal = AtomicBoolean(false)
         val result = processor.process(
-            currentParams.adjustForThermal(thermalLevel),
+            currentParams,
             onProgress = { progress ->
-                if (
-                    !stoppedForCriticalThermal &&
-                    progress.stage == UpscaleStage.PROCESSING_TILE &&
-                    (thermalLevelProvider() ?: ThermalLevel.NORMAL) == ThermalLevel.CRITICAL
-                ) {
-                    stoppedForCriticalThermal = true
-                    processor.cancel(currentParams.taskId)
+                if (progress.stage == UpscaleStage.PROCESSING_TILE) {
+                    runCatching { thermalLevelProvider() }.getOrNull()?.let { nextLevel ->
+                        val previousLevel = lastThermalLevel.getAndSet(nextLevel)
+                        if (previousLevel != nextLevel) logThermalTransition(previousLevel, nextLevel)
+                        thermalState.updateAndGet { state ->
+                            AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
+                                state = state,
+                                thermalLevel = nextLevel
+                            )
+                        }
+                        if (
+                            nextLevel == ThermalLevel.CRITICAL &&
+                            stoppedForCriticalThermal.compareAndSet(false, true)
+                        ) {
+                            processor.cancel(currentParams.taskId)
+                        }
+                    }
                 }
                 onProgress(progress)
+            },
+            runtimeControlProvider = RuntimeInferenceControlProvider {
+                thermalState.get().toRuntimeControl()
             }
         )
         return when {
             result.success -> ProcessingRunResult.Completed
-            result.stage == UpscaleStage.CANCELLED && stoppedForCriticalThermal ->
+            result.stage == UpscaleStage.CANCELLED && stoppedForCriticalThermal.get() ->
                 ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL)
             result.stage == UpscaleStage.CANCELLED -> ProcessingRunResult.Cancelled
             else -> ProcessingRunResult.Failed(ProcessingFailureCode.PROCESSOR_FAILED)
@@ -83,20 +113,19 @@ class SuperResProcessingTaskRunner(
         processor.cancel(taskId)
     }
 
-    private fun UpscaleParams.adjustForThermal(level: ThermalLevel): UpscaleParams {
-        val state = AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(
-            state = AdaptiveInferencePolicy.initialThermalState(
-                InferenceExecutionProfileMapper.from(this)
-            ),
-            thermalLevel = level
-        )
-        val adjusted = InferenceExecutionProfileMapper.apply(this, state.effectiveProfile)
-        return adjusted.copy(
-            pipelinePasses = pipelinePasses.map { pass -> pass.adjustForThermal(level) }
-        )
+    private fun ThermalPolicyState.toRuntimeControl(): RuntimeInferenceControl =
+        RuntimeInferenceControl(
+            commandBatchSize = effectiveProfile.commandBatchSize,
+            thermalHeadroomPercent = thermalHeadroomPercent,
+            shouldPause = shouldPause
+        ).sanitized()
+
+    private fun logThermalTransition(previous: ThermalLevel, current: ThermalLevel) {
+        runCatching { Log.i(LOG_TAG, "thermalLevel=${previous.name}->${current.name}") }
     }
 
     private companion object {
+        const val LOG_TAG = "LumaSRThermal"
         val FAIL_CLOSED_RESOLVER = ProcessingExecutionProfileResolver { _, params, _ ->
             fun safe(value: UpscaleParams): UpscaleParams = value.copy(
                 tileSize = UpscaleParamsFactory.sanitizeTileSize(value.tileSize),

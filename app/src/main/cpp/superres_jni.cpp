@@ -84,6 +84,53 @@ void emit_progress(
     env->DeleteLocalRef(j_message);
 }
 
+bool read_runtime_control(
+    JNIEnv* env,
+    jobject progress_sink,
+    SuperResRuntimeInferenceControl& control
+) {
+    if (progress_sink == nullptr || env->ExceptionCheck()) {
+        return false;
+    }
+    jclass sink_class = env->GetObjectClass(progress_sink);
+    if (sink_class == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    const jmethodID method = env->GetMethodID(sink_class, "currentRuntimeControl", "()[I");
+    env->DeleteLocalRef(sink_class);
+    if (method == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+
+    jintArray values = static_cast<jintArray>(env->CallObjectMethod(progress_sink, method));
+    if (values == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (values != nullptr) env->DeleteLocalRef(values);
+        return false;
+    }
+    const jsize value_count = env->GetArrayLength(values);
+    if (value_count < 3 || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(values);
+        return false;
+    }
+    jint raw[3] = {};
+    env->GetIntArrayRegion(values, 0, 3, raw);
+    env->DeleteLocalRef(values);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    control = sanitize_runtime_control(SuperResRuntimeInferenceControl{
+        static_cast<int>(raw[0]),
+        static_cast<int>(raw[1]),
+        raw[2] != 0
+    });
+    return true;
+}
+
 bool bitmap_to_rgb(JNIEnv* env, jobject bitmap, std::vector<unsigned char>& rgb, int& width, int& height) {
     if (bitmap == nullptr) {
         return false;
@@ -340,9 +387,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
         static_cast<int>(command_batch_size),
         static_cast<int>(model_cache_capacity)
     };
-    return static_cast<jint>(process_superres(
-        params,
-        [env, progress_sink](
+    const SuperResProgressCallback progress_callback = [env, progress_sink](
             SuperResNativeStage stage,
             int current_tile,
             int total_tiles,
@@ -351,8 +396,21 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
             const SuperResNativePerformance& performance
         ) {
             emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
+        };
+    const SuperResRuntimeControlCallback runtime_control = [
+        env,
+        progress_sink,
+        last_control = sanitize_runtime_control(
+            SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+        )
+    ]() mutable {
+        SuperResRuntimeInferenceControl next_control;
+        if (read_runtime_control(env, progress_sink, next_control)) {
+            last_control = next_control;
         }
-    ));
+        return last_control;
+    };
+    return static_cast<jint>(process_superres(params, progress_callback, runtime_control));
 }
 
 extern "C"
@@ -421,13 +479,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
         static_cast<int>(command_batch_size),
         static_cast<int>(model_cache_capacity)
     };
-    return static_cast<jint>(process_superres_rgb(
-        params,
-        width,
-        height,
-        rgb.data(),
-        rgb.size(),
-        [env, progress_sink](
+    const SuperResProgressCallback progress_callback = [env, progress_sink](
             SuperResNativeStage stage,
             int current_tile,
             int total_tiles,
@@ -436,7 +488,28 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
             const SuperResNativePerformance& performance
         ) {
             emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
+        };
+    const SuperResRuntimeControlCallback runtime_control = [
+        env,
+        progress_sink,
+        last_control = sanitize_runtime_control(
+            SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+        )
+    ]() mutable {
+        SuperResRuntimeInferenceControl next_control;
+        if (read_runtime_control(env, progress_sink, next_control)) {
+            last_control = next_control;
         }
+        return last_control;
+    };
+    return static_cast<jint>(process_superres_rgb(
+        params,
+        width,
+        height,
+        rgb.data(),
+        rgb.size(),
+        progress_callback,
+        runtime_control
     ));
 }
 

@@ -120,6 +120,7 @@ enum class ThermalLevel {
 data class ThermalPolicyState(
     val baselineProfile: InferenceExecutionProfile,
     val effectiveProfile: InferenceExecutionProfile,
+    val thermalHeadroomPercent: Int,
     val shouldPause: Boolean
 )
 
@@ -254,6 +255,7 @@ object AdaptiveInferencePolicy {
         return ThermalPolicyState(
             baselineProfile = profile,
             effectiveProfile = profile,
+            thermalHeadroomPercent = 0,
             shouldPause = false
         )
     }
@@ -281,6 +283,13 @@ object AdaptiveInferencePolicy {
         return ThermalPolicyState(
             baselineProfile = baseline,
             effectiveProfile = effective,
+            thermalHeadroomPercent = when (thermalLevel) {
+                ThermalLevel.NORMAL,
+                ThermalLevel.LIGHT -> 0
+                ThermalLevel.MODERATE -> 10
+                ThermalLevel.SEVERE,
+                ThermalLevel.CRITICAL -> 20
+            },
             shouldPause = thermalLevel == ThermalLevel.CRITICAL
         )
     }

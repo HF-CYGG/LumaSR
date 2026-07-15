@@ -12,6 +12,8 @@ import com.lumasr.domain.ProcessingRunResult
 import com.lumasr.domain.ProcessingTask
 import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.ThermalLevel
@@ -27,7 +29,7 @@ import org.junit.Test
 
 class SuperResProcessingTaskRunnerTest {
     @Test
-    fun samplesThermalOncePerTaskAndAppliesModerateAndSevereProfiles() = runBlocking {
+    fun appliesInitialThermalStateThroughRuntimeControlWithoutMutatingBaseline() = runBlocking {
         val processor = RecordingProcessor()
         val levels = ArrayDeque(listOf(ThermalLevel.MODERATE, ThermalLevel.SEVERE))
         val runner = SuperResProcessingTaskRunner(
@@ -40,10 +42,75 @@ class SuperResProcessingTaskRunnerTest {
         assertEquals(ProcessingRunResult.Completed, runner.run(task("two"), spec("two")) {})
 
         assertEquals(2, processor.requests.size)
-        assertEquals(4, processor.requests[0].commandBatchSize)
-        assertEquals(10, processor.requests[0].gpuHeadroomPercent)
-        assertEquals(1, processor.requests[1].commandBatchSize)
-        assertEquals(20, processor.requests[1].gpuHeadroomPercent)
+        assertTrue(processor.requests.all { it.commandBatchSize == 8 })
+        assertTrue(processor.requests.all { it.gpuHeadroomPercent == 8 })
+        assertEquals(
+            listOf(
+                RuntimeInferenceControl(4, 10, shouldPause = false),
+                RuntimeInferenceControl(1, 20, shouldPause = false)
+            ),
+            processor.controls
+        )
+    }
+
+    @Test
+    fun updatesRuntimeControlAtEveryTileBoundaryAndRestoresBaseline() = runBlocking {
+        val processor = RecordingProcessor(boundariesToEmit = 3)
+        val levels = ArrayDeque(
+            listOf(
+                ThermalLevel.NORMAL,
+                ThermalLevel.MODERATE,
+                ThermalLevel.SEVERE,
+                ThermalLevel.NORMAL
+            )
+        )
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { levels.removeFirst() },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("dynamic"), spec("dynamic")) {}
+
+        assertEquals(ProcessingRunResult.Completed, result)
+        assertEquals(
+            listOf(
+                RuntimeInferenceControl(8, 0, shouldPause = false),
+                RuntimeInferenceControl(4, 10, shouldPause = false),
+                RuntimeInferenceControl(1, 20, shouldPause = false),
+                RuntimeInferenceControl(8, 0, shouldPause = false)
+            ),
+            processor.controls
+        )
+    }
+
+    @Test
+    fun thermalSamplingFailureKeepsLastValidRuntimeControl() = runBlocking {
+        val processor = RecordingProcessor(boundariesToEmit = 2)
+        var sampleCount = 0
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = {
+                when (++sampleCount) {
+                    1 -> ThermalLevel.NORMAL
+                    2 -> ThermalLevel.MODERATE
+                    else -> error("thermal sampler unavailable")
+                }
+            },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("sampling-failure"), spec("sampling-failure")) {}
+
+        assertEquals(ProcessingRunResult.Completed, result)
+        assertEquals(
+            listOf(
+                RuntimeInferenceControl(8, 0, shouldPause = false),
+                RuntimeInferenceControl(4, 10, shouldPause = false),
+                RuntimeInferenceControl(4, 10, shouldPause = false)
+            ),
+            processor.controls
+        )
     }
 
     @Test
@@ -66,37 +133,10 @@ class SuperResProcessingTaskRunnerTest {
     @Test
     fun criticalThermalReachedAtTileBoundaryCancelsNativeAndPausesRetryably() = runBlocking {
         val levels = ArrayDeque(listOf(ThermalLevel.NORMAL, ThermalLevel.CRITICAL))
-        var cancelledTaskId: String? = null
-        val processor = object : SuperResProcessor {
-            override suspend fun process(
-                params: UpscaleParams,
-                onProgress: (UpscaleProgress) -> Unit
-            ): UpscaleResult {
-                onProgress(
-                    UpscaleProgress(
-                        taskId = params.taskId,
-                        stage = UpscaleStage.PROCESSING_TILE,
-                        progress = 0.5f,
-                        currentTile = 2,
-                        totalTiles = 4,
-                        completedTiles = 1,
-                        message = "tile boundary",
-                        estimatedRemainingMs = null
-                    )
-                )
-                return UpscaleResult(
-                    taskId = params.taskId,
-                    stage = UpscaleStage.CANCELLED,
-                    outputPath = null,
-                    success = false,
-                    message = "cancelled"
-                )
-            }
-
-            override fun cancel(taskId: String) {
-                cancelledTaskId = taskId
-            }
-        }
+        val processor = RecordingProcessor(
+            boundariesToEmit = 1,
+            resultStage = UpscaleStage.CANCELLED
+        )
         val runner = SuperResProcessingTaskRunner(
             processor = processor,
             thermalLevelProvider = { levels.removeFirst() },
@@ -109,7 +149,11 @@ class SuperResProcessingTaskRunnerTest {
             ProcessingRunResult.RetryLater(ProcessingFailureCode.THERMAL_CRITICAL),
             result
         )
-        assertEquals("thermal-boundary", cancelledTaskId)
+        assertEquals(listOf("thermal-boundary"), processor.cancelledTaskIds)
+        assertEquals(
+            RuntimeInferenceControl(1, 20, shouldPause = true),
+            processor.controls.last()
+        )
     }
 
     @Test
@@ -135,10 +179,14 @@ class SuperResProcessingTaskRunnerTest {
         val resolved = processor.requests.single()
         assertEquals(NativeBackend.OPTIMIZED, resolved.nativeBackend)
         assertEquals(InferencePrecision.FP16, resolved.inferencePrecision)
-        assertEquals(1, resolved.commandBatchSize)
-        assertEquals(20, resolved.gpuHeadroomPercent)
-        assertTrue(resolved.pipelinePasses.all { it.commandBatchSize == 1 })
-        assertTrue(resolved.pipelinePasses.all { it.gpuHeadroomPercent == 20 })
+        assertEquals(8, resolved.commandBatchSize)
+        assertEquals(8, resolved.gpuHeadroomPercent)
+        assertTrue(resolved.pipelinePasses.all { it.commandBatchSize == 8 })
+        assertTrue(resolved.pipelinePasses.all { it.gpuHeadroomPercent == 8 })
+        assertEquals(
+            RuntimeInferenceControl(1, 20, shouldPause = false),
+            processor.controls.single()
+        )
     }
 
     @Test
@@ -259,17 +307,48 @@ class SuperResProcessingTaskRunnerTest {
         )
     }
 
-    private class RecordingProcessor : SuperResProcessor {
+    private class RecordingProcessor(
+        private val boundariesToEmit: Int = 0,
+        private val resultStage: UpscaleStage = UpscaleStage.DONE
+    ) : SuperResProcessor {
         val requests = mutableListOf<UpscaleParams>()
+        val controls = mutableListOf<RuntimeInferenceControl>()
+        val cancelledTaskIds = mutableListOf<String>()
 
         override suspend fun process(
             params: UpscaleParams,
-            onProgress: (UpscaleProgress) -> Unit
+            onProgress: (UpscaleProgress) -> Unit,
+            runtimeControlProvider: RuntimeInferenceControlProvider?
         ): UpscaleResult {
             requests += params
-            return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "done")
+            runtimeControlProvider?.let { controls += it.current() }
+            repeat(boundariesToEmit) { index ->
+                onProgress(
+                    UpscaleProgress(
+                        taskId = params.taskId,
+                        stage = UpscaleStage.PROCESSING_TILE,
+                        progress = (index + 1f) / boundariesToEmit,
+                        currentTile = index + 1,
+                        totalTiles = boundariesToEmit,
+                        completedTiles = index,
+                        message = "tile boundary",
+                        estimatedRemainingMs = null
+                    )
+                )
+                runtimeControlProvider?.let { controls += it.current() }
+            }
+            val success = resultStage == UpscaleStage.DONE
+            return UpscaleResult(
+                params.taskId,
+                resultStage,
+                params.outputPath.takeIf { success },
+                success,
+                if (success) "done" else "cancelled"
+            )
         }
 
-        override fun cancel(taskId: String) = Unit
+        override fun cancel(taskId: String) {
+            cancelledTaskIds += taskId
+        }
     }
 }

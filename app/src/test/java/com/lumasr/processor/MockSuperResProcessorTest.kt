@@ -2,6 +2,8 @@ package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleStage
@@ -55,6 +57,29 @@ class MockSuperResProcessorTest {
         }
 
         assertTrue(cancelled)
+        assertEquals(UpscaleStage.CANCELLED, result.stage)
+    }
+
+    @Test
+    fun runtimeCriticalControlStopsBeforeStartingNextMockTile() = runBlocking {
+        val processor = MockSuperResProcessor(tileCount = 4, delayMs = 1)
+        var shouldPause = false
+        var completedTiles = 0
+
+        val result = processor.process(
+            params = defaultParams(),
+            onProgress = { progress ->
+                if (progress.stage == UpscaleStage.PROCESSING_TILE) {
+                    completedTiles = progress.completedTiles
+                    shouldPause = true
+                }
+            },
+            runtimeControlProvider = RuntimeInferenceControlProvider {
+                RuntimeInferenceControl(4, 20, shouldPause)
+            }
+        )
+
+        assertEquals(1, completedTiles)
         assertEquals(UpscaleStage.CANCELLED, result.stage)
     }
 

@@ -8,6 +8,8 @@ import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.NativeOutputMode
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.UpscaleErrorCode
 import com.lumasr.domain.UpscaleErrorMapper
 import com.lumasr.domain.SuperResProcessor
@@ -88,6 +90,12 @@ interface NativeProcessBridge {
     fun process(
         request: NativeProcessRequest,
         onProgress: (NativeProgressEvent) -> Unit
+    ): NativeProcessCode = process(request, onProgress, runtimeControlProvider = null)
+
+    fun process(
+        request: NativeProcessRequest,
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode
 
     fun cancel(taskId: String)
@@ -107,6 +115,18 @@ interface NativeBitmapRegionBridge {
         request: NativeProcessRequest,
         bitmap: Bitmap?,
         onProgress: (NativeProgressEvent) -> Unit
+    ): NativeProcessCode = processBitmapRegion(
+        request,
+        bitmap,
+        onProgress,
+        runtimeControlProvider = null
+    )
+
+    fun processBitmapRegion(
+        request: NativeProcessRequest,
+        bitmap: Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode
 }
 
@@ -128,13 +148,26 @@ interface NativeBitmapRegionProcessor {
         params: UpscaleParams,
         bitmap: Bitmap?,
         onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult = processBitmapRegion(
+        params,
+        bitmap,
+        onProgress,
+        runtimeControlProvider = null
+    )
+
+    suspend fun processBitmapRegion(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult
 }
 
 object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
     override fun process(
         request: NativeProcessRequest,
-        onProgress: (NativeProgressEvent) -> Unit
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode {
         return NativeProcessCode.fromRawCode(
             processNative(
@@ -163,7 +196,11 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
                 openmpBlocktimeMs = request.openmpBlocktimeMs,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
-                progressSink = NativeProgressSink(onProgress)
+                progressSink = NativeProgressSink(
+                    onProgress = onProgress,
+                    runtimeControlProvider = runtimeControlProvider,
+                    defaultCommandBatchSize = request.commandBatchSize
+                )
             )
         )
     }
@@ -196,7 +233,8 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
     override fun processBitmapRegion(
         request: NativeProcessRequest,
         bitmap: Bitmap?,
-        onProgress: (NativeProgressEvent) -> Unit
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode {
         return NativeProcessCode.fromRawCode(
             processBitmapRegionNative(
@@ -225,7 +263,11 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
                 openmpBlocktimeMs = request.openmpBlocktimeMs,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
-                progressSink = NativeProgressSink(onProgress)
+                progressSink = NativeProgressSink(
+                    onProgress = onProgress,
+                    runtimeControlProvider = runtimeControlProvider,
+                    defaultCommandBatchSize = request.commandBatchSize
+                )
             )
         )
     }
@@ -302,8 +344,31 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
 }
 
 class NativeProgressSink(
-    private val onProgress: (NativeProgressEvent) -> Unit
+    private val onProgress: (NativeProgressEvent) -> Unit,
+    private val runtimeControlProvider: RuntimeInferenceControlProvider? = null,
+    defaultCommandBatchSize: Int = 1
 ) {
+    private var lastValidRuntimeControl = RuntimeInferenceControl(
+        commandBatchSize = defaultCommandBatchSize,
+        thermalHeadroomPercent = 0,
+        shouldPause = false
+    ).sanitized()
+
+    @Suppress("unused")
+    @Synchronized
+    fun currentRuntimeControl(): IntArray {
+        runtimeControlProvider?.let { provider ->
+            runCatching { provider.current().sanitized() }
+                .getOrNull()
+                ?.let { lastValidRuntimeControl = it }
+        }
+        return intArrayOf(
+            lastValidRuntimeControl.commandBatchSize,
+            lastValidRuntimeControl.thermalHeadroomPercent,
+            if (lastValidRuntimeControl.shouldPause) 1 else 0
+        )
+    }
+
     @Suppress("unused")
     fun onProgress(
         stageOrdinal: Int,
@@ -392,7 +457,8 @@ class NativeSuperResProcessor(
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         if (!isNativeAvailable()) {
             return UpscaleResult(
@@ -414,7 +480,8 @@ class NativeSuperResProcessor(
                 onProgress = { event ->
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
-                }
+                },
+                runtimeControlProvider = runtimeControlProvider
             )
             if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
             nativeCode
@@ -425,7 +492,8 @@ class NativeSuperResProcessor(
     override suspend fun processBitmapRegion(
         params: UpscaleParams,
         bitmap: Bitmap?,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         if (!isNativeAvailable()) {
             return UpscaleResult(
@@ -455,7 +523,8 @@ class NativeSuperResProcessor(
                 onProgress = { event ->
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
-                }
+                },
+                runtimeControlProvider = runtimeControlProvider
             )
             if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
             nativeCode

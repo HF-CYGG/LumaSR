@@ -1,5 +1,6 @@
 package com.lumasr.processor
 
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
@@ -18,7 +19,8 @@ class MockSuperResProcessor(
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         cancelledTasks.remove(params.taskId)
         emit(params, UpscaleStage.PREPARING, 0, 0, "Preparing local image", onProgress)
@@ -28,7 +30,10 @@ class MockSuperResProcessor(
         val safeTileCount = max(1, tileCount)
         var completedTiles = 0
         for (tileIndex in 1..safeTileCount) {
-            if (params.taskId in cancelledTasks) {
+            val shouldPause = runCatching {
+                runtimeControlProvider?.current()?.sanitized()?.shouldPause
+            }.getOrNull() == true
+            if (shouldPause || params.taskId in cancelledTasks) {
                 return cancelled(params, completedTiles, onProgress)
             }
 

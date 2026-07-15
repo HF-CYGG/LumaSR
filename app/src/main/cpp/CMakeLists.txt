@@ -11,6 +11,7 @@ add_library(localsr SHARED
     superres_engine.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp
+    superres_runtime_control_checks.cpp
     superres_png_streamer.cpp
     superres_atomic_publish.cpp
     superres_atomic_publish_checks.cpp

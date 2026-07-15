@@ -1,6 +1,7 @@
 #pragma once
 
 #include "superres_capability.h"
+#include "superres_runtime_control.h"
 
 #include <functional>
 #include <cstddef>
@@ -103,9 +104,12 @@ using SuperResProgressCallback = std::function<void(
     const SuperResNativePerformance& performance
 )>;
 
+using SuperResRuntimeControlCallback = std::function<SuperResRuntimeInferenceControl()>;
+
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 );
 SuperResNativeCode process_superres_rgb(
     const SuperResNativeParams& params,
@@ -113,7 +117,8 @@ SuperResNativeCode process_superres_rgb(
     int height,
     const unsigned char* rgb,
     size_t rgbSize,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();

@@ -5,6 +5,7 @@ import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.CalibrationProbeOutput
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.RgbImage
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
@@ -110,7 +111,8 @@ class NativeBitmapCalibrationProbeTest {
             override suspend fun processBitmapRegion(
                 params: UpscaleParams,
                 bitmap: Bitmap?,
-                onProgress: (UpscaleProgress) -> Unit
+                onProgress: (UpscaleProgress) -> Unit,
+                runtimeControlProvider: RuntimeInferenceControlProvider?
             ): UpscaleResult {
                 started.complete(Unit)
                 delay(5_000L)
@@ -187,7 +189,8 @@ class NativeBitmapCalibrationProbeTest {
         override suspend fun processBitmapRegion(
             params: UpscaleParams,
             bitmap: Bitmap?,
-            onProgress: (UpscaleProgress) -> Unit
+            onProgress: (UpscaleProgress) -> Unit,
+            runtimeControlProvider: RuntimeInferenceControlProvider?
         ): UpscaleResult {
             outputExistedDuringRun = File(params.outputPath).exists()
             return result(params)

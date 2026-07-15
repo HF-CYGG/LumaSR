@@ -170,10 +170,41 @@ data class UpscaleResult(
     val message: String
 )
 
+data class RuntimeInferenceControl(
+    val commandBatchSize: Int,
+    val thermalHeadroomPercent: Int,
+    val shouldPause: Boolean
+) {
+    fun sanitized(): RuntimeInferenceControl = copy(
+        commandBatchSize = commandBatchSize.coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE),
+        thermalHeadroomPercent = thermalHeadroomPercent.coerceIn(
+            MIN_THERMAL_HEADROOM_PERCENT,
+            MAX_THERMAL_HEADROOM_PERCENT
+        )
+    )
+
+    private companion object {
+        const val MIN_COMMAND_BATCH_SIZE = 1
+        const val MAX_COMMAND_BATCH_SIZE = 8
+        const val MIN_THERMAL_HEADROOM_PERCENT = 0
+        const val MAX_THERMAL_HEADROOM_PERCENT = 25
+    }
+}
+
+fun interface RuntimeInferenceControlProvider {
+    fun current(): RuntimeInferenceControl
+}
+
 interface SuperResProcessor {
     suspend fun process(
         params: UpscaleParams,
         onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult = process(params, onProgress, runtimeControlProvider = null)
+
+    suspend fun process(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult
 
     fun cancel(taskId: String)

@@ -503,6 +503,23 @@ bool is_cancelled(const std::string& taskId) {
     return task_registry.consume_cancelled(taskId);
 }
 
+SuperResRuntimeInferenceControl read_runtime_control(
+    const SuperResRuntimeControlCallback& runtimeControl,
+    int defaultCommandBatchSize
+) {
+    const SuperResRuntimeInferenceControl fallback = sanitize_runtime_control(
+        SuperResRuntimeInferenceControl{defaultCommandBatchSize, 0, false}
+    );
+    if (!runtimeControl) {
+        return fallback;
+    }
+    try {
+        return sanitize_runtime_control(runtimeControl());
+    } catch (...) {
+        return fallback;
+    }
+}
+
 std::string path_basename(const std::string& path) {
     const size_t separator = path.find_last_of("/\\");
     return separator == std::string::npos ? path : path.substr(separator + 1);
@@ -1039,6 +1056,7 @@ void log_tile_output_mismatch(
 SuperResNativeCode run_optimized_vulkan_tiles(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     const LoadedImage& image,
     const ModelFiles& files,
     ncnn::Net& net,
@@ -1070,10 +1088,17 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     int firstTile = 0;
 
     while (firstTile < totalTiles) {
+        const SuperResRuntimeInferenceControl control = read_runtime_control(
+            runtimeControl,
+            executionProfile.commandBatchSize
+        );
+        if (control.shouldPause) {
+            return SuperResNativeCode::Cancelled;
+        }
         const bool cancellationRequested = is_cancelled(params.taskId);
         const SuperResCommandBatchPlan plan = plan_command_batch(
             totalTiles,
-            executionProfile.commandBatchSize,
+            control.commandBatchSize,
             firstTile,
             cancellationRequested
         );
@@ -1260,7 +1285,11 @@ SuperResNativeCode run_optimized_vulkan_tiles(
 
         firstTile += plan.tileCount;
         sleep_for_gpu_headroom(
-            params.gpuHeadroomPercent,
+            resolve_runtime_headroom_percent(
+                params.gpuHeadroomPercent,
+                control.thermalHeadroomPercent,
+                true
+            ),
             std::chrono::steady_clock::now() - batchStart
         );
         if (is_cancelled(params.taskId)) {
@@ -1278,6 +1307,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
 SuperResNativeCode run_ncnn_image(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan,
     const LoadedImage& image,
     long long decodeMs
@@ -1297,6 +1327,9 @@ SuperResNativeCode run_ncnn_image(
     if (!atomicPublishChecksPass) {
         __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Atomic publish runtime checks failed");
         return SuperResNativeCode::OutputFailed;
+    }
+    if (read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause) {
+        return SuperResNativeCode::Cancelled;
     }
 #ifndef NDEBUG
     static const bool streamingPngChecksPass = run_streaming_png_writer_runtime_checks(
@@ -1430,6 +1463,7 @@ SuperResNativeCode run_ncnn_image(
         const SuperResNativeCode optimizedCode = run_optimized_vulkan_tiles(
             params,
             onProgress,
+            runtimeControl,
             image,
             files,
             *net,
@@ -1455,6 +1489,13 @@ SuperResNativeCode run_ncnn_image(
     } else {
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
+            const SuperResRuntimeInferenceControl control = read_runtime_control(
+                runtimeControl,
+                executionProfile.commandBatchSize
+            );
+            if (control.shouldPause) {
+                return SuperResNativeCode::Cancelled;
+            }
             if (is_cancelled(params.taskId)) {
                 return SuperResNativeCode::Cancelled;
             }
@@ -1663,14 +1704,19 @@ SuperResNativeCode run_ncnn_image(
             result.release();
             input.release();
 
-            if (useVulkan) {
+            const int runtimeHeadroomPercent = resolve_runtime_headroom_percent(
+                params.gpuHeadroomPercent,
+                control.thermalHeadroomPercent,
+                useVulkan
+            );
+            if (runtimeHeadroomPercent > 0) {
                 sleep_for_gpu_headroom(
-                    params.gpuHeadroomPercent,
+                    runtimeHeadroomPercent,
                     std::chrono::steady_clock::now() - tileStart
                 );
-                if (is_cancelled(params.taskId)) {
-                    return SuperResNativeCode::Cancelled;
-                }
+            }
+            if (is_cancelled(params.taskId)) {
+                return SuperResNativeCode::Cancelled;
             }
 
             completed += 1;
@@ -1811,18 +1857,20 @@ SuperResNativeCode run_ncnn_image(
 SuperResNativeCode run_ncnn(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan
 ) {
     emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
     const auto decodeStart = std::chrono::steady_clock::now();
     LoadedImage image = load_rgb_image(params.inputPath);
     const long long decodeMs = elapsed_ms(decodeStart);
-    return run_ncnn_image(params, onProgress, useVulkan, image, decodeMs);
+    return run_ncnn_image(params, onProgress, runtimeControl, useVulkan, image, decodeMs);
 }
 
 SuperResNativeCode run_ncnn_rgb(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan,
     int width,
     int height,
@@ -1842,7 +1890,7 @@ SuperResNativeCode run_ncnn_rgb(
     } catch (...) {
         return SuperResNativeCode::OutOfMemory;
     }
-    return run_ncnn_image(params, onProgress, useVulkan, image, 0);
+    return run_ncnn_image(params, onProgress, runtimeControl, useVulkan, image, 0);
 }
 
 bool write_all(FILE* file, const void* data, size_t size) {
@@ -1978,12 +2026,14 @@ SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot() {
 using RunNcnnFunction = std::function<SuperResNativeCode(
     const SuperResNativeParams&,
     const SuperResProgressCallback&,
+    const SuperResRuntimeControlCallback&,
     bool
 )>;
 
 SuperResNativeCode process_superres_internal(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool requireInputPath,
     const RunNcnnFunction& runNcnn
 ) {
@@ -2037,9 +2087,9 @@ SuperResNativeCode process_superres_internal(
                 params.accelerationMode
             );
             emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Using CPU for this model");
-            return runNcnn(params, onProgress, false);
+            return runNcnn(params, onProgress, runtimeControl, false);
         }
-        SuperResNativeCode code = runNcnn(params, onProgress, true);
+        SuperResNativeCode code = runNcnn(params, onProgress, runtimeControl, true);
         const bool canRetryCpu = should_retry_cpu_after_gpu_code(
             params.accelerationMode,
             static_cast<int>(code)
@@ -2059,19 +2109,26 @@ SuperResNativeCode process_superres_internal(
         emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "GPU failed; retrying on CPU");
     }
 
-    return runNcnn(params, onProgress, false);
+    return runNcnn(params, onProgress, runtimeControl, false);
 }
 
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 ) {
     return process_superres_internal(
         params,
         onProgress,
+        runtimeControl,
         true,
-        [](const SuperResNativeParams& request, const SuperResProgressCallback& progress, bool useVulkan) {
-            return run_ncnn(request, progress, useVulkan);
+        [](
+            const SuperResNativeParams& request,
+            const SuperResProgressCallback& progress,
+            const SuperResRuntimeControlCallback& control,
+            bool useVulkan
+        ) {
+            return run_ncnn(request, progress, control, useVulkan);
         }
     );
 }
@@ -2082,7 +2139,8 @@ SuperResNativeCode process_superres_rgb(
     int height,
     const unsigned char* rgb,
     size_t rgbSize,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 ) {
     if (width <= 0 || height <= 0 || rgb == nullptr ||
         rgbSize != static_cast<size_t>(width) * height * 3) {
@@ -2091,13 +2149,24 @@ SuperResNativeCode process_superres_rgb(
     return process_superres_internal(
         params,
         onProgress,
+        runtimeControl,
         false,
         [width, height, rgb, rgbSize](
             const SuperResNativeParams& request,
             const SuperResProgressCallback& progress,
+            const SuperResRuntimeControlCallback& control,
             bool useVulkan
         ) {
-            return run_ncnn_rgb(request, progress, useVulkan, width, height, rgb, rgbSize);
+            return run_ncnn_rgb(
+                request,
+                progress,
+                control,
+                useVulkan,
+                width,
+                height,
+                rgb,
+                rgbSize
+            );
         }
     );
 }

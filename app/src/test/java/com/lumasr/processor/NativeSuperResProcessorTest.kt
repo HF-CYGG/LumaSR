@@ -7,6 +7,8 @@ import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleStage
@@ -14,11 +16,44 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Executors
 
 class NativeSuperResProcessorTest {
+    @Test
+    fun nativeProgressSinkClampsControlAndKeepsLastValueAfterProviderFailure() {
+        var callCount = 0
+        val sink = NativeProgressSink(
+            onProgress = {},
+            runtimeControlProvider = RuntimeInferenceControlProvider {
+                if (++callCount == 1) {
+                    RuntimeInferenceControl(99, -5, shouldPause = true)
+                } else {
+                    error("provider failed")
+                }
+            },
+            defaultCommandBatchSize = 4
+        )
+
+        assertArrayEquals(intArrayOf(8, 0, 1), sink.currentRuntimeControl())
+        assertArrayEquals(intArrayOf(8, 0, 1), sink.currentRuntimeControl())
+    }
+
+    @Test
+    fun forwardsRuntimeControlProviderToNativeBridge() = runBlocking {
+        val bridge = FakeNativeBridge(NativeProcessCode.OK)
+        val provider = RuntimeInferenceControlProvider {
+            RuntimeInferenceControl(2, 10, shouldPause = false)
+        }
+        val processor = NativeSuperResProcessor(bridge = bridge, isAvailable = { true })
+
+        processor.process(defaultParams(), {}, provider)
+
+        assertTrue(bridge.lastRuntimeControlProvider === provider)
+    }
+
     @Test
     fun mapsModelMissingNativeCodeToUserMessage() = runBlocking {
         val processor = NativeSuperResProcessor(
@@ -496,13 +531,17 @@ private class FakeNativeBridge(
         private set
     var lastBitmapRegionRequest: NativeProcessRequest? = null
         private set
+    var lastRuntimeControlProvider: RuntimeInferenceControlProvider? = null
+        private set
 
     override fun process(
         request: NativeProcessRequest,
-        onProgress: (NativeProgressEvent) -> Unit
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode {
         callCount += 1
         lastRequest = request
+        lastRuntimeControlProvider = runtimeControlProvider
         lastProcessThreadName = Thread.currentThread().name
         progressEvents.forEach(onProgress)
         return code
@@ -532,10 +571,12 @@ private class FakeNativeBridge(
     override fun processBitmapRegion(
         request: NativeProcessRequest,
         bitmap: android.graphics.Bitmap?,
-        onProgress: (NativeProgressEvent) -> Unit
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): NativeProcessCode {
         bitmapRegionCallCount += 1
         lastBitmapRegionRequest = request
+        lastRuntimeControlProvider = runtimeControlProvider
         progressEvents.forEach(onProgress)
         return code
     }

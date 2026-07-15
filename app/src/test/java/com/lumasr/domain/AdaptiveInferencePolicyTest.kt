@@ -260,18 +260,24 @@ class AdaptiveInferencePolicyTest {
 
         assertEquals(base, initial.baselineProfile)
         assertEquals(base, initial.effectiveProfile)
+        assertEquals(0, initial.thermalHeadroomPercent)
         assertEquals(base, normal.effectiveProfile)
+        assertEquals(0, normal.thermalHeadroomPercent)
         assertFalse(normal.shouldPause)
         assertEquals(base, light.effectiveProfile)
+        assertEquals(0, light.thermalHeadroomPercent)
         assertFalse(light.shouldPause)
         assertEquals(4, moderate.effectiveProfile.commandBatchSize)
         assertEquals(10, moderate.effectiveProfile.gpuHeadroomPercent)
+        assertEquals(10, moderate.thermalHeadroomPercent)
         assertFalse(moderate.shouldPause)
         assertEquals(1, severe.effectiveProfile.commandBatchSize)
         assertEquals(20, severe.effectiveProfile.gpuHeadroomPercent)
+        assertEquals(20, severe.thermalHeadroomPercent)
         assertFalse(severe.shouldPause)
         assertEquals(1, critical.effectiveProfile.commandBatchSize)
         assertEquals(20, critical.effectiveProfile.gpuHeadroomPercent)
+        assertEquals(20, critical.thermalHeadroomPercent)
         assertTrue(critical.shouldPause)
         assertEquals(8, base.commandBatchSize)
         assertEquals(8, base.gpuHeadroomPercent)
@@ -294,6 +300,7 @@ class AdaptiveInferencePolicyTest {
         assertEquals(4, firstModerate.effectiveProfile.commandBatchSize)
         assertEquals(4, secondModerate.effectiveProfile.commandBatchSize)
         assertEquals(10, secondModerate.effectiveProfile.gpuHeadroomPercent)
+        assertEquals(10, secondModerate.thermalHeadroomPercent)
     }
 
     @Test
@@ -312,7 +319,20 @@ class AdaptiveInferencePolicyTest {
         assertEquals(20, severe.effectiveProfile.gpuHeadroomPercent)
         assertEquals(base, recovered.baselineProfile)
         assertEquals(base, recovered.effectiveProfile)
+        assertEquals(0, recovered.thermalHeadroomPercent)
         assertFalse(recovered.shouldPause)
+    }
+
+    @Test
+    fun clampsRuntimeControlBeforeCrossingNativeBoundary() {
+        assertEquals(
+            RuntimeInferenceControl(1, 25, shouldPause = true),
+            RuntimeInferenceControl(-4, 99, shouldPause = true).sanitized()
+        )
+        assertEquals(
+            RuntimeInferenceControl(8, 0, shouldPause = false),
+            RuntimeInferenceControl(99, -5, shouldPause = false).sanitized()
+        )
     }
 
     @Test

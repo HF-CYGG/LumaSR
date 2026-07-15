@@ -5,6 +5,8 @@ import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
@@ -59,6 +61,22 @@ class HybridSuperResProcessorTest {
 
         assertTrue(result.success)
         assertEquals("Mock preview complete. Native inference is unavailable.", result.message)
+    }
+
+    @Test
+    fun forwardsRuntimeControlProviderThroughHybridBoundary() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+        val provider = RuntimeInferenceControlProvider {
+            RuntimeInferenceControl(2, 10, shouldPause = false)
+        }
+
+        processor.process(defaultParams(), {}, provider)
+
+        assertTrue(nativeProcessor.runtimeControlProviders.single() === provider)
     }
 
     @Test
@@ -274,7 +292,8 @@ private class StaticProcessor(
 ) : SuperResProcessor {
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult = result
 
     override fun cancel(taskId: String) = Unit
@@ -282,12 +301,15 @@ private class StaticProcessor(
 
 private class RecordingProcessor : SuperResProcessor {
     val calls = mutableListOf<UpscaleParams>()
+    val runtimeControlProviders = mutableListOf<RuntimeInferenceControlProvider?>()
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         calls += params
+        runtimeControlProviders += runtimeControlProvider
         return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
     }
 
@@ -301,7 +323,8 @@ private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
     }
@@ -323,7 +346,8 @@ private class RecordingBitmapRegionProcessor : SuperResProcessor, NativeBitmapRe
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         pathProcessCallCount += 1
         pathProcessCalls += params
@@ -333,7 +357,8 @@ private class RecordingBitmapRegionProcessor : SuperResProcessor, NativeBitmapRe
     override suspend fun processBitmapRegion(
         params: UpscaleParams,
         bitmap: Bitmap?,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         bitmapRegionCalls += params
         return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "ok")
