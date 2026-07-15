@@ -1,5 +1,6 @@
 package com.lumasr.service
 
+import com.lumasr.data.FileProcessingTaskMaintenance
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
@@ -229,9 +230,11 @@ object ApplicationForegroundProcessingRuntime {
             ForegroundProcessingRuntime(
                 leaseAcquirer = ApplicationProcessingSnapshotBridge::acquire,
                 coordinatorFactory = {
+                    val taskRepository = FileProcessingTaskRepository(normalizedDirectory)
+                    val workSpecRepository = FileProcessingWorkSpecRepository(normalizedDirectory)
                     ProcessingCoordinator(
-                        taskRepository = FileProcessingTaskRepository(normalizedDirectory),
-                        workSpecRepository = FileProcessingWorkSpecRepository(normalizedDirectory),
+                        taskRepository = taskRepository,
+                        workSpecRepository = workSpecRepository,
                         runner = executionProfileResolver?.let { resolver ->
                             SuperResProcessingTaskRunner(
                                 thermalLevelProvider = thermalLevelProvider,
@@ -239,6 +242,11 @@ object ApplicationForegroundProcessingRuntime {
                             )
                         } ?: SuperResProcessingTaskRunner(
                             thermalLevelProvider = thermalLevelProvider
+                        ),
+                        maintenance = FileProcessingTaskMaintenance(
+                            taskRoot = normalizedDirectory,
+                            taskRepository = taskRepository,
+                            workSpecRepository = workSpecRepository
                         )
                     )
                 }

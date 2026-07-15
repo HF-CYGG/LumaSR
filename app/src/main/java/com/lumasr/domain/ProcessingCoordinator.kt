@@ -71,7 +71,8 @@ class ProcessingCoordinator(
     private val runner: ProcessingTaskRunner,
     dispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val clock: ProcessingClock = ProcessingClock(System::currentTimeMillis),
-    private val pauseJoinTimeoutMs: Long = DEFAULT_PAUSE_JOIN_TIMEOUT_MS
+    private val pauseJoinTimeoutMs: Long = DEFAULT_PAUSE_JOIN_TIMEOUT_MS,
+    private val maintenance: ProcessingTaskMaintenance = ProcessingTaskMaintenance.NONE
 ) : AutoCloseable {
     init {
         require(pauseJoinTimeoutMs > 0L) { "Pause join timeout must be positive" }
@@ -121,10 +122,16 @@ class ProcessingCoordinator(
         expectedGeneration: Long? = null
     ) {
         check(started.get()) { "Coordinator must be started before refresh" }
+        val maintenanceResult = runCatching {
+            maintenance.maintain(clock.nowEpochMs())
+        }.getOrElse {
+            ProcessingTaskMaintenanceResult(emptySet())
+        }
         val tasksToQueue = stateMutex.withLock {
             if (expectedGeneration != null && lifecycleGeneration.get() != expectedGeneration) {
                 return@withLock emptyList()
             }
+            removeMaintainedTerminalTasks(maintenanceResult.removedTaskIds)
             val persisted = taskRepository.list()
                 .sortedWith(compareBy<ProcessingTask>({ it.createdAtEpochMs }, { it.id }))
             if (expectedGeneration != null && lifecycleGeneration.get() != expectedGeneration) {
@@ -389,6 +396,21 @@ class ProcessingCoordinator(
         if (activeExecution?.taskId == taskId) activeExecution = null
         explicitlyCancelledTaskIds.remove(taskId)
         clearProgressThrottle(taskId)
+    }
+
+    private fun removeMaintainedTerminalTasks(taskIds: Set<String>) {
+        if (taskIds.isEmpty()) return
+        val removableIds = taskIds.filterTo(hashSetOf()) { taskId ->
+            tasksById[taskId]?.state?.isTerminal != false
+        }
+        if (removableIds.isEmpty()) return
+        removableIds.forEach { taskId ->
+            tasksById.remove(taskId)
+            clearWorkerBookkeeping(taskId)
+        }
+        _snapshots.update { snapshots ->
+            snapshots.filterNot { snapshot -> snapshot.task.id in removableIds }
+        }
     }
 
     private suspend fun ensureWorker(expectedGeneration: Long): Boolean {

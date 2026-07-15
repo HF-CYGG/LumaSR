@@ -88,6 +88,59 @@ class ProcessingCoordinatorTest {
     }
 
     @Test
+    fun refreshRemovesTasksDeletedByPersistentMaintenanceFromSnapshots() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val removeOnRefresh = AtomicBoolean(false)
+        tasks.seed(task("stale-terminal", state = ProcessingTaskState.COMPLETED))
+        work.seed(spec("stale-terminal"))
+        val maintenance = ProcessingTaskMaintenance {
+            if (removeOnRefresh.get()) {
+                tasks.delete("stale-terminal")
+                work.delete("stale-terminal")
+                ProcessingTaskMaintenanceResult(setOf("stale-terminal"))
+            } else {
+                ProcessingTaskMaintenanceResult(emptySet())
+            }
+        }
+        val coordinator = coordinator(tasks, work, GateRunner(), maintenance = maintenance)
+        try {
+            coordinator.start()
+            assertEquals(listOf("stale-terminal"), coordinator.snapshots.value.map { it.task.id })
+
+            removeOnRefresh.set(true)
+            coordinator.refreshQueue()
+
+            assertTrue(coordinator.snapshots.value.isEmpty())
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun maintenanceFailureDoesNotBlockPersistedQueueRefresh() = runBlocking {
+        val tasks = InMemoryTaskRepository()
+        val work = InMemoryWorkRepository()
+        val runner = GateRunner()
+        tasks.seed(task("queued-after-maintenance-error"))
+        work.seed(spec("queued-after-maintenance-error"))
+        val coordinator = coordinator(
+            tasks = tasks,
+            work = work,
+            runner = runner,
+            maintenance = ProcessingTaskMaintenance { error("maintenance failed") }
+        )
+        try {
+            coordinator.start()
+
+            assertEquals("queued-after-maintenance-error", runner.awaitStarted())
+            runner.complete("queued-after-maintenance-error")
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun persistsRunningBeforeExecutionAndTerminalAfterResult() = runBlocking {
         val tasks = InMemoryTaskRepository()
         val work = InMemoryWorkRepository()
@@ -1044,8 +1097,17 @@ class ProcessingCoordinatorTest {
         runner: ProcessingTaskRunner,
         dispatcher: CoroutineDispatcher = Dispatchers.Default,
         clock: ProcessingClock = FakeClock(10_000L),
-        pauseJoinTimeoutMs: Long = 5_000L
-    ) = ProcessingCoordinator(tasks, work, runner, dispatcher, clock, pauseJoinTimeoutMs)
+        pauseJoinTimeoutMs: Long = 5_000L,
+        maintenance: ProcessingTaskMaintenance = ProcessingTaskMaintenance.NONE
+    ) = ProcessingCoordinator(
+        tasks,
+        work,
+        runner,
+        dispatcher,
+        clock,
+        pauseJoinTimeoutMs,
+        maintenance
+    )
 
     private suspend fun ProcessingCoordinator.awaitState(
         taskId: String,
@@ -1105,8 +1167,9 @@ class ProcessingCoordinatorTest {
         completedExtremeTileIndexes = completedTiles,
         createdAtEpochMs = createdAt,
         updatedAtEpochMs = createdAt,
-        terminalAtEpochMs = null,
-        retryableErrorCode = null,
+        terminalAtEpochMs = createdAt.takeIf { state.isTerminal },
+        retryableErrorCode = ProcessingFailureCode.PROCESSOR_FAILED.stableCode
+            .takeIf { state == ProcessingTaskState.FAILED },
         executionProfileKey = "profile"
     )
 

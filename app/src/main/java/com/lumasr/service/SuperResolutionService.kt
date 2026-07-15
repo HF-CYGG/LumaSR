@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.annotation.RequiresApi
 import com.lumasr.R
+import com.lumasr.data.FileProcessingTaskMaintenance
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.AndroidThermalSignalSource
@@ -61,14 +62,21 @@ class SuperResolutionService : Service() {
         createNotificationChannel()
         startForegroundImmediately(buildNotification(active = null))
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
+        val taskRepository = FileProcessingTaskRepository(taskDirectory)
+        val workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory)
         coordinator = ProcessingCoordinator(
-            taskRepository = FileProcessingTaskRepository(taskDirectory),
-            workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory),
+            taskRepository = taskRepository,
+            workSpecRepository = workSpecRepository,
             runner = SuperResProcessingTaskRunner(
                 thermalLevelProvider = ThermalSampler(
                     AndroidThermalSignalSource(this)
                 )::sampleLevel,
                 executionProfileResolver = createInferenceExecutionProfileResolver(this)
+            ),
+            maintenance = FileProcessingTaskMaintenance(
+                taskRoot = taskDirectory,
+                taskRepository = taskRepository,
+                workSpecRepository = workSpecRepository
             )
         )
         snapshotLease = checkNotNull(
