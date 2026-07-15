@@ -28,6 +28,7 @@ import com.lumasr.domain.ExtremeExportEstimate
 import com.lumasr.domain.ModelManifest
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.ModelRuntimePolicy
+import com.lumasr.domain.MediaOutputNamer
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingTask
 import com.lumasr.domain.ProcessingTaskState
@@ -75,7 +76,8 @@ class LumaViewModel(
         createDeviceCalibrationCoordinator(application)
     },
     private val modelRuntimePolicy: ModelRuntimePolicy = ModelRuntimePolicy(Build.SUPPORTED_ABIS.toList()),
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val sdkIntProvider: () -> Int = { Build.VERSION.SDK_INT }
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(LumaUiState())
     val uiState: StateFlow<LumaUiState> = _uiState.asStateFlow()
@@ -83,6 +85,9 @@ class LumaViewModel(
     private var currentJob: Job? = null
     private var currentTaskId: String? = null
     private var calibrationJob: Job? = null
+    private var documentSaveJob: Job? = null
+    private var documentSaveQueue: DocumentSaveQueue? = null
+    private var nextDocumentSaveRequestId: Long = 1L
     private val calibrationCoordinator: DeviceCalibrationCoordinator by lazy(
         LazyThreadSafetyMode.SYNCHRONIZED,
         calibrationCoordinatorFactory
@@ -606,6 +611,10 @@ class LumaViewModel(
             }.orEmpty()
         }
         if (results.isEmpty()) return
+        if (resultSaveDestinationForSdk(sdkIntProvider()) == ResultSaveDestination.SAF_DOCUMENT) {
+            startDocumentSaveQueue(results)
+            return
+        }
         viewModelScope.launch {
             runCatching {
                 withContext(ioDispatcher) {
@@ -676,6 +685,106 @@ class LumaViewModel(
         }
     }
 
+    fun markDocumentSaveLaunched(requestId: Long) {
+        val current = documentSaveQueue ?: return
+        val updated = current.markLaunched(requestId)
+        if (updated === current) return
+        documentSaveQueue = updated
+        _uiState.update { it.copy(documentSavePrompt = updated.prompt) }
+    }
+
+    fun completeDocumentSave(requestId: Long, destinationUri: Uri) {
+        val current = documentSaveQueue ?: return
+        val prompt = current.prompt ?: return
+        val item = current.currentItem ?: return
+        if (prompt.requestId != requestId || !prompt.launched || documentSaveJob?.isActive == true) return
+        documentSaveJob = viewModelScope.launch {
+            runCatching {
+                withContext(ioDispatcher) {
+                    galleryRepository.copyImageToUri(File(item.sourcePath), destinationUri)
+                }
+            }.onSuccess { savedUri ->
+                val latest = documentSaveQueue ?: return@onSuccess
+                val updated = latest.complete(requestId, savedUri.toString())
+                if (updated === latest) return@onSuccess
+                documentSaveQueue = updated.takeUnless(DocumentSaveQueue::isFinished)
+                _uiState.update { state ->
+                    val next = state.copy(
+                        documentSavePrompt = updated.prompt,
+                        savedOutputUri = updated.savedUris.lastOrNull(),
+                        savedOutputUris = updated.savedUris
+                    )
+                    if (updated.isFinished) {
+                        next.withResultMessage(savedDocumentMessage(updated.savedCount))
+                    } else {
+                        next
+                    }
+                }
+            }.onFailure { error ->
+                val latest = documentSaveQueue ?: return@onFailure
+                val updated = latest.fail(requestId)
+                if (updated === latest) return@onFailure
+                documentSaveQueue = null
+                _uiState.update { state ->
+                    state.copy(
+                        documentSavePrompt = null,
+                        savedOutputUri = updated.savedUris.lastOrNull(),
+                        savedOutputUris = updated.savedUris
+                    ).withResultMessage(
+                        "Save failed after ${updated.savedCount} image(s); " +
+                            "${updated.stoppedCount} not saved: ${error.message}"
+                    )
+                }
+            }
+            documentSaveJob = null
+        }
+    }
+
+    fun cancelDocumentSave(requestId: Long) {
+        val current = documentSaveQueue ?: return
+        val updated = current.cancel(requestId)
+        if (updated === current) return
+        documentSaveQueue = null
+        _uiState.update { state ->
+            state.copy(
+                documentSavePrompt = null,
+                savedOutputUri = updated.savedUris.lastOrNull(),
+                savedOutputUris = updated.savedUris
+            ).withResultMessage(
+                "Save cancelled after ${updated.savedCount} image(s); " +
+                    "${updated.stoppedCount} not saved."
+            )
+        }
+    }
+
+    private fun startDocumentSaveQueue(results: List<RenderResultInfo>) {
+        if (documentSaveQueue?.isFinished == false) return
+        val timestamp = System.currentTimeMillis()
+        val items = results.mapIndexed { index, result ->
+            DocumentSaveItem(
+                sourcePath = result.outputPath,
+                displayName = MediaOutputNamer.create(
+                    timestampMillis = timestamp + index * 1_000L,
+                    modelName = result.modelName,
+                    scale = result.scale,
+                    format = result.outputFormat
+                ),
+                mimeType = "image/png"
+            )
+        }
+        val firstRequestId = nextDocumentSaveRequestId
+        nextDocumentSaveRequestId += items.size.toLong()
+        val queue = DocumentSaveQueue.start(items, firstRequestId)
+        documentSaveQueue = queue
+        _uiState.update {
+            it.copy(
+                documentSavePrompt = queue.prompt,
+                savedOutputUri = null,
+                savedOutputUris = emptyList()
+            )
+        }
+    }
+
     class Factory(
         private val application: Application
     ) : ViewModelProvider.Factory {
@@ -711,6 +820,7 @@ data class LumaUiState(
     val completedResults: List<RenderResultInfo> = emptyList(),
     val savedOutputUri: String? = null,
     val savedOutputUris: List<String> = emptyList(),
+    val documentSavePrompt: DocumentSavePrompt? = null,
     val resultMessage: String? = null,
     val resultMessageEventId: Long = 0L,
     val calibrationStatus: CalibrationUiStatus = CalibrationUiStatus.NOT_RUN,
@@ -999,3 +1109,7 @@ private fun com.lumasr.data.CachedImageInfo.toSelectedImageInfo() = SelectedImag
 
 private const val DEFAULT_MODEL_ID = "realcugan-standard"
 private const val MAX_SOURCE_DISPLAY_NAME_LENGTH = 512
+
+private fun savedDocumentMessage(savedCount: Int): String {
+    return if (savedCount == 1) "Saved 1 image." else "Saved $savedCount images."
+}

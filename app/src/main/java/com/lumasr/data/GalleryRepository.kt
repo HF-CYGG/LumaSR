@@ -8,6 +8,7 @@ import android.provider.MediaStore
 import com.lumasr.domain.MediaOutputNamer
 import com.lumasr.domain.OutputFormat
 import java.io.File
+import java.io.OutputStream
 
 class GalleryRepository(
     private val context: Context
@@ -38,10 +39,7 @@ class GalleryRepository(
         ) { "Cannot create MediaStore entry." }
 
         runCatching {
-            resolver.openOutputStream(uri).use { output ->
-                requireNotNull(output) { "Cannot open gallery output stream." }
-                sourceFile.inputStream().use { input -> input.copyTo(output) }
-            }
+            copyImageContents(sourceFile) { resolver.openOutputStream(uri) }
             resolver.update(
                 uri,
                 ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
@@ -54,5 +52,26 @@ class GalleryRepository(
         }
 
         return uri
+    }
+
+    fun copyImageToUri(sourceFile: File, destinationUri: Uri): Uri {
+        val resolver = context.contentResolver
+        runCatching {
+            copyImageContents(sourceFile) { resolver.openOutputStream(destinationUri) }
+        }.onFailure {
+            runCatching { resolver.delete(destinationUri, null, null) }
+            throw it
+        }
+        return destinationUri
+    }
+}
+
+internal fun copyImageContents(
+    sourceFile: File,
+    openDestination: () -> OutputStream?
+) {
+    require(sourceFile.isFile && sourceFile.length() > 0L) { "Output file is missing." }
+    requireNotNull(openDestination()) { "Cannot open destination output stream." }.use { output ->
+        sourceFile.inputStream().use { input -> input.copyTo(output) }
     }
 }

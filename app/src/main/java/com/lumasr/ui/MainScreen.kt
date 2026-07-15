@@ -3,6 +3,8 @@
  */
 package com.lumasr.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
@@ -104,6 +106,17 @@ fun MainScreen(viewModel: LumaViewModel) {
         route = currentRoute
     )
     var hasShownEditingBottomBar by remember { mutableStateOf(false) }
+    val documentSaveLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("image/png")
+    ) { destinationUri ->
+        val prompt = state.documentSavePrompt?.takeIf(DocumentSavePrompt::launched)
+            ?: return@rememberLauncherForActivityResult
+        if (destinationUri == null) {
+            viewModel.cancelDocumentSave(prompt.requestId)
+        } else {
+            viewModel.completeDocumentSave(prompt.requestId, destinationUri)
+        }
+    }
     val bottomBarEnterTransition = if (shouldAnimateBottomBarEnter(hasShownEditingBottomBar, showBottomBar)) {
         slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160))
     } else {
@@ -170,6 +183,15 @@ fun MainScreen(viewModel: LumaViewModel) {
                     .align(Alignment.TopCenter)
                     .zIndex(2f)
             )
+        }
+    }
+
+    LaunchedEffect(state.documentSavePrompt) {
+        val prompt = state.documentSavePrompt ?: return@LaunchedEffect
+        if (!prompt.launched) {
+            viewModel.markDocumentSaveLaunched(prompt.requestId)
+            runCatching { documentSaveLauncher.launch(prompt.displayName) }
+                .onFailure { viewModel.cancelDocumentSave(prompt.requestId) }
         }
     }
     if (state.showCalibrationPrompt) {
