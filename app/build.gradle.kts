@@ -1,3 +1,6 @@
+import java.security.KeyStore
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -51,6 +54,48 @@ android {
         uploadKeyAlias,
         uploadKeyPassword
     ).all { it.isPresent }
+    val fixedReleaseCertificateSha256 =
+        "43648398DD74C72B1CBA185D3832E558C72D9BB58AE46BB9C09EF32818988D2F"
+
+    val verifyReleaseSigningCertificate = tasks.register("verifyReleaseSigningCertificate") {
+        group = "verification"
+        description = "Rejects Release builds that do not use the fixed LumaSR signing certificate."
+
+        doLast {
+            if (!hasUploadSigningConfig) {
+                throw GradleException(
+                    "Release signing is required. Use scripts/build-fixed-release.ps1."
+                )
+            }
+
+            val keystoreFile = file(uploadStoreFile.get())
+            val keystoreType = when (keystoreFile.extension.lowercase()) {
+                "p12", "pfx" -> "PKCS12"
+                else -> "JKS"
+            }
+            val keystore = KeyStore.getInstance(keystoreType)
+            keystoreFile.inputStream().use { input ->
+                keystore.load(input, uploadStorePassword.get().toCharArray())
+            }
+            val certificate = keystore.getCertificate(uploadKeyAlias.get())
+                ?: throw GradleException("Release signing alias was not found in the configured keystore.")
+            val actualCertificateSha256 = MessageDigest.getInstance("SHA-256")
+                .digest(certificate.encoded)
+                .joinToString("") { byte -> "%02X".format(byte.toInt() and 0xFF) }
+
+            if (actualCertificateSha256 != fixedReleaseCertificateSha256) {
+                throw GradleException(
+                    "Release signing certificate mismatch. Expected " +
+                        "$fixedReleaseCertificateSha256 but found $actualCertificateSha256. " +
+                        "Use scripts/build-fixed-release.ps1."
+                )
+            }
+        }
+    }
+
+    tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+        dependsOn(verifyReleaseSigningCertificate)
+    }
 
     signingConfigs {
         if (hasUploadSigningConfig) {
