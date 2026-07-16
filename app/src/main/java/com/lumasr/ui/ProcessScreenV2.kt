@@ -147,6 +147,8 @@ internal data class TileSizeChoice(
     val label: String
 )
 
+internal fun resultPreviewPath(result: RenderResultInfo): String = result.outputPath
+
 internal val TileSizeChoices: List<TileSizeChoice> =
     listOf(TileSizeChoice(value = null, label = "自动")) +
         TileSizeOptions.map { tileSize -> TileSizeChoice(value = tileSize, label = tileSize.toString()) }
@@ -170,7 +172,7 @@ internal fun settleResultSaveCardPhase(phase: ResultSaveCardPhase): ResultSaveCa
     if (phase == ResultSaveCardPhase.SavedFlash) ResultSaveCardPhase.SavedSettled else phase
 
 internal fun resultSaveCardButtonLabels(phase: ResultSaveCardPhase): List<String> =
-    if (phase == ResultSaveCardPhase.Ready) listOf("保存", "返回") else listOf("返回")
+    if (phase == ResultSaveCardPhase.Ready) listOf("保存", "返回") else listOf("分享", "返回")
 
 @Composable
 fun ProcessTabV2(
@@ -1454,6 +1456,7 @@ private fun RenderStatusStrip(
 fun CompareScreenV2(
     state: LumaUiState,
     onSave: () -> Unit,
+    onShare: (List<String>) -> Unit,
     onBackHome: () -> Unit
 ) {
     val results = state.completedResults.ifEmpty {
@@ -1480,6 +1483,11 @@ fun CompareScreenV2(
     }
     val currentResult = results.getOrNull(safePreviewIndex)
     val savedCount = state.savedOutputUris.size.coerceAtLeast(if (state.savedOutputUri != null) 1 else 0)
+    val shareUriStrings = remember(state.savedOutputUri, state.savedOutputUris) {
+        resultShareRequest(state.savedOutputUris + listOfNotNull(state.savedOutputUri))
+            ?.uriStrings
+            .orEmpty()
+    }
     val animationKey = remember(results) { results.joinToString(separator = "|") { it.taskId } }
     var contentVisible by remember(animationKey) { mutableStateOf(false) }
     var saveCardPhase by remember(animationKey) { mutableStateOf(initialResultSaveCardPhase(savedCount)) }
@@ -1587,8 +1595,18 @@ fun CompareScreenV2(
                         if (labels.size == 2) {
                             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Button(
-                                    onClick = onSave,
-                                    enabled = results.isNotEmpty(),
+                                    onClick = {
+                                        if (phase == ResultSaveCardPhase.Ready) {
+                                            onSave()
+                                        } else {
+                                            onShare(shareUriStrings)
+                                        }
+                                    },
+                                    enabled = if (phase == ResultSaveCardPhase.Ready) {
+                                        results.isNotEmpty()
+                                    } else {
+                                        shareUriStrings.isNotEmpty()
+                                    },
                                     modifier = Modifier.weight(1f).height(50.dp),
                                     shape = RoundedCornerShape(16.dp)
                                 ) {
@@ -1769,128 +1787,11 @@ private fun ResultPreviewPage(
     result: RenderResultInfo,
     modifier: Modifier = Modifier
 ) {
-    val path = remember(result.inputPath) { result.inputPath }
+    val outputPath = remember(result) { resultPreviewPath(result) }
     PreviewImagePage(
-        path = path,
+        path = outputPath,
         modifier = modifier
     )
-}
-
-@Composable
-private fun CompareImageSurface(
-    inputPath: String?,
-    outputPath: String?,
-    modifier: Modifier,
-    skipOutputDecode: Boolean = false
-) {
-    val context = LocalContext.current
-    val inputImage by produceState<ImageBitmap?>(initialValue = null, inputPath) {
-        value = withContext(Dispatchers.IO) {
-            decodePreviewImage(context, inputPath)
-        }
-    }
-    val outputImage by produceState<ImageBitmap?>(initialValue = null, outputPath, skipOutputDecode) {
-        value = if (skipOutputDecode) {
-            null
-        } else {
-            withContext(Dispatchers.IO) {
-                decodePreviewImage(context, outputPath)
-            }
-        }
-    }
-    val split by animateFloatAsState(targetValue = 0.5f, animationSpec = tween(220), label = "compareSplit")
-    val inputBitmap = inputImage
-    val outputBitmap = outputImage
-    val baseImage = outputBitmap ?: inputBitmap
-    val canCompare = inputBitmap != null && outputBitmap != null
-
-    Surface(modifier = modifier, color = MaterialTheme.colorScheme.surfaceVariant) {
-        BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            if (baseImage == null) {
-                CleanImagePlaceholder()
-            } else {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val referenceImage = inputBitmap ?: baseImage
-                    val viewport = calculateRenderImageViewport(
-                        canvasWidth = size.width,
-                        canvasHeight = size.height,
-                        imageWidth = referenceImage.width,
-                        imageHeight = referenceImage.height
-                    )
-                    val dstOffset = IntOffset(viewport.left.roundToInt(), viewport.top.roundToInt())
-                    val dstSize = IntSize(viewport.width.roundToInt(), viewport.height.roundToInt())
-                    val resultImage = outputBitmap ?: baseImage
-
-                    drawImage(
-                        image = resultImage,
-                        dstOffset = dstOffset,
-                        dstSize = dstSize
-                    )
-
-                    if (canCompare && inputBitmap != null) {
-                        val splitX = viewport.left + viewport.width * split.coerceIn(0f, 1f)
-                        clipRect(
-                            left = viewport.left,
-                            top = viewport.top,
-                            right = splitX,
-                            bottom = viewport.bottom
-                        ) {
-                            drawImage(
-                                image = inputBitmap,
-                                dstOffset = dstOffset,
-                                dstSize = dstSize
-                            )
-                        }
-                        drawLine(
-                            color = Color.White.copy(alpha = 0.92f),
-                            start = Offset(splitX, viewport.top),
-                            end = Offset(splitX, viewport.bottom),
-                            strokeWidth = 2.dp.toPx()
-                        )
-                    }
-                }
-            }
-
-            if (outputPath != null && outputBitmap == null) {
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(18.dp),
-                    shape = RoundedCornerShape(999.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
-                    tonalElevation = 2.dp
-                ) {
-                    Text(
-                        text = if (skipOutputDecode) "极限 PNG 已生成" else "结果预览不可用",
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            if (canCompare) {
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 28.dp)
-                        .width(maxWidth * 0.74f)
-                        .height(4.dp),
-                    shape = RoundedCornerShape(999.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f)
-                ) {}
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 18.dp)
-                        .size(26.dp),
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 5.dp
-                ) {}
-            }
-        }
-    }
 }
 
 private fun decodePreviewImage(context: Context, rawPath: String?, maxDimension: Int = 1800): ImageBitmap? {

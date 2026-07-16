@@ -17,9 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CloudOff
-import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.PhotoLibrary
-import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.HorizontalDivider
@@ -28,14 +26,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,8 +54,6 @@ fun SettingsScreenV2(
     onTileSizeAutoSelected: () -> Unit,
     appVersionLabel: String? = null
 ) {
-    var notifications by remember { mutableStateOf(true) }
-    var exif by remember { mutableStateOf(true) }
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
     val context = LocalContext.current
     val resolvedAppVersionLabel = appVersionLabel ?: remember(context) {
@@ -112,14 +104,6 @@ fun SettingsScreenV2(
                 onTileSizeChanged = onTileSizeChanged,
                 onTileSizeAutoSelected = onTileSizeAutoSelected
             )
-            SettingsSwitchRowV2(
-                icon = Icons.Rounded.Memory,
-                title = "后台通知",
-                subtitle = "处理完成时发送系统通知",
-                checked = notifications,
-                onCheckedChange = { notifications = it }
-            )
-
             SectionDivider()
             SettingsGroupTitleV2("内置模型")
             state.models.forEach { model ->
@@ -136,13 +120,6 @@ fun SettingsScreenV2(
                 icon = Icons.Rounded.CloudOff,
                 title = "云端上传",
                 subtitle = "关闭。所有图片仅在本机处理"
-            )
-            SettingsSwitchRowV2(
-                icon = Icons.Rounded.Save,
-                title = "保留 EXIF",
-                subtitle = "保存结果时尽量保留原始图片元数据",
-                checked = exif,
-                onCheckedChange = { exif = it }
             )
             Spacer(modifier = Modifier.height(20.dp))
             Text(
@@ -249,25 +226,6 @@ private fun SettingsInfoRowV2(
     subtitle: String
 ) {
     SettingsRowFrame(icon = icon, title = title, subtitle = subtitle)
-}
-
-@Composable
-private fun SettingsSwitchRowV2(
-    icon: ImageVector,
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    SettingsRowFrame(
-        icon = icon,
-        title = title,
-        subtitle = subtitle,
-        modifier = Modifier.clickable { onCheckedChange(!checked) },
-        trailing = {
-            Switch(checked = checked, onCheckedChange = onCheckedChange)
-        }
-    )
 }
 
 @Composable

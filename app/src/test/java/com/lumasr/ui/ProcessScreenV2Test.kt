@@ -1,5 +1,6 @@
 package com.lumasr.ui
 
+import com.lumasr.domain.OutputFormat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -7,6 +8,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProcessScreenV2Test {
+    @Test
+    fun bindsResultPreviewOnlyToGeneratedFile() {
+        val result = RenderResultInfo(
+            taskId = "task-1",
+            fileName = "source.png",
+            inputPath = "/cache/input.png",
+            outputPath = "/cache/output.png",
+            modelName = "CUnet",
+            scale = 2,
+            noise = 1,
+            outputFormat = OutputFormat.PNG,
+            isExtremeExport = true
+        )
+
+        assertEquals("/cache/output.png", resultPreviewPath(result))
+    }
+
     @Test
     fun keepsStartButtonAboveFloatingBottomNavigationWhenScrolledToEnd() {
         assertTrue(ProcessSheetBottomSpacerDp in 128..160)
@@ -30,7 +48,7 @@ class ProcessScreenV2Test {
 
         assertEquals(ResultSaveCardPhase.SavedFlash, flash)
         assertEquals(ResultSaveCardPhase.SavedSettled, settleResultSaveCardPhase(flash))
-        assertEquals(listOf("返回"), resultSaveCardButtonLabels(ResultSaveCardPhase.SavedSettled))
+        assertEquals(listOf("分享", "返回"), resultSaveCardButtonLabels(ResultSaveCardPhase.SavedSettled))
     }
 
     @Test

@@ -66,6 +66,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,6 +92,7 @@ sealed class BottomNavItem(val route: String, val title: String, val icon: Image
 
 @Composable
 fun MainScreen(viewModel: LumaViewModel) {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val state by viewModel.uiState.collectAsState()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -138,6 +140,7 @@ fun MainScreen(viewModel: LumaViewModel) {
                     CompareScreenV2(
                         state = state,
                         onSave = viewModel::saveResultToGallery,
+                        onShare = { uriStrings -> context.launchResultShare(uriStrings) },
                         onBackHome = viewModel::backHome
                     )
                 } else {
