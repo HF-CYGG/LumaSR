@@ -21,4 +21,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        viewModel.onHostStarted()
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) {
+            viewModel.onHostStopped()
+        }
+        super.onStop()
+    }
 }

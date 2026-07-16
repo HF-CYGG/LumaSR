@@ -1,5 +1,8 @@
 #pragma once
 
+#include "superres_capability.h"
+#include "superres_runtime_control.h"
+
 #include <functional>
 #include <cstddef>
 #include <string>
@@ -50,6 +53,12 @@ struct SuperResNativeParams {
     int outputCropHeight;
     int retryCount;
     int regionIndex;
+    int nativeBackend = 0;
+    int inferencePrecision = 0;
+    int cpuThreads = 0;
+    int openmpBlocktimeMs = 20;
+    int commandBatchSize = 1;
+    int modelCacheCapacity = 1;
 };
 
 struct SuperResRawTile {
@@ -75,6 +84,15 @@ struct SuperResNativePerformance {
     int cacheSize = 0;
     int retryCount = 0;
     int regionIndex = -1;
+    long long preprocessMs = 0;
+    long long uploadMs = 0;
+    long long inferenceMs = 0;
+    long long downloadMs = 0;
+    long long postprocessMs = 0;
+    long long encodeMs = 0;
+    int effectiveBackend = 0;
+    int effectivePrecision = 0;
+    int fallbackReason = -1;
 };
 
 using SuperResProgressCallback = std::function<void(
@@ -86,9 +104,12 @@ using SuperResProgressCallback = std::function<void(
     const SuperResNativePerformance& performance
 )>;
 
+using SuperResRuntimeControlCallback = std::function<SuperResRuntimeInferenceControl()>;
+
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 );
 SuperResNativeCode process_superres_rgb(
     const SuperResNativeParams& params,
@@ -96,10 +117,12 @@ SuperResNativeCode process_superres_rgb(
     int height,
     const unsigned char* rgb,
     size_t rgbSize,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();
+SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot();
 SuperResNativeCode merge_raw_tiles_to_png(
     const std::string& outputPath,
     int outputWidth,

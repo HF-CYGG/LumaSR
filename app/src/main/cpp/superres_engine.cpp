@@ -1,5 +1,14 @@
 // 这个文件负责在原生层执行基于 ncnn 的超分推理，包括模型选择、图像分块、推理拼接与结果输出。
 #include "superres_engine.h"
+#include "superres_d4_tta_ncnn.h"
+#include "superres_execution_profile.h"
+#include "superres_atomic_publish.h"
+#include "superres_pixel_io.h"
+#include "superres_png_writer.h"
+#include "superres_png_writer_checks.h"
+#include "superres_atomic_publish_checks.h"
+#include "superres_task_registry.h"
+#include "superres_task_registry_checks.h"
 #include "superres_tile_geometry.h"
 
 #include <android/log.h>
@@ -8,22 +17,23 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include "net.h"
+#include "command.h"
+#include "cpu.h"
 #include "gpu.h"
 #include "mat.h"
 #include "zlib.h"
+#include <unistd.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 namespace {
 constexpr const char* kLogTag = "LumaSRNative";
@@ -35,11 +45,27 @@ constexpr int kAccelerationVulkan = 1;
 constexpr int kNativeOutputPng = 0;
 constexpr int kNativeOutputRawCroppedRgbTile = 1;
 
-std::mutex cancel_mutex;
 std::mutex gpu_mutex;
 std::mutex net_cache_mutex;
-std::unordered_set<std::string> cancelled_tasks;
-bool gpu_instance_created = false;
+SuperResTaskRegistry task_registry;
+SuperResGpuInitState gpu_init_state = SuperResGpuInitState::Uninitialized;
+
+class TaskCompletionGuard {
+public:
+    TaskCompletionGuard(SuperResTaskRegistry& registry, std::string taskId)
+        : registry_(registry), taskId_(std::move(taskId)) {}
+
+    ~TaskCompletionGuard() {
+        registry_.complete_task(taskId_);
+    }
+
+    TaskCompletionGuard(const TaskCompletionGuard&) = delete;
+    TaskCompletionGuard& operator=(const TaskCompletionGuard&) = delete;
+
+private:
+    SuperResTaskRegistry& registry_;
+    std::string taskId_;
+};
 
 struct ModelFiles {
     std::string paramPath;
@@ -64,9 +90,240 @@ struct LoadedNet {
     bool cacheHit = false;
 };
 
+class OutputAssembly {
+public:
+    SuperResNativeCode initialize(
+        const std::string& outputPath,
+        int width,
+        int height,
+        bool croppedRaw,
+        int maximumBandHeight
+    ) {
+        width_ = width;
+        height_ = height;
+        croppedRaw_ = croppedRaw;
+        rowBytes_ = streaming_png_rgb_row_bytes(width);
+        if (rowBytes_ == 0 || height <= 0) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        const int allocatedRows = croppedRaw ? height : std::min(height, maximumBandHeight);
+        if (allocatedRows <= 0 ||
+            static_cast<size_t>(allocatedRows) > std::numeric_limits<size_t>::max() / rowBytes_) {
+            return SuperResNativeCode::OutOfMemory;
+        }
+        try {
+            bytes_.resize(rowBytes_ * static_cast<size_t>(allocatedRows));
+        } catch (...) {
+            return SuperResNativeCode::OutOfMemory;
+        }
+        if (croppedRaw) {
+            return SuperResNativeCode::Ok;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.open(outputPath, width, height);
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    bool prepare_window(int destinationY, int windowHeight) {
+        if (croppedRaw_) {
+            return destinationY >= 0 && windowHeight > 0 && destinationY <= height_ - windowHeight;
+        }
+        if (destinationY == bandStartY_) {
+            return windowHeight == bandHeight_;
+        }
+        if (bandStartY_ >= 0 && !flush_band()) {
+            return false;
+        }
+        if (destinationY != writtenRows_ || windowHeight <= 0 ||
+            destinationY > height_ - windowHeight ||
+            static_cast<size_t>(windowHeight) > bytes_.size() / rowBytes_) {
+            return false;
+        }
+        bandStartY_ = destinationY;
+        bandHeight_ = windowHeight;
+        std::fill(bytes_.begin(), bytes_.begin() + rowBytes_ * static_cast<size_t>(windowHeight), 0);
+        return true;
+    }
+
+    unsigned char* row(int destinationY, int destinationX) {
+        if (destinationX < 0 || destinationX >= width_) {
+            return nullptr;
+        }
+        const int localY = croppedRaw_ ? destinationY : destinationY - bandStartY_;
+        const int availableRows = croppedRaw_ ? height_ : bandHeight_;
+        if (localY < 0 || localY >= availableRows) {
+            return nullptr;
+        }
+        return bytes_.data() + static_cast<size_t>(localY) * rowBytes_ +
+            static_cast<size_t>(destinationX) * 3u;
+    }
+
+    SuperResNativeCode finish_png_temporary() {
+        if (croppedRaw_) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        if (!flush_band() || writtenRows_ != height_) {
+            return lastFailure_ == SuperResNativeCode::Ok
+                ? SuperResNativeCode::TileOutputMismatch
+                : lastFailure_;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.finish_temporary();
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    SuperResNativeCode publish_png() {
+        if (croppedRaw_) {
+            return SuperResNativeCode::InvalidParams;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.publish();
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        lastFailure_ = native_code(status);
+        return lastFailure_;
+    }
+
+    void abort_png() {
+        writer_.abort();
+    }
+
+    const std::vector<unsigned char>& bytes() const {
+        return bytes_;
+    }
+
+    std::chrono::steady_clock::duration encoding_duration() const {
+        return encodingDuration_;
+    }
+
+    SuperResNativeCode failure_code() const {
+        return lastFailure_;
+    }
+
+private:
+    bool flush_band() {
+        if (bandStartY_ < 0) {
+            return true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const StreamingPngStatus status = writer_.write_rgb_rows(
+            bytes_.data(),
+            bandHeight_,
+            rowBytes_
+        );
+        encodingDuration_ += std::chrono::steady_clock::now() - start;
+        if (status != StreamingPngStatus::Ok) {
+            lastFailure_ = native_code(status);
+            return false;
+        }
+        writtenRows_ += bandHeight_;
+        bandStartY_ = -1;
+        bandHeight_ = 0;
+        return true;
+    }
+
+    static SuperResNativeCode native_code(StreamingPngStatus status) {
+        switch (status) {
+            case StreamingPngStatus::Ok:
+                return SuperResNativeCode::Ok;
+            case StreamingPngStatus::OutOfMemory:
+                return SuperResNativeCode::OutOfMemory;
+            case StreamingPngStatus::InvalidParams:
+            case StreamingPngStatus::InvalidState:
+                return SuperResNativeCode::InvalidParams;
+            case StreamingPngStatus::IoError:
+                return SuperResNativeCode::OutputFailed;
+        }
+        return SuperResNativeCode::OutputFailed;
+    }
+
+    bool croppedRaw_ = false;
+    int width_ = 0;
+    int height_ = 0;
+    int writtenRows_ = 0;
+    int bandStartY_ = -1;
+    int bandHeight_ = 0;
+    size_t rowBytes_ = 0;
+    std::vector<unsigned char> bytes_;
+    StreamingPngWriter writer_;
+    std::chrono::steady_clock::duration encodingDuration_{};
+    SuperResNativeCode lastFailure_ = SuperResNativeCode::Ok;
+};
+
+class InvocationVulkanAllocators {
+public:
+    explicit InvocationVulkanAllocators(const ncnn::VulkanDevice* device)
+        : device_(device),
+          blob_(device == nullptr ? nullptr : device->acquire_blob_allocator()),
+          workspace_(device == nullptr ? nullptr : device->acquire_blob_allocator()),
+          staging_(device == nullptr ? nullptr : device->acquire_staging_allocator()) {}
+
+    ~InvocationVulkanAllocators() {
+        if (device_ == nullptr) {
+            return;
+        }
+        if (staging_ != nullptr) {
+            device_->reclaim_staging_allocator(staging_);
+        }
+        if (workspace_ != nullptr) {
+            device_->reclaim_blob_allocator(workspace_);
+        }
+        if (blob_ != nullptr) {
+            device_->reclaim_blob_allocator(blob_);
+        }
+    }
+
+    InvocationVulkanAllocators(const InvocationVulkanAllocators&) = delete;
+    InvocationVulkanAllocators& operator=(const InvocationVulkanAllocators&) = delete;
+
+    bool valid() const {
+        return device_ != nullptr && blob_ != nullptr && workspace_ != nullptr && staging_ != nullptr;
+    }
+
+    ncnn::VkAllocator* blob() const {
+        return blob_;
+    }
+
+    ncnn::VkAllocator* workspace() const {
+        return workspace_;
+    }
+
+    ncnn::VkAllocator* staging() const {
+        return staging_;
+    }
+
+    ncnn::Option attach_to(const ncnn::Option& base) const {
+        ncnn::Option option = base;
+        option.blob_vkallocator = blob_;
+        option.workspace_vkallocator = workspace_;
+        option.staging_vkallocator = staging_;
+        return option;
+    }
+
+private:
+    const ncnn::VulkanDevice* device_;
+    ncnn::VkAllocator* blob_;
+    ncnn::VkAllocator* workspace_;
+    ncnn::VkAllocator* staging_;
+};
+
+struct OptimizedVulkanTileWork {
+    int tileX;
+    int tileY;
+    int tileW;
+    int tileH;
+    TileInputRegion region;
+    ncnn::Mat input;
+    ncnn::VkMat uploaded;
+    ncnn::VkMat inferred;
+    ncnn::Mat downloaded;
+};
+
 NetCacheEntry net_cache;
 std::vector<NetCacheEntry> net_cache_entries;
-constexpr size_t kNetCacheCapacity = 3;
 
 long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -83,42 +340,98 @@ const char* acceleration_name(bool useVulkan) {
     return useVulkan ? "vulkan" : "cpu";
 }
 
-int clamp_gpu_headroom_percent(int value) {
-    return std::min(10, std::max(5, value));
+SuperResNativeBackend native_backend_from_code(int code) {
+    return code == static_cast<int>(SuperResNativeBackend::Optimized)
+        ? SuperResNativeBackend::Optimized
+        : SuperResNativeBackend::LegacySafe;
 }
 
-int inference_threads(bool useVulkan) {
+void record_tile_copy_duration(
+    SuperResNativePerformance& performance,
+    const std::chrono::steady_clock::time_point& start,
+    const OutputAssembly& output,
+    std::chrono::steady_clock::duration encodingBefore
+) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto encoding = output.encoding_duration() - encodingBefore;
+    const auto copyOnly = elapsed > encoding ? elapsed - encoding : std::chrono::steady_clock::duration{};
+    performance.tileCopyMs += std::chrono::duration_cast<std::chrono::milliseconds>(copyOnly).count();
+}
+
+SuperResInferencePrecision inference_precision_from_code(int code) {
+    return code == static_cast<int>(SuperResInferencePrecision::Fp16)
+        ? SuperResInferencePrecision::Fp16
+        : SuperResInferencePrecision::Fp32;
+}
+
+SuperResExecutionProfile resolve_execution_profile(
+    const SuperResNativeParams& params,
+    bool useVulkan
+) {
+    bool gpuSupportsFp16Arithmetic = false;
     if (useVulkan) {
-        return 1;
+        gpuSupportsFp16Arithmetic = ncnn::get_gpu_info(
+            ncnn::get_default_gpu_index()
+        ).support_fp16_arithmetic();
     }
-    const unsigned int hardware = std::thread::hardware_concurrency();
-    const int available = hardware == 0 ? 2 : static_cast<int>(hardware);
-    return std::min(4, std::max(1, available - 1));
+    return sanitize_execution_profile(
+        SuperResExecutionProfileRequest{
+            native_backend_from_code(params.nativeBackend),
+            inference_precision_from_code(params.inferencePrecision),
+            params.cpuThreads,
+            params.openmpBlocktimeMs,
+            params.commandBatchSize,
+            params.modelCacheCapacity
+        },
+        useVulkan,
+        ncnn::get_big_cpu_count(),
+        ncnn::get_physical_cpu_count(),
+        gpuSupportsFp16Arithmetic
+    );
 }
 
 bool ensure_gpu_instance() {
-    if (gpu_instance_created) {
-        return ncnn::get_gpu_count() > 0;
+    if (!should_attempt_gpu_initialization(gpu_init_state)) {
+        return gpu_init_state == SuperResGpuInitState::Available;
     }
-    if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0) {
-        return false;
+
+    const int createResult = ncnn::create_gpu_instance();
+    const int gpuCount = createResult == 0 ? ncnn::get_gpu_count() : 0;
+    if (should_destroy_empty_gpu_instance(createResult, gpuCount)) {
+        ncnn::destroy_gpu_instance();
     }
-    gpu_instance_created = true;
-    return true;
+    gpu_init_state = transition_gpu_init_state(gpu_init_state, createResult, gpuCount);
+    return gpu_init_state == SuperResGpuInitState::Available;
 }
 
-std::string make_net_cache_key(const ModelFiles& files, bool useVulkan, int threadCount) {
-    return files.paramPath + "|" + files.binPath + "|" + (useVulkan ? "vulkan" : "cpu") + "|" + std::to_string(threadCount);
+std::string make_net_cache_key(
+    const ModelFiles& files,
+    bool useVulkan,
+    const SuperResExecutionProfile& profile
+) {
+    return files.paramPath + "|" + files.binPath + "|" +
+        serialize_execution_cache_identity(useVulkan, profile);
+}
+
+void trim_cached_nets_locked(int requestedCapacity) {
+    const std::size_t trimCount = cache_entries_to_trim(net_cache_entries.size(), requestedCapacity);
+    if (trimCount > 0) {
+        net_cache_entries.erase(
+            net_cache_entries.begin(),
+            net_cache_entries.begin() + static_cast<std::ptrdiff_t>(trimCount)
+        );
+    }
 }
 
 LoadedNet load_cached_net(
     const ModelFiles& files,
     bool useVulkan,
-    int threadCount
+    const SuperResExecutionProfile& profile
 ) {
-    const std::string key = make_net_cache_key(files, useVulkan, threadCount);
+    const std::string key = make_net_cache_key(files, useVulkan, profile);
     {
         std::lock_guard<std::mutex> lock(net_cache_mutex);
+        trim_cached_nets_locked(profile.modelCacheCapacity);
         for (auto it = net_cache_entries.begin(); it != net_cache_entries.end(); ++it) {
             if (it->key == key && it->net) {
                 auto cached = *it;
@@ -130,15 +443,16 @@ LoadedNet load_cached_net(
     }
 
     auto net = std::make_shared<ncnn::Net>();
-    net->opt.num_threads = threadCount;
+    net->opt.num_threads = profile.cpuThreads;
+    net->opt.openmp_blocktime = profile.openmpBlocktimeMs;
     net->opt.use_packing_layout = true;
     net->opt.use_vulkan_compute = useVulkan;
     if (useVulkan) {
         net->opt.use_fp16_packed = true;
         net->opt.use_fp16_storage = true;
-        // Keep arithmetic in fp32 like the upstream waifu2x/RealCUGAN Vulkan pipelines.
-        // Some desktop/emulator Vulkan stacks advertise fp16 arithmetic but crash on CUnet.
-        net->opt.use_fp16_arithmetic = false;
+        // Legacy-safe remains on FP32 arithmetic; optimized FP16 is gated by the GPU capability check.
+        net->opt.use_fp16_arithmetic =
+            profile.effectivePrecision == SuperResInferencePrecision::Fp16;
         net->set_vulkan_device(ncnn::get_default_gpu_index());
     }
     if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
@@ -154,7 +468,8 @@ LoadedNet load_cached_net(
         ),
         net_cache_entries.end()
     );
-    if (net_cache_entries.size() >= kNetCacheCapacity) {
+    trim_cached_nets_locked(profile.modelCacheCapacity);
+    if (net_cache_entries.size() >= static_cast<std::size_t>(profile.modelCacheCapacity)) {
         net_cache_entries.erase(net_cache_entries.begin());
     }
     net_cache_entries.push_back(NetCacheEntry{key, net});
@@ -176,23 +491,58 @@ void sleep_for_gpu_headroom(
     int gpuHeadroomPercent,
     const std::chrono::steady_clock::duration& elapsed
 ) {
-    const int headroom = clamp_gpu_headroom_percent(gpuHeadroomPercent);
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    if (elapsedMs <= 0) {
+    const long long sleepMs = calculate_gpu_headroom_sleep_ms(gpuHeadroomPercent, elapsedMs);
+    if (sleepMs <= 0) {
         return;
     }
-    const long long sleepMs = std::min<long long>(20, std::max<long long>(1, elapsedMs * headroom / (100 - headroom)));
     std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
 }
 
 bool is_cancelled(const std::string& taskId) {
-    std::lock_guard<std::mutex> lock(cancel_mutex);
-    const auto found = cancelled_tasks.find(taskId);
-    if (found == cancelled_tasks.end()) {
-        return false;
+    return task_registry.consume_cancelled(taskId);
+}
+
+SuperResRuntimeInferenceControl read_runtime_control(
+    const SuperResRuntimeControlCallback& runtimeControl,
+    int defaultCommandBatchSize
+) {
+    const SuperResRuntimeInferenceControl fallback = sanitize_runtime_control(
+        SuperResRuntimeInferenceControl{defaultCommandBatchSize, 0, false}
+    );
+    if (!runtimeControl) {
+        return fallback;
     }
-    cancelled_tasks.erase(found);
-    return true;
+    try {
+        return sanitize_runtime_control(runtimeControl());
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::string path_basename(const std::string& path) {
+    const size_t separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
+}
+
+std::string performance_model_key(const SuperResNativeParams& params) {
+    const std::string raw = path_basename(
+        params.modelFileBase.empty() ? params.modelDir : params.modelFileBase
+    );
+    std::string key;
+    key.reserve(std::min<size_t>(raw.size(), 64u));
+    for (char value : raw) {
+        if (key.size() >= 64u) {
+            break;
+        }
+        const bool safe =
+            (value >= 'a' && value <= 'z') ||
+            (value >= 'A' && value <= 'Z') ||
+            (value >= '0' && value <= '9') ||
+            value == '.' || value == '_' || value == '-';
+        key.push_back(safe ? value : '_');
+    }
+    return key.empty() ? "unknown" : key;
 }
 
 std::string join_path(const std::string& dir, const std::string& name) {
@@ -321,20 +671,6 @@ void emit(
     }
 }
 
-float clamp01(float value) {
-    if (value < 0.0f) {
-        return 0.0f;
-    }
-    if (value > 1.0f) {
-        return 1.0f;
-    }
-    return value;
-}
-
-unsigned char to_u8(float normalized) {
-    return static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, normalized * 255.0f + 0.5f)));
-}
-
 int waifu2x_prepadding(const SuperResNativeParams& params) {
     if (params.engineType != kEngineWaifu2x) {
         return 0;
@@ -454,16 +790,26 @@ ncnn::Mat make_input_tile(
     int inputH
 ) {
     ncnn::Mat tile(inputW, inputH, 3, sizeof(float));
-    for (int c = 0; c < 3; ++c) {
-        ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < inputH; ++y) {
-            float* row = channel.row(y);
-            const int sourceY = std::min(image.height - 1, std::max(0, tileY + y));
-            for (int x = 0; x < inputW; ++x) {
-                const int sourceX = std::min(image.width - 1, std::max(0, tileX + x));
-                const size_t offset = (static_cast<size_t>(sourceY) * image.width + sourceX) * 3 + c;
-                row[x] = static_cast<float>(image.rgb[offset]) / 255.0f;
-            }
+    if (tile.empty()) {
+        return tile;
+    }
+    ncnn::Mat redChannel = tile.channel(0);
+    ncnn::Mat greenChannel = tile.channel(1);
+    ncnn::Mat blueChannel = tile.channel(2);
+    for (int y = 0; y < inputH; ++y) {
+        const int sourceY = std::min(image.height - 1, std::max(0, tileY + y));
+        const unsigned char* const sourceRow =
+            image.rgb.data() + static_cast<size_t>(sourceY) * image.width * 3;
+        if (!copy_clamped_rgb8_row_to_planar(
+                sourceRow,
+                image.width,
+                tileX,
+                inputW,
+                redChannel.row(y),
+                greenChannel.row(y),
+                blueChannel.row(y)
+            )) {
+            return ncnn::Mat{};
         }
     }
     return tile;
@@ -471,7 +817,7 @@ ncnn::Mat make_input_tile(
 
 bool copy_output_tile(
     const ncnn::Mat& tile,
-    std::vector<unsigned char>& output,
+    OutputAssembly& output,
     long long& coveredPixels,
     const LoadedImage* residualBaseImage,
     int bufferW,
@@ -555,21 +901,39 @@ bool copy_output_tile(
     const int fullDstBaseX = useCroppedOutput ? cropLeft + window.dstX : window.dstX;
     const int fullDstBaseY = useCroppedOutput ? cropTop + window.dstY : window.dstY;
 
-    for (int c = 0; c < 3; ++c) {
-        const ncnn::Mat channel = tile.channel(c);
-        for (int y = 0; y < window.copyH; ++y) {
-            const float* row = channel.row(window.srcY + y);
-            for (int x = 0; x < window.copyW; ++x) {
-                const size_t offset = (static_cast<size_t>(window.dstY + y) * bufferW + window.dstX + x) * 3 + c;
-                float value = row[window.srcX + x];
-                if (addRealCugan4xResidualBase) {
-                    const int baseX = realcugan_4x_residual_source_coord(fullDstBaseX + x, residualBaseImage->width);
-                    const int baseY = realcugan_4x_residual_source_coord(fullDstBaseY + y, residualBaseImage->height);
-                    const size_t baseOffset = (static_cast<size_t>(baseY) * residualBaseImage->width + baseX) * 3 + c;
-                    value += static_cast<float>(residualBaseImage->rgb[baseOffset]) / 255.0f;
-                }
-                output[offset] = to_u8(clamp01(value));
-            }
+    const ncnn::Mat redChannel = tile.channel(0);
+    const ncnn::Mat greenChannel = tile.channel(1);
+    const ncnn::Mat blueChannel = tile.channel(2);
+    if (!output.prepare_window(window.dstY, window.copyH)) {
+        return false;
+    }
+    for (int y = 0; y < window.copyH; ++y) {
+        unsigned char* const destinationRow = output.row(window.dstY + y, window.dstX);
+        if (destinationRow == nullptr) {
+            return false;
+        }
+        const unsigned char* residualRow = nullptr;
+        int residualWidth = 0;
+        if (addRealCugan4xResidualBase) {
+            const int baseY = realcugan_4x_residual_source_coord(
+                fullDstBaseY + y,
+                residualBaseImage->height
+            );
+            residualWidth = residualBaseImage->width;
+            residualRow = residualBaseImage->rgb.data() +
+                static_cast<size_t>(baseY) * residualWidth * 3;
+        }
+        if (!copy_planar_float_row_to_rgb8(
+                redChannel.row(window.srcY + y) + window.srcX,
+                greenChannel.row(window.srcY + y) + window.srcX,
+                blueChannel.row(window.srcY + y) + window.srcX,
+                destinationRow,
+                window.copyW,
+                residualRow,
+                residualWidth,
+                fullDstBaseX
+            )) {
+            return false;
         }
     }
     coveredPixels += static_cast<long long>(window.copyW) * window.copyH;
@@ -689,14 +1053,293 @@ void log_tile_output_mismatch(
     );
 }
 
+SuperResNativeCode run_optimized_vulkan_tiles(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    const LoadedImage& image,
+    const ModelFiles& files,
+    ncnn::Net& net,
+    const SuperResExecutionProfile& executionProfile,
+    int tileSize,
+    int tileOverlap,
+    int tilesX,
+    int tilesY,
+    int bufferW,
+    int bufferH,
+    int outputW,
+    int outputH,
+    bool useCroppedOutput,
+    OutputAssembly& output,
+    long long& coveredPixels,
+    int& completed,
+    SuperResNativePerformance& performance
+) {
+    const ncnn::VulkanDevice* device = net.vulkan_device();
+    InvocationVulkanAllocators allocators(device);
+    if (!allocators.valid()) {
+        return SuperResNativeCode::VulkanFailed;
+    }
+    const ncnn::Option executionOption = allocators.attach_to(net.opt);
+    const int totalTiles = tilesX * tilesY;
+    std::chrono::steady_clock::duration uploadDuration{};
+    std::chrono::steady_clock::duration inferenceDuration{};
+    std::chrono::steady_clock::duration downloadDuration{};
+    int firstTile = 0;
+
+    while (firstTile < totalTiles) {
+        const SuperResRuntimeInferenceControl control = read_runtime_control(
+            runtimeControl,
+            executionProfile.commandBatchSize
+        );
+        if (control.shouldPause) {
+            return SuperResNativeCode::Cancelled;
+        }
+        const bool cancellationRequested = is_cancelled(params.taskId);
+        const SuperResCommandBatchPlan plan = plan_command_batch(
+            totalTiles,
+            control.commandBatchSize,
+            firstTile,
+            cancellationRequested
+        );
+        if (!plan.shouldRecord) {
+            return cancellationRequested ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+        }
+
+        const auto batchStart = std::chrono::steady_clock::now();
+        std::vector<OptimizedVulkanTileWork> batch;
+        std::vector<std::unique_ptr<ncnn::Extractor>> extractors;
+        batch.reserve(static_cast<size_t>(plan.tileCount));
+        extractors.reserve(static_cast<size_t>(plan.tileCount));
+        ncnn::VkCompute command(device);
+
+        for (int offset = 0; offset < plan.tileCount; ++offset) {
+            const int tileIndex = plan.firstTile + offset;
+            const int tx = tileIndex % tilesX;
+            const int ty = tileIndex / tilesX;
+            const int tileX = tx * tileSize;
+            const int tileY = ty * tileSize;
+            const int tileW = std::min(tileSize, image.width - tileX);
+            const int tileH = std::min(tileSize, image.height - tileY);
+            const TileInputRegion region = params.engineType == kEngineWaifu2x
+                ? make_waifu2x_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                : params.engineType == kEngineRealCugan
+                    ? make_realcugan_tile_region(params, image.width, image.height, tileX, tileY, tileW, tileH)
+                    : make_overlapped_tile_region(
+                        image.width,
+                        image.height,
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        tileSize,
+                        tileOverlap,
+                        params.scale
+                    );
+
+            const auto inputStart = std::chrono::steady_clock::now();
+            ncnn::Mat input = make_input_tile(
+                image,
+                region.inputX,
+                region.inputY,
+                region.inputW,
+                region.inputH
+            );
+            performance.tileInputMs += elapsed_ms(inputStart);
+            batch.push_back(OptimizedVulkanTileWork{
+                tileX,
+                tileY,
+                tileW,
+                tileH,
+                region,
+                input,
+                ncnn::VkMat{},
+                ncnn::VkMat{},
+                ncnn::Mat{}
+            });
+            OptimizedVulkanTileWork& work = batch.back();
+
+            const auto uploadStart = std::chrono::steady_clock::now();
+            command.record_upload(work.input, work.uploaded, executionOption);
+            uploadDuration += std::chrono::steady_clock::now() - uploadStart;
+            if (work.uploaded.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+
+            auto extractor = std::make_unique<ncnn::Extractor>(net.create_extractor());
+            extractor->set_blob_vkallocator(allocators.blob());
+            extractor->set_workspace_vkallocator(allocators.workspace());
+            extractor->set_staging_vkallocator(allocators.staging());
+            const auto inferenceStart = std::chrono::steady_clock::now();
+            const bool inferenceFailed =
+                extractor->input(files.inputBlob, work.uploaded) != 0 ||
+                extractor->extract(files.outputBlob, work.inferred, command) != 0;
+            inferenceDuration += std::chrono::steady_clock::now() - inferenceStart;
+            if (inferenceFailed) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+            if (work.inferred.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+            extractors.push_back(std::move(extractor));
+
+            const auto downloadStart = std::chrono::steady_clock::now();
+            command.record_download(work.inferred, work.downloaded, executionOption);
+            downloadDuration += std::chrono::steady_clock::now() - downloadStart;
+        }
+
+        // ncnn exposes one synchronization result for the complete command buffer; keep it in inference time.
+        const auto submitStart = std::chrono::steady_clock::now();
+        const int submitResult = command.submit_and_wait();
+        inferenceDuration += std::chrono::steady_clock::now() - submitStart;
+        if (submitResult != 0) {
+            return SuperResNativeCode::VulkanFailed;
+        }
+
+        if (is_cancelled(params.taskId)) {
+            return SuperResNativeCode::Cancelled;
+        }
+
+        for (size_t index = 0; index < batch.size(); ++index) {
+            if (index > 0 && is_cancelled(params.taskId)) {
+                return SuperResNativeCode::Cancelled;
+            }
+            OptimizedVulkanTileWork& work = batch[index];
+            if (work.downloaded.empty()) {
+                return SuperResNativeCode::VulkanFailed;
+            }
+
+            ncnn::Mat copySource;
+            if (!normalize_output_tile_for_copy(work.downloaded, copySource, performance.tileCopyMs)) {
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-normalize",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResNativeCode::TileOutputMismatch;
+            }
+
+            const auto copyStart = std::chrono::steady_clock::now();
+            const auto encodingBefore = output.encoding_duration();
+            if (!copy_output_tile(
+                    copySource,
+                    output,
+                    coveredPixels,
+                    params.engineType == kEngineRealCugan && params.scale == 4 ? &image : nullptr,
+                    bufferW,
+                    bufferH,
+                    outputW,
+                    outputH,
+                    work.region.cropX,
+                    work.region.cropY,
+                    work.region.dstX,
+                    work.region.dstY,
+                    work.region.copyW,
+                    work.region.copyH,
+                    useCroppedOutput,
+                    params.outputCropLeft,
+                    params.outputCropTop,
+                    params.outputCropWidth,
+                    params.outputCropHeight,
+                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
+                    params.engineType == kEngineRealCugan && params.scale == 4
+                )) {
+                record_tile_copy_duration(performance, copyStart, output, encodingBefore);
+                if (output.failure_code() != SuperResNativeCode::Ok) {
+                    return output.failure_code();
+                }
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-copy",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResNativeCode::TileOutputMismatch;
+            }
+            record_tile_copy_duration(performance, copyStart, output, encodingBefore);
+
+            completed += 1;
+            const float progress = 0.12f + 0.78f * (static_cast<float>(completed) / totalTiles);
+            emit(
+                onProgress,
+                SuperResNativeStage::ProcessingTile,
+                completed,
+                totalTiles,
+                progress,
+                "Processing tile " + std::to_string(completed) + "/" + std::to_string(totalTiles)
+            );
+        }
+
+        firstTile += plan.tileCount;
+        sleep_for_gpu_headroom(
+            resolve_runtime_headroom_percent(
+                params.gpuHeadroomPercent,
+                control.thermalHeadroomPercent,
+                true
+            ),
+            std::chrono::steady_clock::now() - batchStart
+        );
+        if (is_cancelled(params.taskId)) {
+            return SuperResNativeCode::Cancelled;
+        }
+    }
+
+    // Convert once after all batches so sub-millisecond record calls accumulate instead of truncating per tile.
+    performance.uploadMs = std::chrono::duration_cast<std::chrono::milliseconds>(uploadDuration).count();
+    performance.inferenceMs = std::chrono::duration_cast<std::chrono::milliseconds>(inferenceDuration).count();
+    performance.downloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(downloadDuration).count();
+    return SuperResNativeCode::Ok;
+}
+
 SuperResNativeCode run_ncnn_image(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan,
     const LoadedImage& image,
     long long decodeMs
 ) {
     const auto totalStart = std::chrono::steady_clock::now();
+    static const bool executionProfileChecksPass = run_execution_profile_runtime_checks();
+    if (!executionProfileChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Execution profile runtime checks failed");
+        return SuperResNativeCode::InvalidParams;
+    }
+    static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
+    if (!pixelIoChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
+        return SuperResNativeCode::Unsupported;
+    }
+    static const bool atomicPublishChecksPass = run_atomic_publish_runtime_checks();
+    if (!atomicPublishChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Atomic publish runtime checks failed");
+        return SuperResNativeCode::OutputFailed;
+    }
+    if (read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause) {
+        return SuperResNativeCode::Cancelled;
+    }
+#ifndef NDEBUG
+    static const bool streamingPngChecksPass = run_streaming_png_writer_runtime_checks(
+        params.outputPath.c_str()
+    );
+    if (!streamingPngChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Streaming PNG writer runtime checks failed");
+        return SuperResNativeCode::Unsupported;
+    }
+#endif
     SuperResNativePerformance performance;
     performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
     performance.decodeMs = decodeMs;
@@ -720,6 +1363,14 @@ SuperResNativeCode run_ncnn_image(
 
     if (image.rgb.empty()) {
         return SuperResNativeCode::Unsupported;
+    }
+
+    if (params.tta) {
+        static const bool d4RuntimeChecksPass = run_d4_tta_runtime_checks();
+        if (!d4RuntimeChecksPass) {
+            __android_log_print(ANDROID_LOG_ERROR, kLogTag, "D4 TTA runtime checks failed");
+            return SuperResNativeCode::TileOutputMismatch;
+        }
     }
 
     if (is_cancelled(params.taskId)) {
@@ -749,9 +1400,12 @@ SuperResNativeCode run_ncnn_image(
     }
 
     emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
-    const int threadCount = inference_threads(useVulkan);
+    const SuperResExecutionProfile executionProfile = resolve_execution_profile(params, useVulkan);
+    performance.effectiveBackend = static_cast<int>(executionProfile.effectiveBackend);
+    performance.effectivePrecision = static_cast<int>(executionProfile.effectivePrecision);
+    performance.fallbackReason = static_cast<int>(executionProfile.fallbackReason);
     const auto modelLoadStart = std::chrono::steady_clock::now();
-    LoadedNet loadedNet = load_cached_net(files, useVulkan, threadCount);
+    LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
     performance.cacheSize = cached_net_count();
@@ -763,10 +1417,16 @@ SuperResNativeCode run_ncnn_image(
     }
 
     const int tileSize = std::max(32, params.tileSize);
+    if (!safe_mul_leq(tileSize, params.scale, kMaxIntDimension)) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    const int maximumBandHeight = static_cast<int>(
+        static_cast<long long>(tileSize) * params.scale
+    );
     performance.tileSize = tileSize;
     const int tileOverlap = std::min(32, std::max(8, tileSize / 4));
-    const int tilesX = (image.width + tileSize - 1) / tileSize;
-    const int tilesY = (image.height + tileSize - 1) / tileSize;
+    const int tilesX = 1 + (image.width - 1) / tileSize;
+    const int tilesY = 1 + (image.height - 1) / tileSize;
     const int totalTiles = tilesX * tilesY;
     const int outputW = image.width * params.scale;
     const int outputH = image.height * params.scale;
@@ -774,27 +1434,68 @@ SuperResNativeCode run_ncnn_image(
     if (useCroppedOutput &&
         (params.outputCropLeft < 0 || params.outputCropTop < 0 ||
             params.outputCropWidth <= 0 || params.outputCropHeight <= 0 ||
-            params.outputCropLeft + params.outputCropWidth > outputW ||
-            params.outputCropTop + params.outputCropHeight > outputH)) {
+            params.outputCropLeft > outputW || params.outputCropTop > outputH ||
+            params.outputCropWidth > outputW - params.outputCropLeft ||
+            params.outputCropHeight > outputH - params.outputCropTop)) {
         return SuperResNativeCode::InvalidParams;
     }
     const int bufferW = useCroppedOutput ? params.outputCropWidth : outputW;
     const int bufferH = useCroppedOutput ? params.outputCropHeight : outputH;
 
-    std::vector<unsigned char> output;
-    try {
-        output.resize(static_cast<size_t>(bufferW) * bufferH * 3);
-    } catch (...) {
-        return SuperResNativeCode::OutOfMemory;
-    }
-    if (output.empty()) {
-        return SuperResNativeCode::OutOfMemory;
+    OutputAssembly output;
+    const SuperResNativeCode outputInitialization = output.initialize(
+            params.outputPath,
+            bufferW,
+            bufferH,
+            useCroppedOutput,
+            maximumBandHeight
+        );
+    if (outputInitialization != SuperResNativeCode::Ok) {
+        return outputInitialization;
     }
 
     int completed = 0;
     long long coveredPixels = 0;
+    const bool useExplicitVulkanPath =
+        should_use_optimized_vulkan_path(executionProfile.effectiveBackend, useVulkan) &&
+        !params.tta;
+    if (useExplicitVulkanPath) {
+        const SuperResNativeCode optimizedCode = run_optimized_vulkan_tiles(
+            params,
+            onProgress,
+            runtimeControl,
+            image,
+            files,
+            *net,
+            executionProfile,
+            tileSize,
+            tileOverlap,
+            tilesX,
+            tilesY,
+            bufferW,
+            bufferH,
+            outputW,
+            outputH,
+            useCroppedOutput,
+            output,
+            coveredPixels,
+            completed,
+            performance
+        );
+        if (optimizedCode != SuperResNativeCode::Ok) {
+            return optimizedCode;
+        }
+        performance.tileExtractMs = performance.inferenceMs;
+    } else {
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
+            const SuperResRuntimeInferenceControl control = read_runtime_control(
+                runtimeControl,
+                executionProfile.commandBatchSize
+            );
+            if (control.shouldPause) {
+                return SuperResNativeCode::Cancelled;
+            }
             if (is_cancelled(params.taskId)) {
                 return SuperResNativeCode::Cancelled;
             }
@@ -822,33 +1523,141 @@ SuperResNativeCode run_ncnn_image(
             ncnn::Mat input = make_input_tile(image, region.inputX, region.inputY, region.inputW, region.inputH);
             performance.tileInputMs += elapsed_ms(inputStart);
             ncnn::Mat result;
+            ncnn::Mat copySource;
             const auto tileStart = std::chrono::steady_clock::now();
 
-            ncnn::Extractor extractor = net->create_extractor();
-            const auto extractStart = std::chrono::steady_clock::now();
-            if (extractor.input(files.inputBlob, input) != 0 ||
-                extractor.extract(files.outputBlob, result) != 0) {
-                return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
-            }
-            performance.tileExtractMs += elapsed_ms(extractStart);
-            ncnn::Mat copySource;
-            if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
-                log_tile_output_mismatch(
-                    params,
-                    useVulkan,
-                    "normalize",
-                    tileX,
-                    tileY,
-                    tileW,
-                    tileH,
-                    region,
-                    result,
-                    copySource
-                );
-                return SuperResNativeCode::TileOutputMismatch;
+            if (!params.tta) {
+                ncnn::Extractor extractor = net->create_extractor();
+                const auto extractStart = std::chrono::steady_clock::now();
+                if (extractor.input(files.inputBlob, input) != 0 ||
+                    extractor.extract(files.outputBlob, result) != 0) {
+                    return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
+                }
+                performance.tileExtractMs += elapsed_ms(extractStart);
+                if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
+                    log_tile_output_mismatch(
+                        params,
+                        useVulkan,
+                        "normalize",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        result,
+                        copySource
+                    );
+                    return SuperResNativeCode::TileOutputMismatch;
+                }
+            } else {
+                // Fusion stays in canonical float space; crop/copy and the RealCUGAN x4 residual run only after all passes succeed.
+                D4FloatFusion fusion;
+                for (size_t pass = 0; pass < kD4Transforms.size(); ++pass) {
+                    const D4Transform transform = kD4Transforms[pass];
+                    ncnn::Mat transformedInput;
+                    if (!d4_transform_ncnn_mat(input, transform, transformedInput)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-input-transform",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            transformedInput,
+                            ncnn::Mat{}
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+
+                    ncnn::Extractor extractor = net->create_extractor();
+                    ncnn::Mat passResult;
+                    const auto extractStart = std::chrono::steady_clock::now();
+                    if (extractor.input(files.inputBlob, transformedInput) != 0 ||
+                        extractor.extract(files.outputBlob, passResult) != 0) {
+                        performance.tileExtractMs += elapsed_ms(extractStart);
+                        if (is_cancelled(params.taskId)) {
+                            return SuperResNativeCode::Cancelled;
+                        }
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-extract",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            ncnn::Mat{}
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+                    performance.tileExtractMs += elapsed_ms(extractStart);
+
+                    ncnn::Mat normalizedPass;
+                    if (!normalize_output_tile_for_copy(passResult, normalizedPass, performance.tileCopyMs)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-normalize",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            normalizedPass
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+                    if (!d4_add_ncnn_to_fusion(normalizedPass, transform, fusion)) {
+                        log_tile_output_mismatch(
+                            params,
+                            useVulkan,
+                            "tta-inverse-shape",
+                            tileX,
+                            tileY,
+                            tileW,
+                            tileH,
+                            region,
+                            passResult,
+                            normalizedPass
+                        );
+                        return SuperResNativeCode::TileOutputMismatch;
+                    }
+
+                    normalizedPass.release();
+                    passResult.release();
+                    transformedInput.release();
+                    // Progress remains tile-based, while cancellation can stop before the next expensive TTA inference.
+                    if (pass + 1 < kD4Transforms.size() && is_cancelled(params.taskId)) {
+                        return SuperResNativeCode::Cancelled;
+                    }
+                }
+                if (!d4_finish_ncnn_fusion(fusion, copySource)) {
+                    log_tile_output_mismatch(
+                        params,
+                        useVulkan,
+                        "tta-fusion",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        result,
+                        copySource
+                    );
+                    return SuperResNativeCode::TileOutputMismatch;
+                }
+                if (is_cancelled(params.taskId)) {
+                    return SuperResNativeCode::Cancelled;
+                }
             }
 
             const auto copyStart = std::chrono::steady_clock::now();
+            const auto encodingBefore = output.encoding_duration();
             if (!copy_output_tile(
                     copySource,
                     output,
@@ -872,6 +1681,10 @@ SuperResNativeCode run_ncnn_image(
                     params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
                     params.engineType == kEngineRealCugan && params.scale == 4
                 )) {
+                record_tile_copy_duration(performance, copyStart, output, encodingBefore);
+                if (output.failure_code() != SuperResNativeCode::Ok) {
+                    return output.failure_code();
+                }
                 log_tile_output_mismatch(
                     params,
                     useVulkan,
@@ -886,19 +1699,24 @@ SuperResNativeCode run_ncnn_image(
                 );
                 return SuperResNativeCode::TileOutputMismatch;
             }
-            performance.tileCopyMs += elapsed_ms(copyStart);
+            record_tile_copy_duration(performance, copyStart, output, encodingBefore);
             copySource.release();
             result.release();
             input.release();
 
-            if (useVulkan) {
+            const int runtimeHeadroomPercent = resolve_runtime_headroom_percent(
+                params.gpuHeadroomPercent,
+                control.thermalHeadroomPercent,
+                useVulkan
+            );
+            if (runtimeHeadroomPercent > 0) {
                 sleep_for_gpu_headroom(
-                    params.gpuHeadroomPercent,
+                    runtimeHeadroomPercent,
                     std::chrono::steady_clock::now() - tileStart
                 );
-                if (is_cancelled(params.taskId)) {
-                    return SuperResNativeCode::Cancelled;
-                }
+            }
+            if (is_cancelled(params.taskId)) {
+                return SuperResNativeCode::Cancelled;
             }
 
             completed += 1;
@@ -913,7 +1731,13 @@ SuperResNativeCode run_ncnn_image(
             );
         }
     }
+    }
 
+    // The last tile can complete while cancellation is being delivered. Consume it before
+    // spending time finalizing the temporary PNG, then arbitrate once more at publication.
+    if (is_cancelled(params.taskId)) {
+        return SuperResNativeCode::Cancelled;
+    }
     emit(onProgress, SuperResNativeStage::Stitching, totalTiles, totalTiles, 0.92f, "Stitching tiles");
     const long long expectedCoveredPixels = static_cast<long long>(bufferW) * bufferH;
     if (coveredPixels != expectedCoveredPixels) {
@@ -939,28 +1763,73 @@ SuperResNativeCode run_ncnn_image(
     if (params.outputMode == kNativeOutputRawCroppedRgbTile) {
         if (!write_cropped_raw_rgb_tile(
                 params.outputPath,
-                output,
+                output.bytes(),
                 params.outputCropWidth,
                 params.outputCropHeight
             )) {
             return SuperResNativeCode::OutputFailed;
         }
+        performance.saveMs = elapsed_ms(saveStart);
     } else {
-        // The output buffer owns RGB bytes until stbi_write_png has synchronously copied them to disk.
-        if (stbi_write_png(params.outputPath.c_str(), outputW, outputH, 3, output.data(), outputW * 3) == 0) {
-            return SuperResNativeCode::OutputFailed;
+        const SuperResNativeCode finishCode = output.finish_png_temporary();
+        if (finishCode != SuperResNativeCode::Ok) {
+            return finishCode;
         }
+        // Publication and cancellation share the registry mutex as their linearization point.
+        const SuperResTaskPublishOutcome publishOutcome = task_registry.publish_or_cancel(
+            params.taskId,
+            [&output]() { return output.publish_png() == SuperResNativeCode::Ok; },
+            [&output]() { output.abort_png(); }
+        );
+        if (publishOutcome == SuperResTaskPublishOutcome::Cancelled) {
+            return SuperResNativeCode::Cancelled;
+        }
+        if (publishOutcome != SuperResTaskPublishOutcome::Published) {
+            return output.failure_code() == SuperResNativeCode::Ok
+                ? SuperResNativeCode::OutputFailed
+                : output.failure_code();
+        }
+        performance.saveMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            output.encoding_duration()
+        ).count();
     }
-    performance.saveMs = elapsed_ms(saveStart);
+    performance.preprocessMs = performance.tileInputMs;
+    if (!useExplicitVulkanPath) {
+        performance.inferenceMs = performance.tileExtractMs;
+    }
+    performance.postprocessMs = performance.tileCopyMs;
+    performance.encodeMs = performance.saveMs;
     performance.totalMs = elapsed_ms(totalStart);
     performance.hasValue = true;
+    const std::string modelKey = performance_model_key(params);
+    unsigned int driverId = 0u;
+    unsigned int driverVersion = 0u;
+    if (useVulkan) {
+        const int gpuIndex = ncnn::get_default_gpu_index();
+        const int gpuCount = ncnn::get_gpu_count();
+        if (gpuIndex >= 0 && gpuIndex < gpuCount) {
+            const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
+            driverId = static_cast<unsigned int>(gpuInfo.driver_id());
+            driverVersion = static_cast<unsigned int>(gpuInfo.driver_version());
+        }
+    }
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s accel=%s cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld totalMs=%lld",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld",
         params.taskId.c_str(),
-        params.modelFileBase.c_str(),
+        modelKey.c_str(),
+        modelKey.c_str(),
+        driverId,
+        driverVersion,
         acceleration_name(useVulkan),
+        performance.effectiveBackend,
+        performance.effectivePrecision,
+        performance.fallbackReason,
+        executionProfile.cpuThreads,
+        executionProfile.openmpBlocktimeMs,
+        executionProfile.commandBatchSize,
+        executionProfile.modelCacheCapacity,
         performance.cacheHit ? 1 : 0,
         performance.cacheSize,
         performance.retryCount,
@@ -972,28 +1841,36 @@ SuperResNativeCode run_ncnn_image(
         performance.tileExtractMs,
         performance.tileCopyMs,
         performance.saveMs,
+        performance.preprocessMs,
+        performance.uploadMs,
+        performance.inferenceMs,
+        performance.downloadMs,
+        performance.postprocessMs,
+        performance.encodeMs,
         performance.totalMs
     );
     emit(onProgress, SuperResNativeStage::Saving, totalTiles, totalTiles, 0.99f, "Native performance sample", performance);
 
-    return is_cancelled(params.taskId) ? SuperResNativeCode::Cancelled : SuperResNativeCode::Ok;
+    return SuperResNativeCode::Ok;
 }
 
 SuperResNativeCode run_ncnn(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan
 ) {
     emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
     const auto decodeStart = std::chrono::steady_clock::now();
     LoadedImage image = load_rgb_image(params.inputPath);
     const long long decodeMs = elapsed_ms(decodeStart);
-    return run_ncnn_image(params, onProgress, useVulkan, image, decodeMs);
+    return run_ncnn_image(params, onProgress, runtimeControl, useVulkan, image, decodeMs);
 }
 
 SuperResNativeCode run_ncnn_rgb(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan,
     int width,
     int height,
@@ -1013,7 +1890,7 @@ SuperResNativeCode run_ncnn_rgb(
     } catch (...) {
         return SuperResNativeCode::OutOfMemory;
     }
-    return run_ncnn_image(params, onProgress, useVulkan, image, 0);
+    return run_ncnn_image(params, onProgress, runtimeControl, useVulkan, image, 0);
 }
 
 bool write_all(FILE* file, const void* data, size_t size) {
@@ -1085,23 +1962,83 @@ bool deflate_png_bytes(
 }
 }
 
+SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot() {
+    if (!run_capability_normalization_runtime_checks()) {
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "Capability normalization runtime checks failed"
+        );
+        return SuperResNativeCapabilitySnapshot{};
+    }
+
+    const SuperResCpuTopology topology = normalize_cpu_topology(
+        ncnn::get_physical_cpu_count(),
+        ncnn::get_physical_big_cpu_count(),
+        ncnn::get_physical_little_cpu_count()
+    );
+    SuperResNativeCapabilitySnapshot snapshot;
+    snapshot.physicalCoreCount = topology.physicalCoreCount;
+    snapshot.bigCoreCount = topology.bigCoreCount;
+    snapshot.littleCoreCount = topology.littleCoreCount;
+
+    std::lock_guard<std::mutex> gpuLock(gpu_mutex);
+    if (!ensure_gpu_instance()) {
+        return snapshot;
+    }
+
+    const int gpuIndex = ncnn::get_default_gpu_index();
+    const int gpuCount = ncnn::get_gpu_count();
+    if (gpuIndex < 0 || gpuIndex >= gpuCount) {
+        return snapshot;
+    }
+
+    const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
+    char vendorIdentity[32] = {};
+    std::snprintf(
+        vendorIdentity,
+        sizeof(vendorIdentity),
+        "vendor=0x%08x",
+        static_cast<unsigned int>(gpuInfo.vendor_id())
+    );
+    char driverIdentity[96] = {};
+    const std::string driverName = sanitize_capability_text(gpuInfo.driver_name(), 48);
+    std::snprintf(
+        driverIdentity,
+        sizeof(driverIdentity),
+        "%s%sid=0x%08x version=0x%08x",
+        driverName.c_str(),
+        driverName.empty() ? "" : " ",
+        static_cast<unsigned int>(gpuInfo.driver_id()),
+        static_cast<unsigned int>(gpuInfo.driver_version())
+    );
+
+    snapshot.gpuVendor = sanitize_capability_text(vendorIdentity);
+    snapshot.gpuDevice = sanitize_capability_text(gpuInfo.device_name());
+    snapshot.gpuDriverVersion = sanitize_capability_text(driverIdentity);
+    snapshot.gpuRoughScore = normalize_gpu_rough_score(gpuInfo.rough_score());
+    snapshot.supportsVulkan = true;
+    snapshot.supportsFp16Storage = gpuInfo.support_fp16_storage();
+    snapshot.supportsFp16Arithmetic = gpuInfo.support_fp16_arithmetic();
+    return snapshot;
+}
+
 using RunNcnnFunction = std::function<SuperResNativeCode(
     const SuperResNativeParams&,
     const SuperResProgressCallback&,
+    const SuperResRuntimeControlCallback&,
     bool
 )>;
 
 SuperResNativeCode process_superres_internal(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
     bool requireInputPath,
     const RunNcnnFunction& runNcnn
 ) {
-    {
-        std::lock_guard<std::mutex> lock(cancel_mutex);
-        cancelled_tasks.erase(params.taskId);
-    }
-
+    static const bool taskRegistryChecksPass = run_task_registry_runtime_checks();
+    if (!taskRegistryChecksPass) return SuperResNativeCode::InvalidParams;
     if (params.taskId.empty() || params.outputPath.empty() ||
         params.modelDir.empty() || params.scale <= 0 || params.tileSize <= 0) {
         return SuperResNativeCode::InvalidParams;
@@ -1131,6 +2068,11 @@ SuperResNativeCode process_superres_internal(
         return SuperResNativeCode::InputMissing;
     }
 
+    if (!task_registry.register_task(params.taskId)) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    TaskCompletionGuard taskCompletion(task_registry, params.taskId);
+
     emit(onProgress, SuperResNativeStage::Preparing, 0, 0, 0.0f, "Preparing native inference");
 
     if (params.accelerationMode == kAccelerationVulkan || params.accelerationMode == kAccelerationAuto) {
@@ -1145,9 +2087,9 @@ SuperResNativeCode process_superres_internal(
                 params.accelerationMode
             );
             emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Using CPU for this model");
-            return runNcnn(params, onProgress, false);
+            return runNcnn(params, onProgress, runtimeControl, false);
         }
-        SuperResNativeCode code = runNcnn(params, onProgress, true);
+        SuperResNativeCode code = runNcnn(params, onProgress, runtimeControl, true);
         const bool canRetryCpu = should_retry_cpu_after_gpu_code(
             params.accelerationMode,
             static_cast<int>(code)
@@ -1167,19 +2109,26 @@ SuperResNativeCode process_superres_internal(
         emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "GPU failed; retrying on CPU");
     }
 
-    return runNcnn(params, onProgress, false);
+    return runNcnn(params, onProgress, runtimeControl, false);
 }
 
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 ) {
     return process_superres_internal(
         params,
         onProgress,
+        runtimeControl,
         true,
-        [](const SuperResNativeParams& request, const SuperResProgressCallback& progress, bool useVulkan) {
-            return run_ncnn(request, progress, useVulkan);
+        [](
+            const SuperResNativeParams& request,
+            const SuperResProgressCallback& progress,
+            const SuperResRuntimeControlCallback& control,
+            bool useVulkan
+        ) {
+            return run_ncnn(request, progress, control, useVulkan);
         }
     );
 }
@@ -1190,7 +2139,8 @@ SuperResNativeCode process_superres_rgb(
     int height,
     const unsigned char* rgb,
     size_t rgbSize,
-    const SuperResProgressCallback& onProgress
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
 ) {
     if (width <= 0 || height <= 0 || rgb == nullptr ||
         rgbSize != static_cast<size_t>(width) * height * 3) {
@@ -1199,20 +2149,30 @@ SuperResNativeCode process_superres_rgb(
     return process_superres_internal(
         params,
         onProgress,
+        runtimeControl,
         false,
         [width, height, rgb, rgbSize](
             const SuperResNativeParams& request,
             const SuperResProgressCallback& progress,
+            const SuperResRuntimeControlCallback& control,
             bool useVulkan
         ) {
-            return run_ncnn_rgb(request, progress, useVulkan, width, height, rgb, rgbSize);
+            return run_ncnn_rgb(
+                request,
+                progress,
+                control,
+                useVulkan,
+                width,
+                height,
+                rgb,
+                rgbSize
+            );
         }
     );
 }
 
 void cancel_superres(const std::string& taskId) {
-    std::lock_guard<std::mutex> lock(cancel_mutex);
-    cancelled_tasks.insert(taskId);
+    task_registry.cancel(taskId);
 }
 
 void clear_superres_cache() {
@@ -1229,6 +2189,8 @@ SuperResNativeCode merge_raw_tiles_to_png(
     if (outputPath.empty() || outputWidth <= 0 || outputHeight <= 0 || tiles.empty()) {
         return SuperResNativeCode::InvalidParams;
     }
+    const std::string temporaryPath = outputPath + ".part";
+    std::remove(temporaryPath.c_str());
 
     struct OpenTile {
         SuperResRawTile spec;
@@ -1239,7 +2201,8 @@ SuperResNativeCode merge_raw_tiles_to_png(
     openTiles.reserve(tiles.size());
     for (const SuperResRawTile& tile : tiles) {
         if (tile.path.empty() || tile.x < 0 || tile.y < 0 || tile.width <= 0 || tile.height <= 0 ||
-            tile.x + tile.width > outputWidth || tile.y + tile.height > outputHeight) {
+            tile.x > outputWidth || tile.y > outputHeight ||
+            tile.width > outputWidth - tile.x || tile.height > outputHeight - tile.y) {
             for (OpenTile& openTile : openTiles) {
                 std::fclose(openTile.file);
             }
@@ -1266,7 +2229,7 @@ SuperResNativeCode merge_raw_tiles_to_png(
         openTiles.push_back(OpenTile{tile, file});
     }
 
-    FILE* output = std::fopen(outputPath.c_str(), "wb");
+    FILE* output = std::fopen(temporaryPath.c_str(), "wb");
     if (output == nullptr) {
         for (OpenTile& openTile : openTiles) {
             std::fclose(openTile.file);
@@ -1277,6 +2240,7 @@ SuperResNativeCode merge_raw_tiles_to_png(
     z_stream stream{};
     if (deflateInit(&stream, Z_BEST_SPEED) != Z_OK) {
         std::fclose(output);
+        std::remove(temporaryPath.c_str());
         for (OpenTile& openTile : openTiles) {
             std::fclose(openTile.file);
         }
@@ -1332,15 +2296,18 @@ SuperResNativeCode merge_raw_tiles_to_png(
     }
     ok = deflateEnd(&stream) == Z_OK && ok;
     ok = ok && write_png_chunk(output, "IEND", nullptr, 0);
+    if (ok && std::fflush(output) != 0) ok = false;
+    if (ok && ::fsync(::fileno(output)) != 0) ok = false;
     ok = std::fclose(output) == 0 && ok;
     for (OpenTile& openTile : openTiles) {
         std::fclose(openTile.file);
     }
 
     if (!ok) {
-        std::error_code error;
-        std::filesystem::remove(outputPath, error);
+        std::remove(temporaryPath.c_str());
         return SuperResNativeCode::OutputFailed;
     }
-    return SuperResNativeCode::Ok;
+    return publish_atomic_file(temporaryPath, outputPath) == SuperResAtomicPublishStatus::Ok
+        ? SuperResNativeCode::Ok
+        : SuperResNativeCode::OutputFailed;
 }

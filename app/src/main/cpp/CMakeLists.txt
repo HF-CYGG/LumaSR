@@ -9,8 +9,19 @@ endif()
 add_library(localsr SHARED
     superres_jni.cpp
     superres_engine.cpp
+    superres_capability_checks.cpp
+    superres_execution_profile_checks.cpp
+    superres_runtime_control_checks.cpp
     superres_png_streamer.cpp
+    superres_atomic_publish.cpp
+    superres_atomic_publish_checks.cpp
+    superres_task_registry.cpp
+    superres_task_registry_checks.cpp
+    superres_d4_tta_checks.cpp
     superres_tile_geometry_checks.cpp
+    superres_pixel_io_checks.cpp
+    superres_png_writer.cpp
+    superres_png_writer_checks.cpp
 )
 
 target_compile_features(localsr PRIVATE cxx_std_17)

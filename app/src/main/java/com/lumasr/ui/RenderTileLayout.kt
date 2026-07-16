@@ -102,7 +102,7 @@ internal fun buildRenderTileRects(
 internal fun calculateRenderTileVisualState(progress: UpscaleProgress): RenderTileVisualState {
     val totalTiles = progress.totalTiles.coerceAtLeast(1)
     val reportedCompleted = maxOf(
-        progress.completedTileIndexes.count { it in 1..totalTiles },
+        progress.completedTiles,
         progress.currentTile.takeIf { it in 1..totalTiles } ?: 0
     ).coerceIn(0, totalTiles)
     val completedCount = when (progress.stage) {

@@ -57,6 +57,19 @@ class UserPreferencesRepository(
             .apply()
     }
 
+    fun shouldShowCalibrationPrompt(): Boolean =
+        !preferences.getBoolean(KEY_CALIBRATION_PROMPT_HANDLED, false)
+
+    fun wasCalibrationSkipped(): Boolean =
+        preferences.getBoolean(KEY_CALIBRATION_SKIPPED, false)
+
+    fun markCalibrationPromptHandled(skipped: Boolean) {
+        preferences.edit()
+            .putBoolean(KEY_CALIBRATION_PROMPT_HANDLED, true)
+            .putBoolean(KEY_CALIBRATION_SKIPPED, skipped)
+            .apply()
+    }
+
     private fun Int.sanitizeTileSize(): Int = UpscaleParamsFactory.sanitizeTileSize(this)
 
     companion object {
@@ -65,6 +78,8 @@ class UserPreferencesRepository(
         private const val KEY_MANUAL_TILE_SIZE = "manual_tile_size"
         private const val KEY_LAST_AUTO_TILE_SIZE = "last_auto_tile_size"
         private const val KEY_DISABLED_EXTREME_GPU_KEYS = "disabled_extreme_gpu_keys"
+        private const val KEY_CALIBRATION_PROMPT_HANDLED = "calibration_prompt_handled"
+        private const val KEY_CALIBRATION_SKIPPED = "calibration_skipped"
 
         fun fromContext(context: Context): UserPreferencesRepository {
             return UserPreferencesRepository(

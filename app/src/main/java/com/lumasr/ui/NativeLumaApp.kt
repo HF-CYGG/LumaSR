@@ -364,7 +364,7 @@ private fun MiniRenderPreview(progress: Float) {
         progress = progress,
         currentTile = max(1, (progress * 32).toInt()),
         totalTiles = 32,
-        completedTileIndexes = (1..(progress * 32).toInt()).toSet(),
+        completedTiles = (progress * 32).toInt(),
         message = "Preview",
         estimatedRemainingMs = null
     )

@@ -38,7 +38,11 @@ void emit_progress(
         return;
     }
 
-    jmethodID method = env->GetMethodID(sink_class, "onProgress", "(IIIFLjava/lang/String;ZJJJJJJJZIIIII)V");
+    jmethodID method = env->GetMethodID(
+        sink_class,
+        "onProgress",
+        "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIII)V"
+    );
     env->DeleteLocalRef(sink_class);
     if (method == nullptr || env->ExceptionCheck()) {
         return;
@@ -66,9 +70,65 @@ void emit_progress(
         static_cast<jint>(performance.tileSize),
         static_cast<jint>(performance.cacheSize),
         static_cast<jint>(performance.retryCount),
-        static_cast<jint>(performance.regionIndex)
+        static_cast<jint>(performance.regionIndex),
+        static_cast<jlong>(performance.preprocessMs),
+        static_cast<jlong>(performance.uploadMs),
+        static_cast<jlong>(performance.inferenceMs),
+        static_cast<jlong>(performance.downloadMs),
+        static_cast<jlong>(performance.postprocessMs),
+        static_cast<jlong>(performance.encodeMs),
+        static_cast<jint>(performance.effectiveBackend),
+        static_cast<jint>(performance.effectivePrecision),
+        static_cast<jint>(performance.fallbackReason)
     );
     env->DeleteLocalRef(j_message);
+}
+
+bool read_runtime_control(
+    JNIEnv* env,
+    jobject progress_sink,
+    SuperResRuntimeInferenceControl& control
+) {
+    if (progress_sink == nullptr || env->ExceptionCheck()) {
+        return false;
+    }
+    jclass sink_class = env->GetObjectClass(progress_sink);
+    if (sink_class == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    const jmethodID method = env->GetMethodID(sink_class, "currentRuntimeControl", "()[I");
+    env->DeleteLocalRef(sink_class);
+    if (method == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+
+    jintArray values = static_cast<jintArray>(env->CallObjectMethod(progress_sink, method));
+    if (values == nullptr || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (values != nullptr) env->DeleteLocalRef(values);
+        return false;
+    }
+    const jsize value_count = env->GetArrayLength(values);
+    if (value_count < 3 || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(values);
+        return false;
+    }
+    jint raw[3] = {};
+    env->GetIntArrayRegion(values, 0, 3, raw);
+    env->DeleteLocalRef(values);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    control = sanitize_runtime_control(SuperResRuntimeInferenceControl{
+        static_cast<int>(raw[0]),
+        static_cast<int>(raw[1]),
+        raw[2] != 0
+    });
+    return true;
 }
 
 bool bitmap_to_rgb(JNIEnv* env, jobject bitmap, std::vector<unsigned char>& rgb, int& width, int& height) {
@@ -118,6 +178,154 @@ bool bitmap_to_rgb(JNIEnv* env, jobject bitmap, std::vector<unsigned char>& rgb,
     AndroidBitmap_unlockPixels(env, bitmap);
     return ok;
 }
+
+jobject box_nullable_int(
+    JNIEnv* env,
+    jclass integer_class,
+    jmethodID integer_value_of,
+    int value,
+    bool present
+) {
+    if (!present || env->ExceptionCheck()) {
+        return nullptr;
+    }
+    return env->CallStaticObjectMethod(
+        integer_class,
+        integer_value_of,
+        static_cast<jint>(value)
+    );
+}
+
+jstring new_nullable_string(JNIEnv* env, const std::string& value) {
+    if (value.empty() || env->ExceptionCheck()) {
+        return nullptr;
+    }
+    return env->NewStringUTF(value.c_str());
+}
+
+void delete_local_ref(JNIEnv* env, jobject reference) {
+    if (reference != nullptr) {
+        env->DeleteLocalRef(reference);
+    }
+}
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
+    JNIEnv* env,
+    jobject
+) {
+    SuperResNativeCapabilitySnapshot snapshot;
+    try {
+        snapshot = read_superres_native_capability_snapshot();
+    } catch (...) {
+        return nullptr;
+    }
+
+    jclass snapshot_class = nullptr;
+    jclass integer_class = nullptr;
+    jobject physical_cores = nullptr;
+    jobject big_cores = nullptr;
+    jobject little_cores = nullptr;
+    jobject rough_score = nullptr;
+    jstring gpu_vendor = nullptr;
+    jstring gpu_device = nullptr;
+    jstring gpu_driver = nullptr;
+    jobject result = nullptr;
+
+    do {
+        snapshot_class = env->FindClass("com/lumasr/data/NativeCapabilitySnapshot");
+        if (snapshot_class == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+        const jmethodID snapshot_constructor = env->GetMethodID(
+            snapshot_class,
+            "<init>",
+            "(Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;ZZZ)V"
+        );
+        if (snapshot_constructor == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+
+        integer_class = env->FindClass("java/lang/Integer");
+        if (integer_class == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+        const jmethodID integer_value_of = env->GetStaticMethodID(
+            integer_class,
+            "valueOf",
+            "(I)Ljava/lang/Integer;"
+        );
+        if (integer_value_of == nullptr || env->ExceptionCheck()) {
+            break;
+        }
+
+        physical_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.physicalCoreCount,
+            snapshot.physicalCoreCount > 0
+        );
+        big_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.bigCoreCount,
+            snapshot.bigCoreCount > 0
+        );
+        little_cores = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.littleCoreCount,
+            snapshot.littleCoreCount > 0
+        );
+        rough_score = box_nullable_int(
+            env,
+            integer_class,
+            integer_value_of,
+            snapshot.gpuRoughScore,
+            snapshot.gpuRoughScore >= 0
+        );
+        gpu_vendor = new_nullable_string(env, snapshot.gpuVendor);
+        gpu_device = new_nullable_string(env, snapshot.gpuDevice);
+        gpu_driver = new_nullable_string(env, snapshot.gpuDriverVersion);
+        if (env->ExceptionCheck()) {
+            break;
+        }
+
+        result = env->NewObject(
+            snapshot_class,
+            snapshot_constructor,
+            physical_cores,
+            big_cores,
+            little_cores,
+            gpu_vendor,
+            gpu_device,
+            gpu_driver,
+            rough_score,
+            snapshot.supportsVulkan ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsFp16Storage ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsFp16Arithmetic ? JNI_TRUE : JNI_FALSE
+        );
+    } while (false);
+
+    delete_local_ref(env, physical_cores);
+    delete_local_ref(env, big_cores);
+    delete_local_ref(env, little_cores);
+    delete_local_ref(env, rough_score);
+    delete_local_ref(env, gpu_vendor);
+    delete_local_ref(env, gpu_device);
+    delete_local_ref(env, gpu_driver);
+    delete_local_ref(env, integer_class);
+    delete_local_ref(env, snapshot_class);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    return result;
 }
 
 extern "C"
@@ -144,6 +352,12 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
     jint output_crop_height,
     jint retry_count,
     jint region_index,
+    jint native_backend,
+    jint inference_precision,
+    jint cpu_threads,
+    jint openmp_blocktime_ms,
+    jint command_batch_size,
+    jint model_cache_capacity,
     jobject progress_sink
 ) {
     SuperResNativeParams params{
@@ -165,11 +379,15 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
         static_cast<int>(output_crop_width),
         static_cast<int>(output_crop_height),
         static_cast<int>(retry_count),
-        static_cast<int>(region_index)
+        static_cast<int>(region_index),
+        static_cast<int>(native_backend),
+        static_cast<int>(inference_precision),
+        static_cast<int>(cpu_threads),
+        static_cast<int>(openmp_blocktime_ms),
+        static_cast<int>(command_batch_size),
+        static_cast<int>(model_cache_capacity)
     };
-    return static_cast<jint>(process_superres(
-        params,
-        [env, progress_sink](
+    const SuperResProgressCallback progress_callback = [env, progress_sink](
             SuperResNativeStage stage,
             int current_tile,
             int total_tiles,
@@ -178,8 +396,21 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
             const SuperResNativePerformance& performance
         ) {
             emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
+        };
+    const SuperResRuntimeControlCallback runtime_control = [
+        env,
+        progress_sink,
+        last_control = sanitize_runtime_control(
+            SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+        )
+    ]() mutable {
+        SuperResRuntimeInferenceControl next_control;
+        if (read_runtime_control(env, progress_sink, next_control)) {
+            last_control = next_control;
         }
-    ));
+        return last_control;
+    };
+    return static_cast<jint>(process_superres(params, progress_callback, runtime_control));
 }
 
 extern "C"
@@ -206,6 +437,12 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
     jint output_crop_height,
     jint retry_count,
     jint region_index,
+    jint native_backend,
+    jint inference_precision,
+    jint cpu_threads,
+    jint openmp_blocktime_ms,
+    jint command_batch_size,
+    jint model_cache_capacity,
     jobject progress_sink
 ) {
     std::vector<unsigned char> rgb;
@@ -234,15 +471,15 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
         static_cast<int>(output_crop_width),
         static_cast<int>(output_crop_height),
         static_cast<int>(retry_count),
-        static_cast<int>(region_index)
+        static_cast<int>(region_index),
+        static_cast<int>(native_backend),
+        static_cast<int>(inference_precision),
+        static_cast<int>(cpu_threads),
+        static_cast<int>(openmp_blocktime_ms),
+        static_cast<int>(command_batch_size),
+        static_cast<int>(model_cache_capacity)
     };
-    return static_cast<jint>(process_superres_rgb(
-        params,
-        width,
-        height,
-        rgb.data(),
-        rgb.size(),
-        [env, progress_sink](
+    const SuperResProgressCallback progress_callback = [env, progress_sink](
             SuperResNativeStage stage,
             int current_tile,
             int total_tiles,
@@ -251,7 +488,28 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
             const SuperResNativePerformance& performance
         ) {
             emit_progress(env, progress_sink, stage, current_tile, total_tiles, progress, message, performance);
+        };
+    const SuperResRuntimeControlCallback runtime_control = [
+        env,
+        progress_sink,
+        last_control = sanitize_runtime_control(
+            SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+        )
+    ]() mutable {
+        SuperResRuntimeInferenceControl next_control;
+        if (read_runtime_control(env, progress_sink, next_control)) {
+            last_control = next_control;
         }
+        return last_control;
+    };
+    return static_cast<jint>(process_superres_rgb(
+        params,
+        width,
+        height,
+        rgb.data(),
+        rgb.size(),
+        progress_callback,
+        runtime_control
     ));
 }
 

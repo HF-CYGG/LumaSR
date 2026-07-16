@@ -3,6 +3,8 @@
  */
 package com.lumasr.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
@@ -48,10 +50,12 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -104,6 +108,17 @@ fun MainScreen(viewModel: LumaViewModel) {
         route = currentRoute
     )
     var hasShownEditingBottomBar by remember { mutableStateOf(false) }
+    val documentSaveLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("image/png")
+    ) { destinationUri ->
+        val prompt = state.documentSavePrompt?.takeIf(DocumentSavePrompt::launched)
+            ?: return@rememberLauncherForActivityResult
+        if (destinationUri == null) {
+            viewModel.cancelDocumentSave(prompt.requestId)
+        } else {
+            viewModel.completeDocumentSave(prompt.requestId, destinationUri)
+        }
+    }
     val bottomBarEnterTransition = if (shouldAnimateBottomBarEnter(hasShownEditingBottomBar, showBottomBar)) {
         slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160))
     } else {
@@ -172,6 +187,30 @@ fun MainScreen(viewModel: LumaViewModel) {
                     .zIndex(2f)
             )
         }
+    }
+
+    LaunchedEffect(state.documentSavePrompt) {
+        val prompt = state.documentSavePrompt ?: return@LaunchedEffect
+        if (!prompt.launched) {
+            viewModel.markDocumentSaveLaunched(prompt.requestId)
+            runCatching { documentSaveLauncher.launch(prompt.displayName) }
+                .onFailure { viewModel.cancelDocumentSave(prompt.requestId) }
+        }
+    }
+    if (state.showCalibrationPrompt) {
+        AlertDialog(
+            onDismissRequest = viewModel::skipCalibrationPrompt,
+            title = { Text("启用安全高性能模式") },
+            text = {
+                Text("可选的本机校准仅使用应用生成的测试图，约 40 秒；不会读取或上传你的照片。")
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::runCalibration) { Text("开始校准") }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::skipCalibrationPrompt) { Text("暂不校准") }
+            }
+        )
     }
 }
 
@@ -401,6 +440,7 @@ private fun LumaNavHost(
                 onTtaChanged = viewModel::setTta,
                 onStart = viewModel::startProcessing,
                 onClearImage = viewModel::clearSelectedImage,
+                onResume = viewModel::resumeProcessing,
                 onCancel = viewModel::cancelProcessing
             )
         }
@@ -409,7 +449,8 @@ private fun LumaNavHost(
                 state = state,
                 onAccelerationChanged = viewModel::setAccelerationMode,
                 onTileSizeChanged = viewModel::setTileSize,
-                onTileSizeAutoSelected = viewModel::setTileSizeAuto
+                onTileSizeAutoSelected = viewModel::setTileSizeAuto,
+                onRunCalibration = viewModel::runCalibration
             )
         }
     }

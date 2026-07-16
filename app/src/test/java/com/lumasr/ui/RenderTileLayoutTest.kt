@@ -54,13 +54,47 @@ class RenderTileLayoutTest {
                 wholeTaskProgress = 0.45f,
                 currentTile = 3,
                 totalTiles = 8,
-                completedTileIndexes = setOf(1, 2, 3)
+                completedTiles = 3
             )
         )
 
         assertEquals(3, state.completedCount)
         assertEquals(4, state.activeIndex)
         assertEquals(3f / 8f, state.completedRatio, 0.001f)
+    }
+
+    @Test
+    fun visualStateClampsNegativeCompletedTilesToZero() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.PROCESSING_TILE,
+                wholeTaskProgress = 0.45f,
+                currentTile = 0,
+                totalTiles = 8,
+                completedTiles = -2
+            )
+        )
+
+        assertEquals(0, state.completedCount)
+        assertEquals(1, state.activeIndex)
+        assertEquals(0f, state.completedRatio, 0.001f)
+    }
+
+    @Test
+    fun visualStateClampsCompletedTilesToTotalTiles() {
+        val state = calculateRenderTileVisualState(
+            progress = progress(
+                stage = UpscaleStage.PROCESSING_TILE,
+                wholeTaskProgress = 0.45f,
+                currentTile = 8,
+                totalTiles = 8,
+                completedTiles = 10
+            )
+        )
+
+        assertEquals(8, state.completedCount)
+        assertEquals(null, state.activeIndex)
+        assertEquals(1f, state.completedRatio, 0.001f)
     }
 
     @Test
@@ -87,7 +121,7 @@ class RenderTileLayoutTest {
                 wholeTaskProgress = 0.96f,
                 currentTile = 8,
                 totalTiles = 8,
-                completedTileIndexes = (1..8).toSet()
+                completedTiles = 8
             )
         )
 
@@ -101,14 +135,14 @@ class RenderTileLayoutTest {
         wholeTaskProgress: Float,
         currentTile: Int,
         totalTiles: Int,
-        completedTileIndexes: Set<Int> = emptySet()
+        completedTiles: Int = 0
     ) = UpscaleProgress(
         taskId = "task",
         stage = stage,
         progress = wholeTaskProgress,
         currentTile = currentTile,
         totalTiles = totalTiles,
-        completedTileIndexes = completedTileIndexes,
+        completedTiles = completedTiles,
         message = "",
         estimatedRemainingMs = null
     )

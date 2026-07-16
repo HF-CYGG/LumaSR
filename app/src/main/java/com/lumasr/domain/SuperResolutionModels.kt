@@ -80,7 +80,13 @@ data class UpscaleParams(
     val retryCount: Int = 0,
     val regionIndex: Int = -1,
     val pipelinePasses: List<UpscaleParams> = emptyList(),
-    val pipelineLabel: String? = null
+    val pipelineLabel: String? = null,
+    val nativeBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
+    val inferencePrecision: InferencePrecision = InferencePrecision.FP32,
+    val cpuThreads: Int = 0,
+    val openmpBlocktimeMs: Int = 20,
+    val commandBatchSize: Int = 1,
+    val modelCacheCapacity: Int = 1
 )
 
 data class UpscalePipelinePlan(
@@ -107,7 +113,7 @@ data class UpscaleProgress(
     val progress: Float,
     val currentTile: Int,
     val totalTiles: Int,
-    val completedTileIndexes: Set<Int>,
+    val completedTiles: Int,
     val message: String,
     val estimatedRemainingMs: Long?,
     val performanceSnapshot: NativePerformanceSnapshot? = null
@@ -126,8 +132,23 @@ data class NativePerformanceSnapshot(
     val tileSize: Int,
     val cacheSize: Int = 0,
     val retryCount: Int = 0,
-    val regionIndex: Int = -1
+    val regionIndex: Int = -1,
+    val preprocessMs: Long = tileInputMs,
+    val uploadMs: Long = 0,
+    val inferenceMs: Long = tileExtractMs,
+    val downloadMs: Long = 0,
+    val postprocessMs: Long = tileCopyMs,
+    val encodeMs: Long = saveMs,
+    val effectiveBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
+    val effectivePrecision: InferencePrecision = InferencePrecision.FP32,
+    val fallbackReason: NativeFallbackReason? = null
 )
+
+enum class NativeFallbackReason {
+    LEGACY_SAFE_REQUIRES_FP32,
+    CPU_REQUIRES_FP32,
+    FP16_UNSUPPORTED
+}
 
 enum class UpscaleStage {
     PREPARING,
@@ -149,10 +170,41 @@ data class UpscaleResult(
     val message: String
 )
 
+data class RuntimeInferenceControl(
+    val commandBatchSize: Int,
+    val thermalHeadroomPercent: Int,
+    val shouldPause: Boolean
+) {
+    fun sanitized(): RuntimeInferenceControl = copy(
+        commandBatchSize = commandBatchSize.coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE),
+        thermalHeadroomPercent = thermalHeadroomPercent.coerceIn(
+            MIN_THERMAL_HEADROOM_PERCENT,
+            MAX_THERMAL_HEADROOM_PERCENT
+        )
+    )
+
+    private companion object {
+        const val MIN_COMMAND_BATCH_SIZE = 1
+        const val MAX_COMMAND_BATCH_SIZE = 8
+        const val MIN_THERMAL_HEADROOM_PERCENT = 0
+        const val MAX_THERMAL_HEADROOM_PERCENT = 25
+    }
+}
+
+fun interface RuntimeInferenceControlProvider {
+    fun current(): RuntimeInferenceControl
+}
+
 interface SuperResProcessor {
     suspend fun process(
         params: UpscaleParams,
         onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult = process(params, onProgress, runtimeControlProvider = null)
+
+    suspend fun process(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult
 
     fun cancel(taskId: String)

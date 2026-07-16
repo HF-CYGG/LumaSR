@@ -187,6 +187,7 @@ fun ProcessTabV2(
     onTtaChanged: (Boolean) -> Unit,
     onStart: () -> Unit,
     onClearImage: () -> Unit,
+    onResume: () -> Unit,
     onCancel: () -> Unit
 ) {
     val batchPhotoPicker = rememberImageBatchPicker(onPickImages)
@@ -198,7 +199,7 @@ fun ProcessTabV2(
             progress = 0f,
             currentTile = 0,
             totalTiles = 64,
-            completedTileIndexes = emptySet(),
+            completedTiles = 0,
             message = "Preparing native inference",
             estimatedRemainingMs = null
         )
@@ -300,6 +301,8 @@ fun ProcessTabV2(
                     progress = it,
                     batchIndex = state.activeBatchIndex,
                     batchSize = state.activeBatchSize,
+                    isPaused = state.processingPaused,
+                    onResume = onResume,
                     onCancel = onCancel
                 )
             }
@@ -1300,7 +1303,7 @@ private fun RenderTileOverlay(
     previewImage: ImageBitmap,
     modifier: Modifier = Modifier
 ) {
-    val visualState = remember(progress.stage, progress.currentTile, progress.totalTiles, progress.completedTileIndexes) {
+    val visualState = remember(progress.stage, progress.currentTile, progress.totalTiles, progress.completedTiles) {
         calculateRenderTileVisualState(progress)
     }
     val animatedProgress by animateFloatAsState(
@@ -1341,7 +1344,7 @@ private fun RenderTileOverlay(
         )
 
         tileRects
-            .filter { it.index <= completedCutoff || progress.completedTileIndexes.contains(it.index) }
+            .filter { it.index <= maxOf(completedCutoff, progress.completedTiles) }
             .forEach { tile ->
                 clipRect(left = tile.left, top = tile.top, right = tile.right, bottom = tile.bottom) {
                     drawImage(
@@ -1401,6 +1404,8 @@ private fun RenderStatusStrip(
     progress: UpscaleProgress,
     batchIndex: Int,
     batchSize: Int,
+    isPaused: Boolean,
+    onResume: () -> Unit,
     onCancel: () -> Unit
 ) {
     Surface(
@@ -1436,6 +1441,11 @@ private fun RenderStatusStrip(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+                if (shouldOfferProcessingResume(isPaused)) {
+                    TextButton(onClick = onResume) {
+                        Text("恢复")
+                    }
+                }
                 TextButton(onClick = onCancel) {
                     Icon(Icons.Rounded.Close, contentDescription = null)
                     Spacer(Modifier.width(4.dp))
@@ -1451,6 +1461,8 @@ private fun RenderStatusStrip(
         }
     }
 }
+
+internal fun shouldOfferProcessingResume(isPaused: Boolean): Boolean = isPaused
 
 @Composable
 fun CompareScreenV2(

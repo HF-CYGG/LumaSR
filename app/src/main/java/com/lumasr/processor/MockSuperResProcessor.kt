@@ -1,5 +1,6 @@
 package com.lumasr.processor
 
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
@@ -18,23 +19,27 @@ class MockSuperResProcessor(
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         cancelledTasks.remove(params.taskId)
-        emit(params, UpscaleStage.PREPARING, 0, emptySet(), "Preparing local image", onProgress)
-        emit(params, UpscaleStage.ANALYZING, 0, emptySet(), "Estimating tile budget", onProgress)
-        emit(params, UpscaleStage.LOADING_MODEL, 0, emptySet(), "Loading ${params.modelName}", onProgress)
+        emit(params, UpscaleStage.PREPARING, 0, 0, "Preparing local image", onProgress)
+        emit(params, UpscaleStage.ANALYZING, 0, 0, "Estimating tile budget", onProgress)
+        emit(params, UpscaleStage.LOADING_MODEL, 0, 0, "Loading ${params.modelName}", onProgress)
 
         val safeTileCount = max(1, tileCount)
-        val completedTiles = linkedSetOf<Int>()
+        var completedTiles = 0
         for (tileIndex in 1..safeTileCount) {
-            if (params.taskId in cancelledTasks) {
+            val shouldPause = runCatching {
+                runtimeControlProvider?.current()?.sanitized()?.shouldPause
+            }.getOrNull() == true
+            if (shouldPause || params.taskId in cancelledTasks) {
                 return cancelled(params, completedTiles, onProgress)
             }
 
             // The delay simulates per-tile native work and keeps cancellation boundaries observable.
             delay(delayMs)
-            completedTiles += tileIndex
+            completedTiles += 1
             emit(
                 params = params,
                 stage = UpscaleStage.PROCESSING_TILE,
@@ -77,10 +82,10 @@ class MockSuperResProcessor(
 
     private fun cancelled(
         params: UpscaleParams,
-        completedTiles: Set<Int>,
+        completedTiles: Int,
         onProgress: (UpscaleProgress) -> Unit
     ): UpscaleResult {
-        emit(params, UpscaleStage.CANCELLED, completedTiles.size, completedTiles, "Task cancelled", onProgress)
+        emit(params, UpscaleStage.CANCELLED, completedTiles, completedTiles, "Task cancelled", onProgress)
         cancelledTasks.remove(params.taskId)
         return UpscaleResult(
             taskId = params.taskId,
@@ -95,7 +100,7 @@ class MockSuperResProcessor(
         params: UpscaleParams,
         stage: UpscaleStage,
         currentTile: Int,
-        completedTiles: Set<Int>,
+        completedTiles: Int,
         message: String,
         onProgress: (UpscaleProgress) -> Unit
     ) {
@@ -117,7 +122,7 @@ class MockSuperResProcessor(
                 progress = progress.coerceIn(0f, 1f),
                 currentTile = currentTile,
                 totalTiles = totalTiles,
-                completedTileIndexes = completedTiles.toSet(),
+                completedTiles = completedTiles,
                 message = message,
                 estimatedRemainingMs = null
             )

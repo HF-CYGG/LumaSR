@@ -15,6 +15,7 @@ import com.lumasr.domain.ExtremeTileScheduler
 import com.lumasr.domain.NativeGpuHealthProbe
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.ProcessingResourceProfile
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
@@ -60,29 +61,29 @@ class HybridSuperResProcessor(
 
     override suspend fun process(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         return if (nativeAvailable()) {
             if (params.exportMode == ExportMode.EXTREME_SINGLE_PNG) {
-                processExtremeSinglePng(params, onProgress)
+                processExtremeSinglePng(params, onProgress, runtimeControlProvider)
             } else if (params.pipelinePasses.isNotEmpty()) {
-                processExplicitPipeline(params, onProgress)
+                processExplicitPipeline(params, onProgress, runtimeControlProvider)
             } else {
-                processSingleOrChainedPass(params, onProgress)
+                processSingleOrChainedPass(params, onProgress, runtimeControlProvider)
             }
         } else if (allowMockFallback) {
-            fallbackProcessor.process(params, onProgress).copy(
+            fallbackProcessor.process(params, onProgress, runtimeControlProvider).copy(
                 message = "Mock preview complete. Native inference is unavailable."
             )
         } else {
-            nativeProcessor.process(params, onProgress)
+            nativeProcessor.process(params, onProgress, runtimeControlProvider)
         }
     }
 
     override fun cancel(taskId: String) {
         if (nativeAvailable()) {
             nativeProcessor.cancel(taskId)
-            (nativeProcessor as? NativeCacheOwner)?.clearNativeCache()
         }
         if (allowMockFallback) fallbackProcessor.cancel(taskId)
     }
@@ -93,20 +94,22 @@ class HybridSuperResProcessor(
 
     private suspend fun processSingleOrChainedPass(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         val scalePlan = params.nativeScalePlan()
         return if (scalePlan.size == 1) {
-            nativeProcessor.process(params, onProgress)
+            nativeProcessor.process(params, onProgress, runtimeControlProvider)
         } else {
-            processChained(params, scalePlan, onProgress)
+            processChained(params, scalePlan, onProgress, runtimeControlProvider)
         }
     }
 
     private suspend fun processChained(
         params: UpscaleParams,
         scalePlan: List<Int>,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         var currentInput = params.inputPath
         val tempFiles = mutableListOf<File>()
@@ -131,9 +134,13 @@ class HybridSuperResProcessor(
                 outputCropHeight = if (isLastPass) params.outputCropHeight else 0,
                 pipelinePasses = emptyList()
             )
-            val result = nativeProcessor.process(passParams) { progress ->
-                onProgress(progress.asChainedProgress(index, scalePlan.size))
-            }
+            val result = nativeProcessor.process(
+                params = passParams,
+                onProgress = { progress ->
+                    onProgress(progress.asChainedProgress(index, scalePlan.size))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
             if (!result.success) {
                 tempFiles.forEach { it.delete() }
                 return result
@@ -160,15 +167,20 @@ class HybridSuperResProcessor(
 
     private suspend fun processExplicitPipeline(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         val passes = params.pipelinePasses
         val tempFiles = passes.dropLast(1).map { File(it.outputPath) }
 
         passes.forEachIndexed { index, pass ->
-            val result = processSingleOrChainedPass(pass) { progress ->
-                onProgress(progress.asChainedProgress(index, passes.size))
-            }
+            val result = processSingleOrChainedPass(
+                params = pass,
+                onProgress = { progress ->
+                    onProgress(progress.asChainedProgress(index, passes.size))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
             if (!result.success) {
                 tempFiles.forEach { it.delete() }
                 return result.copy(taskId = params.taskId)
@@ -189,7 +201,8 @@ class HybridSuperResProcessor(
 
     private suspend fun processExtremeSinglePng(
         params: UpscaleParams,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         val merger = nativeProcessor as? NativeRawTileMerger
             ?: return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Native PNG merger is unavailable.")
@@ -248,7 +261,8 @@ class HybridSuperResProcessor(
                             tileIndex = index,
                             tileCount = jobs.size,
                             retryCount = job.attempt,
-                            onProgress = onProgress
+                            onProgress = onProgress,
+                            runtimeControlProvider = runtimeControlProvider
                         )
                         if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
                             disableExtremeGpuForSession(params.extremeGpuKey())
@@ -262,7 +276,8 @@ class HybridSuperResProcessor(
                                 tileIndex = index,
                                 tileCount = jobs.size,
                                 retryCount = job.attempt,
-                                onProgress = onProgress
+                                onProgress = onProgress,
+                                runtimeControlProvider = runtimeControlProvider
                             )
                         }
                         if (!result.success) {
@@ -330,7 +345,8 @@ class HybridSuperResProcessor(
                                 tileIndex = index,
                                 tileCount = jobs.size,
                                 retryCount = job.attempt,
-                                onProgress = onProgress
+                                onProgress = onProgress,
+                                runtimeControlProvider = runtimeControlProvider
                             )
                             if (!result.success && accelerationDecision.allowGpuRetry && job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()) {
                                 disableExtremeGpuForSession(params.extremeGpuKey())
@@ -344,7 +360,8 @@ class HybridSuperResProcessor(
                                     tileIndex = index,
                                     tileCount = jobs.size,
                                     retryCount = job.attempt,
-                                    onProgress = onProgress
+                                    onProgress = onProgress,
+                                    runtimeControlProvider = runtimeControlProvider
                                 )
                             }
                             if (!result.success) {
@@ -403,30 +420,45 @@ class HybridSuperResProcessor(
         tileIndex: Int,
         tileCount: Int,
         retryCount: Int,
-        onProgress: (UpscaleProgress) -> Unit
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
         if (bitmapRegionProcessor != null && tileParams.pipelinePasses.isEmpty()) {
-            return bitmapRegionProcessor.processBitmapRegion(tileParams, regionBitmap) { progress ->
-                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
-            }
+            return bitmapRegionProcessor.processBitmapRegion(
+                params = tileParams,
+                bitmap = regionBitmap,
+                onProgress = { progress ->
+                    onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
         }
         if (bitmapRegionProcessor != null && tileParams.pipelinePasses.isNotEmpty()) {
             return processExplicitPipelineWithBitmapRegionFirstPass(
                 params = tileParams,
                 bitmap = regionBitmap,
-                bitmapRegionProcessor = bitmapRegionProcessor
+                bitmapRegionProcessor = bitmapRegionProcessor,
+                runtimeControlProvider = runtimeControlProvider
             ) { progress ->
                 onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
             }
         }
         return if (tileParams.pipelinePasses.isNotEmpty()) {
-            processExplicitPipeline(tileParams) { progress ->
-                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
-            }
+            processExplicitPipeline(
+                params = tileParams,
+                onProgress = { progress ->
+                    onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
         } else {
-            processSingleOrChainedPass(tileParams) { progress ->
-                onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
-            }
+            processSingleOrChainedPass(
+                params = tileParams,
+                onProgress = { progress ->
+                    onProgress(progress.asExtremeTileProgress(tileIndex, tileCount, retryCount))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
         }
     }
 
@@ -434,22 +466,37 @@ class HybridSuperResProcessor(
         params: UpscaleParams,
         bitmap: Bitmap?,
         bitmapRegionProcessor: NativeBitmapRegionProcessor,
+        runtimeControlProvider: RuntimeInferenceControlProvider?,
         onProgress: (UpscaleProgress) -> Unit
     ): UpscaleResult {
         val passes = params.pipelinePasses
-        val firstPass = passes.firstOrNull() ?: return bitmapRegionProcessor.processBitmapRegion(params, bitmap, onProgress)
+        val firstPass = passes.firstOrNull() ?: return bitmapRegionProcessor.processBitmapRegion(
+            params,
+            bitmap,
+            onProgress,
+            runtimeControlProvider
+        )
 
-        val firstResult = bitmapRegionProcessor.processBitmapRegion(firstPass, bitmap) { progress ->
-            onProgress(progress.asChainedProgress(0, passes.size))
-        }
+        val firstResult = bitmapRegionProcessor.processBitmapRegion(
+            params = firstPass,
+            bitmap = bitmap,
+            onProgress = { progress ->
+                onProgress(progress.asChainedProgress(0, passes.size))
+            },
+            runtimeControlProvider = runtimeControlProvider
+        )
         if (!firstResult.success) {
             return firstResult.copy(taskId = params.taskId)
         }
 
         passes.drop(1).forEachIndexed { index, pass ->
-            val result = processSingleOrChainedPass(pass) { progress ->
-                onProgress(progress.asChainedProgress(index + 1, passes.size))
-            }
+            val result = processSingleOrChainedPass(
+                params = pass,
+                onProgress = { progress ->
+                    onProgress(progress.asChainedProgress(index + 1, passes.size))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
             if (!result.success) {
                 return result.copy(taskId = params.taskId)
             }
@@ -739,7 +786,7 @@ private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: 
     progress = value,
     currentTile = 1,
     totalTiles = 1,
-    completedTileIndexes = setOf(1),
+    completedTiles = 1,
     message = message,
     estimatedRemainingMs = null
 )

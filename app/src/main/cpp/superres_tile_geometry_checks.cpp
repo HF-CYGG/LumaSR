@@ -5,6 +5,8 @@ namespace {
 static_assert(output_pixels_within_budget(589, 1280, 4));
 static_assert(!output_pixels_within_budget(589, 1280, 16));
 static_assert(!output_pixels_within_budget(2147483647, 2, 2));
+static_assert(safe_mul_leq(512, 4, kMaxIntDimension));
+static_assert(!safe_mul_leq(kMaxIntDimension, 2, kMaxIntDimension));
 
 constexpr TileInputRegion kCunetInterior = make_waifu2x_tile_region(
     2,
@@ -203,6 +205,32 @@ constexpr CroppedCopyWindow kOutsideCropWindow = resolve_cropped_copy_window(
 );
 
 static_assert(!kOutsideCropWindow.valid);
+constexpr CroppedCopyWindow kOverflowingDestinationWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    2147483646,
+    2147483646,
+    4,
+    4,
+    0,
+    0,
+    64,
+    64
+);
+static_assert(!kOverflowingDestinationWindow.valid);
+constexpr CroppedCopyWindow kOverflowingCropWindow = resolve_cropped_copy_window(
+    0,
+    0,
+    0,
+    0,
+    64,
+    64,
+    2147483646,
+    2147483646,
+    4,
+    4
+);
+static_assert(!kOverflowingCropWindow.valid);
 static_assert(should_retry_cpu_after_gpu_code(0, 8));
 static_assert(should_retry_cpu_after_gpu_code(0, 9));
 static_assert(!should_retry_cpu_after_gpu_code(1, 9));

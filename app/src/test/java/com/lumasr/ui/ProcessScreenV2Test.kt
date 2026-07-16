@@ -26,6 +26,12 @@ class ProcessScreenV2Test {
     }
 
     @Test
+    fun pausedProcessingOffersResumeWithoutRemovingCancel() {
+        assertTrue(shouldOfferProcessingResume(isPaused = true))
+        assertFalse(shouldOfferProcessingResume(isPaused = false))
+    }
+
+    @Test
     fun keepsStartButtonAboveFloatingBottomNavigationWhenScrolledToEnd() {
         assertTrue(ProcessSheetBottomSpacerDp in 128..160)
     }

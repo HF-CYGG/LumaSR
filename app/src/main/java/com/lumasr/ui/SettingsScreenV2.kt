@@ -17,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Tune
@@ -52,6 +53,7 @@ fun SettingsScreenV2(
     onAccelerationChanged: (AccelerationMode) -> Unit,
     onTileSizeChanged: (Int) -> Unit,
     onTileSizeAutoSelected: () -> Unit,
+    onRunCalibration: () -> Unit,
     appVersionLabel: String? = null
 ) {
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
@@ -88,6 +90,13 @@ fun SettingsScreenV2(
                 onClick = {
                     onAccelerationChanged(if (gpuEnabled) AccelerationMode.CPU else AccelerationMode.AUTO)
                 }
+            )
+            SettingsClickableRowV2(
+                icon = Icons.Rounded.Memory,
+                title = "本机性能校准",
+                subtitle = calibrationStatusText(state.calibrationStatus),
+                enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                onClick = onRunCalibration
             )
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
@@ -209,13 +218,14 @@ private fun SettingsClickableRowV2(
     icon: ImageVector,
     title: String,
     subtitle: String,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     SettingsRowFrame(
         icon = icon,
         title = title,
         subtitle = subtitle,
-        modifier = Modifier.clickable(onClick = onClick)
+        modifier = Modifier.clickable(enabled = enabled, onClick = onClick)
     )
 }
 

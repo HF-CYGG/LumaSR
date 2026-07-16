@@ -432,7 +432,7 @@ private fun RenderScreen(
         progress = 0f,
         currentTile = 0,
         totalTiles = 80,
-        completedTileIndexes = emptySet(),
+        completedTiles = 0,
         message = "Preparing native inference",
         estimatedRemainingMs = null
     )
@@ -582,7 +582,7 @@ fun RenderTileCanvas(progress: UpscaleProgress, modifier: Modifier = Modifier) {
             val left = column * tileWidth + 2.dp.toPx()
             val top = row * tileHeight + 2.dp.toPx()
             val isVisibleTile = index <= totalTiles
-            val isDone = progress.completedTileIndexes.contains(index) || index <= (animatedProgress * totalTiles).toInt()
+            val isDone = index <= maxOf(progress.completedTiles, (animatedProgress * totalTiles).toInt())
             val isRunning = index == progress.currentTile && progress.stage == UpscaleStage.PROCESSING_TILE
             val color = when {
                 !isVisibleTile -> Color.Transparent
