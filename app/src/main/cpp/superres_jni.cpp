@@ -1,4 +1,5 @@
 #include "superres_engine.h"
+#include "superres_extreme_session.h"
 #include "superres_jni_safety.h"
 
 #include <android/bitmap.h>
@@ -717,6 +718,216 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
             runtime_control
         ));
     }));
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_beginExtremePngSessionNative(
+    JNIEnv* env,
+    jobject,
+    jstring task_id,
+    jstring output_path,
+    jint output_width,
+    jint output_height,
+    jint maximum_band_height,
+    jintArray tile_configs
+) {
+    if (env == nullptr || task_id == nullptr || output_path == nullptr ||
+        tile_configs == nullptr) {
+        return 0;
+    }
+    uint64_t handle = 0u;
+    try {
+        throw_if_superres_jni_exception_pending(env);
+        const jsize flat_count = env->GetArrayLength(tile_configs);
+        throw_if_superres_jni_exception_pending(env);
+        constexpr size_t kTileStride = 5u;
+        if (flat_count <= 0 || flat_count % static_cast<jsize>(kTileStride) != 0) {
+            return 0;
+        }
+        const size_t tile_count = static_cast<size_t>(flat_count) / kTileStride;
+        size_t checked_flat_count = 0;
+        if (!checked_extreme_tile_config_array_length(
+                tile_count,
+                kTileStride,
+                checked_flat_count
+            ) || checked_flat_count != static_cast<size_t>(flat_count)) {
+            return 0;
+        }
+
+        std::vector<jint> flat(checked_flat_count);
+        env->GetIntArrayRegion(tile_configs, 0, flat_count, flat.data());
+        throw_if_superres_jni_exception_pending(env);
+        std::vector<SuperResExtremePngTile> tiles;
+        tiles.reserve(tile_count);
+        for (size_t index = 0; index < tile_count; ++index) {
+            const size_t base = index * kTileStride;
+            tiles.push_back(SuperResExtremePngTile{
+                static_cast<int>(flat[base]),
+                static_cast<int>(flat[base + 1u]),
+                static_cast<int>(flat[base + 2u]),
+                static_cast<int>(flat[base + 3u]),
+                static_cast<int>(flat[base + 4u])
+            });
+        }
+        handle = begin_extreme_png_session(
+            to_string(env, task_id),
+            to_string(env, output_path),
+            static_cast<int>(output_width),
+            static_cast<int>(output_height),
+            static_cast<int>(maximum_band_height),
+            tiles
+        );
+        throw_if_superres_jni_exception_pending(env);
+        if (handle == 0u ||
+            handle > static_cast<uint64_t>(std::numeric_limits<jlong>::max())) {
+            abort_extreme_png_session(handle);
+            return 0;
+        }
+        return static_cast<jlong>(handle);
+    } catch (...) {
+        if (handle != 0u) {
+            abort_extreme_png_session(handle);
+        }
+        clear_superres_jni_exception_if_pending(env);
+        return 0;
+    }
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_processExtremePngSessionBitmapNative(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jobject bitmap,
+    jint engine_type,
+    jstring model_dir,
+    jstring model_file_base,
+    jint scale,
+    jint noise,
+    jint tile_size,
+    jint gpu_headroom_percent,
+    jint acceleration_mode,
+    jboolean tta,
+    jint output_mode,
+    jint output_crop_left,
+    jint output_crop_top,
+    jint output_crop_width,
+    jint output_crop_height,
+    jint retry_count,
+    jint region_index,
+    jint native_backend,
+    jint inference_precision,
+    jint cpu_threads,
+    jint openmp_blocktime_ms,
+    jint command_batch_size,
+    jint model_cache_capacity,
+    jobject progress_sink
+) {
+    return static_cast<jint>(run_superres_bitmap_jni_boundary(env, [&]() -> int {
+        if (handle <= 0) {
+            return static_cast<int>(SuperResNativeCode::InvalidParams);
+        }
+        SuperResRgbImage image;
+        const SuperResNativeCode conversionCode = bitmap_to_rgb(env, bitmap, image);
+        if (conversionCode != SuperResNativeCode::Ok) {
+            return static_cast<int>(conversionCode);
+        }
+        SuperResNativeParams params{
+            "",
+            "",
+            "",
+            static_cast<int>(engine_type),
+            to_string(env, model_dir),
+            to_string(env, model_file_base),
+            static_cast<int>(scale),
+            static_cast<int>(noise),
+            static_cast<int>(tile_size),
+            static_cast<int>(gpu_headroom_percent),
+            static_cast<int>(acceleration_mode),
+            tta == JNI_TRUE,
+            static_cast<int>(output_mode),
+            static_cast<int>(output_crop_left),
+            static_cast<int>(output_crop_top),
+            static_cast<int>(output_crop_width),
+            static_cast<int>(output_crop_height),
+            static_cast<int>(retry_count),
+            static_cast<int>(region_index),
+            static_cast<int>(native_backend),
+            static_cast<int>(inference_precision),
+            static_cast<int>(cpu_threads),
+            static_cast<int>(openmp_blocktime_ms),
+            static_cast<int>(command_batch_size),
+            static_cast<int>(model_cache_capacity)
+        };
+        const SuperResProgressCallback progress_callback = [env, progress_sink](
+            SuperResNativeStage stage,
+            int current_tile,
+            int total_tiles,
+            float progress,
+            const std::string& message,
+            const SuperResNativePerformance& performance
+        ) {
+            emit_progress(
+                env,
+                progress_sink,
+                stage,
+                current_tile,
+                total_tiles,
+                progress,
+                message,
+                performance
+            );
+        };
+        const SuperResRuntimeControlCallback runtime_control = [
+            env,
+            progress_sink,
+            last_control = sanitize_runtime_control(
+                SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false, 1}
+            )
+        ]() mutable {
+            SuperResRuntimeInferenceControl next_control;
+            if (read_runtime_control(env, progress_sink, next_control)) {
+                last_control = next_control;
+            }
+            return last_control;
+        };
+        return static_cast<int>(process_extreme_png_session_rgb(
+            static_cast<uint64_t>(handle),
+            params,
+            std::move(image),
+            progress_callback,
+            runtime_control
+        ));
+    }));
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_finishExtremePngSessionNative(
+    JNIEnv* env,
+    jobject,
+    jlong handle
+) {
+    return static_cast<jint>(run_superres_process_jni_boundary(env, [handle]() {
+        return handle > 0
+            ? static_cast<int>(finish_extreme_png_session(static_cast<uint64_t>(handle)))
+            : static_cast<int>(SuperResNativeCode::InvalidParams);
+    }));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_abortExtremePngSessionNative(
+    JNIEnv* env,
+    jobject,
+    jlong handle
+) {
+    clear_superres_jni_exception_if_pending(env);
+    if (handle > 0) {
+        abort_extreme_png_session(static_cast<uint64_t>(handle));
+    }
 }
 
 extern "C"

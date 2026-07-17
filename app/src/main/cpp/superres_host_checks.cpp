@@ -1,4 +1,5 @@
 #include "superres_host_checks.h"
+#include "superres_extreme_session_checks.h"
 #include "superres_ncnn_stage_contract_checks.h"
 #include "superres_pipeline_internal_checks.h"
 #include "superres_rgb_output_target_checks.h"
@@ -606,7 +607,8 @@ bool bitmap_unlock_guard_check() {
 } // namespace
 
 bool run_superres_host_runtime_checks() {
-    return run_superres_ncnn_stage_contract_runtime_checks() &&
+    return run_superres_extreme_session_runtime_checks() &&
+           run_superres_ncnn_stage_contract_runtime_checks() &&
            run_superres_pipeline_internal_runtime_checks() &&
            run_rgb_output_target_runtime_checks() &&
            run_superres_rgb_transport_runtime_checks() &&

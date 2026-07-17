@@ -2,6 +2,7 @@
 #include "superres_engine.h"
 #include "superres_d4_tta_ncnn.h"
 #include "superres_execution_profile.h"
+#include "superres_extreme_session.h"
 #include "superres_atomic_publish.h"
 #include "superres_output_finalizer.h"
 #include "superres_pixel_io.h"
@@ -56,6 +57,7 @@ constexpr int kNativeOutputRawCroppedRgbTile = 1;
 std::mutex gpu_mutex;
 std::mutex net_cache_mutex;
 SuperResTaskRegistry task_registry;
+SuperResExtremeSessionHandleRegistry extreme_session_registry;
 SuperResGpuInitState gpu_init_state = SuperResGpuInitState::Uninitialized;
 
 struct ModelFiles {
@@ -1466,6 +1468,109 @@ NcnnStageRunResult run_ncnn_stage(
     };
 }
 
+SuperResNativeCode run_ncnn_image_to_extreme_target(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    bool useVulkan,
+    const SuperResRgbImage& image,
+    RgbOutputTarget& output
+) {
+    static const bool executionProfileChecksPass = run_execution_profile_runtime_checks();
+    static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
+    static const bool rgbImageChecksPass = run_superres_rgb_image_runtime_checks();
+    if (!executionProfileChecksPass || !rgbImageChecksPass) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    if (!pixelIoChecksPass) {
+        return SuperResNativeCode::Unsupported;
+    }
+    if (!image.valid() || params.outputCropLeft < 0 || params.outputCropTop < 0 ||
+        params.outputCropWidth <= 0 || params.outputCropHeight <= 0) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    if (read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause ||
+        is_cancelled(params.taskId)) {
+        return SuperResNativeCode::Cancelled;
+    }
+
+    const ModelFiles files = select_model_files(params);
+    if (!is_regular_file(files.paramPath) || !is_regular_file(files.binPath)) {
+        return SuperResNativeCode::ModelMissing;
+    }
+    if (!useVulkan && params.engineType == kEngineRealEsrgan &&
+        is_large_realesrgan_model_base(params.modelFileBase.c_str())) {
+        return SuperResNativeCode::OutOfMemory;
+    }
+    if (params.tta) {
+        static const bool d4RuntimeChecksPass = run_d4_tta_runtime_checks();
+        if (!d4RuntimeChecksPass) {
+            return SuperResNativeCode::TileOutputMismatch;
+        }
+    }
+    if (!output_pixels_within_budget(image.width(), image.height(), params.scale)) {
+        return SuperResNativeCode::OutOfMemory;
+    }
+
+    std::unique_lock<std::mutex> gpuLock(gpu_mutex, std::defer_lock);
+    if (useVulkan) {
+        gpuLock.lock();
+        if (!ensure_gpu_instance()) {
+            return SuperResNativeCode::VulkanFailed;
+        }
+    }
+
+    emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
+    const SuperResExecutionProfile executionProfile = resolve_execution_profile(params, useVulkan);
+    SuperResNativePerformance performance;
+    performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
+    performance.effectiveBackend = static_cast<int>(executionProfile.effectiveBackend);
+    performance.effectivePrecision = static_cast<int>(executionProfile.effectivePrecision);
+    performance.fallbackReason = static_cast<int>(executionProfile.fallbackReason);
+    performance.retryCount = params.retryCount;
+    performance.regionIndex = params.regionIndex;
+    const auto modelLoadStart = std::chrono::steady_clock::now();
+    LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
+    performance.modelLoadMs = elapsed_ms(modelLoadStart);
+    performance.cacheHit = loadedNet.cacheHit;
+    performance.cacheSize = cached_net_count();
+    if (!loadedNet.net) {
+        return SuperResNativeCode::ModelMissing;
+    }
+
+    const SuperResNcnnStageGeometry geometry = resolve_superres_ncnn_stage_geometry(
+        image.width(),
+        image.height(),
+        params.scale,
+        params.tileSize,
+        SuperResNcnnStageCrop{
+            true,
+            params.outputCropLeft,
+            params.outputCropTop,
+            params.outputCropWidth,
+            params.outputCropHeight
+        }
+    );
+    if (geometry.status != SuperResNcnnStageGeometryStatus::Ok) {
+        return geometry.status == SuperResNcnnStageGeometryStatus::OutputTooLarge
+            ? SuperResNativeCode::OutOfMemory
+            : SuperResNativeCode::InvalidParams;
+    }
+    return run_ncnn_stage(
+        params,
+        onProgress,
+        runtimeControl,
+        useVulkan,
+        image,
+        files,
+        *loadedNet.net,
+        executionProfile,
+        geometry,
+        output,
+        performance
+    ).code;
+}
+
 SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
@@ -2275,6 +2380,150 @@ SuperResNativeCode process_superres_rgb(
         onProgress,
         runtimeControl
     );
+}
+
+uint64_t begin_extreme_png_session(
+    const std::string& taskId,
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    int maximumBandHeight,
+    const std::vector<SuperResExtremePngTile>& tiles
+) {
+    try {
+        std::vector<SuperResExtremeTileConfig> configs;
+        configs.reserve(tiles.size());
+        for (const SuperResExtremePngTile& tile : tiles) {
+            configs.push_back(SuperResExtremeTileConfig{
+                tile.index,
+                tile.outputX,
+                tile.outputY,
+                tile.outputWidth,
+                tile.outputHeight
+            });
+        }
+
+        SuperResExtremeSessionDependencies dependencies;
+        dependencies.makeOutput = []() { return make_streaming_png_output(); };
+        dependencies.registerTask = [](const std::string& value) {
+            return task_registry.register_task(value);
+        };
+        dependencies.completeTask = [](const std::string& value) {
+            task_registry.complete_task(value);
+        };
+        dependencies.consumeCancelled = [](const std::string& value) {
+            return is_cancelled(value);
+        };
+        dependencies.publishOutput = [](
+            SuperResStagedOutput& staged,
+            const std::string& value
+        ) {
+            return staged.publish_or_cancel(task_registry, value);
+        };
+
+        SuperResNativeCode beginCode = SuperResNativeCode::InvalidParams;
+        std::unique_ptr<SuperResExtremePngSession> created =
+            SuperResExtremePngSession::create(
+                SuperResExtremeSessionConfig{
+                    taskId,
+                    outputPath,
+                    outputWidth,
+                    outputHeight,
+                    maximumBandHeight,
+                    std::move(configs)
+                },
+                std::move(dependencies),
+                beginCode
+            );
+        if (created == nullptr || beginCode != SuperResNativeCode::Ok) {
+            return 0u;
+        }
+        std::shared_ptr<SuperResExtremePngSession> session(std::move(created));
+        const uint64_t handle = extreme_session_registry.insert(session);
+        if (handle == 0u) {
+            session->abort();
+        }
+        return handle;
+    } catch (...) {
+        return 0u;
+    }
+}
+
+SuperResNativeCode process_extreme_png_session_rgb(
+    uint64_t handle,
+    const SuperResNativeParams& params,
+    SuperResRgbImage image,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+) {
+    std::shared_ptr<SuperResExtremePngSession> session =
+        extreme_session_registry.find(handle);
+    if (session == nullptr || !image.valid()) {
+        return SuperResNativeCode::InvalidParams;
+    }
+
+    SuperResNativeParams normalized = params;
+    normalized.taskId = session->task_id();
+    normalized.inputPath.clear();
+    normalized.outputPath.clear();
+    normalized.outputMode = kNativeOutputRawCroppedRgbTile;
+    return session->process_tile(
+        normalized.regionIndex,
+        normalized.outputCropWidth,
+        normalized.outputCropHeight,
+        [&](const SuperResExtremeTileConfig&, RgbOutputTarget& output) {
+            const bool vulkanRequested =
+                normalized.accelerationMode == kAccelerationVulkan ||
+                normalized.accelerationMode == kAccelerationAuto;
+            const bool forceCpu = vulkanRequested &&
+                should_force_cpu_before_vulkan_model_load(normalized.engineType);
+            SuperResNativeCode code = run_ncnn_image_to_extreme_target(
+                normalized,
+                onProgress,
+                runtimeControl,
+                vulkanRequested && !forceCpu,
+                image,
+                output
+            );
+            if (vulkanRequested && !forceCpu &&
+                normalized.accelerationMode != kAccelerationVulkan &&
+                should_retry_cpu_after_gpu_code(
+                    normalized.accelerationMode,
+                    static_cast<int>(code)
+                )) {
+                code = run_ncnn_image_to_extreme_target(
+                    normalized,
+                    onProgress,
+                    runtimeControl,
+                    false,
+                    image,
+                    output
+                );
+            }
+            return code;
+        }
+    );
+}
+
+SuperResNativeCode finish_extreme_png_session(uint64_t handle) {
+    std::shared_ptr<SuperResExtremePngSession> session =
+        extreme_session_registry.find(handle);
+    if (session == nullptr) {
+        return SuperResNativeCode::InvalidParams;
+    }
+    const SuperResNativeCode code = session->finish();
+    if (session->terminal()) {
+        (void)extreme_session_registry.remove(handle);
+    }
+    return code;
+}
+
+void abort_extreme_png_session(uint64_t handle) {
+    std::shared_ptr<SuperResExtremePngSession> session =
+        extreme_session_registry.remove(handle);
+    if (session != nullptr) {
+        session->abort();
+    }
 }
 
 void cancel_superres(const std::string& taskId) {

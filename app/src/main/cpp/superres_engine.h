@@ -71,6 +71,14 @@ struct SuperResRawTile {
     int height;
 };
 
+struct SuperResExtremePngTile {
+    int index;
+    int outputX;
+    int outputY;
+    int outputWidth;
+    int outputHeight;
+};
+
 // This snapshot is delivered before final-path publication so JNI callback failure cannot leave a
 // successful-looking output. saveMs/encodeMs include complete staging-file creation; totalMs ends
 // before the callback and atomic rename. Native post-publish logs carry publishMs/actualTotalMs.
@@ -157,3 +165,20 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
     int outputHeight,
     const std::vector<SuperResRawTile>& tiles
 );
+uint64_t begin_extreme_png_session(
+    const std::string& taskId,
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    int maximumBandHeight,
+    const std::vector<SuperResExtremePngTile>& tiles
+);
+SuperResNativeCode process_extreme_png_session_rgb(
+    uint64_t handle,
+    const SuperResNativeParams& params,
+    SuperResRgbImage image,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
+SuperResNativeCode finish_extreme_png_session(uint64_t handle);
+void abort_extreme_png_session(uint64_t handle);

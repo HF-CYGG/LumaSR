@@ -17,6 +17,7 @@ if(NOT ANDROID)
     endif()
     add_executable(superres_rgb_image_checks_host
         superres_atomic_publish.cpp
+        superres_extreme_session.cpp
         superres_output_finalizer.cpp
         superres_pipeline_internal.cpp
         superres_process_internal.cpp
@@ -27,6 +28,7 @@ if(NOT ANDROID)
         superres_stbi_decode.cpp
         superres_task_registry.cpp
         superres_rgb_image_checks.cpp
+        superres_extreme_session_checks.cpp
         superres_rgb_output_target_checks.cpp
         superres_rgb_transport_checks.cpp
         superres_pipeline_internal_checks.cpp
@@ -58,10 +60,12 @@ endif()
 
 add_library(localsr SHARED
     superres_jni.cpp
+    superres_extreme_session.cpp
     superres_engine.cpp
     superres_process_internal.cpp
     superres_rgb_image.cpp
     superres_rgb_image_checks.cpp
+    superres_extreme_session_checks.cpp
     superres_rgb_output_target.cpp
     superres_rgb_output_target_writer.cpp
     superres_rgb_output_target_checks.cpp

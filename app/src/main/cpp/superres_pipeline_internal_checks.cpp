@@ -375,6 +375,61 @@ bool later_stage_failure_does_not_replay_completed_stage_check() {
     ) == SuperResNativeCode::OutOfMemory && firstStageRuns == 1 && secondStageRuns == 1;
 }
 
+bool later_stage_auto_retry_does_not_replay_completed_stage_check() {
+    DependencyCounters counters;
+    SuperResRgbPipelineDependencies dependencies = base_dependencies(counters);
+    int firstStageRuns = 0;
+    int secondStageRuns = 0;
+    std::vector<bool> secondStageBackends;
+    dependencies.runStage = [
+        &counters,
+        &firstStageRuns,
+        &secondStageRuns,
+        &secondStageBackends
+    ](
+        const SuperResNativeParams&,
+        const SuperResRgbImage&,
+        bool useVulkan,
+        bool finalStage,
+        size_t stageIndex,
+        size_t
+    ) {
+        ++counters.attempts;
+        if (stageIndex == 0u) {
+            ++firstStageRuns;
+            return SuperResRgbPipelineStageAttempt{
+                SuperResNativeCode::Ok,
+                make_image(1, 1)
+            };
+        }
+        ++secondStageRuns;
+        secondStageBackends.push_back(useVulkan);
+        if (!finalStage) {
+            return SuperResRgbPipelineStageAttempt{
+                SuperResNativeCode::TileOutputMismatch,
+                {}
+            };
+        }
+        return SuperResRgbPipelineStageAttempt{
+            useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Ok,
+            {}
+        };
+    };
+    const std::vector<SuperResNativeParams> passes{
+        make_pass("root-task", 1, 2),
+        make_pass("root-task", 1, 0)
+    };
+    return process_superres_rgb_pipeline_internal(
+        "root-task",
+        passes,
+        16u * kMiB,
+        dependencies
+    ) == SuperResNativeCode::Ok && firstStageRuns == 1 && secondStageRuns == 2 &&
+        secondStageBackends == std::vector<bool>({true, false}) &&
+        counters.attempts == 3 && counters.fallbacks == 1 &&
+        counters.registrations == 1 && counters.completions == 1;
+}
+
 bool explicit_vulkan_and_stop_do_not_retry_or_fallback_check() {
     DependencyCounters vulkanCounters;
     SuperResRgbPipelineDependencies vulkan = base_dependencies(vulkanCounters);
@@ -435,5 +490,6 @@ bool run_superres_pipeline_internal_runtime_checks() {
         runtime_failure_never_becomes_preflight_fallback_check() &&
         partial_gpu_output_is_released_before_cpu_retry_check() &&
         later_stage_failure_does_not_replay_completed_stage_check() &&
+        later_stage_auto_retry_does_not_replay_completed_stage_check() &&
         explicit_vulkan_and_stop_do_not_retry_or_fallback_check();
 }
