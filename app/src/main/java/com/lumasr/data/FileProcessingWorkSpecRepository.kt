@@ -35,6 +35,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
 
 class FileProcessingWorkSpecRepository(
@@ -142,6 +143,7 @@ private object ProcessingWorkSpecJson {
     fun encode(workSpec: ProcessingWorkSpec): String = buildJsonObject {
         put("schemaVersion", SCHEMA_VERSION)
         put("modelId", workSpec.modelId)
+        put("outputPixels", workSpec.outputPixels)
         put("params", encodeParams(workSpec.params))
     }.toString()
 
@@ -150,7 +152,8 @@ private object ProcessingWorkSpecJson {
         check(record.requiredInt("schemaVersion") == SCHEMA_VERSION) { "Unsupported work spec schema" }
         return ProcessingWorkSpec.fromParams(
             modelId = record.requiredString("modelId"),
-            params = decodeParams(record.getValue("params").jsonObject)
+            params = decodeParams(record.getValue("params").jsonObject),
+            outputPixels = record.optionalLong("outputPixels")
         )
     }
 
@@ -234,4 +237,12 @@ private object ProcessingWorkSpecJson {
         ?.takeUnless { it is JsonNull }
         ?.jsonPrimitive
         ?.contentOrNull
+
+    private fun JsonObject.optionalLong(key: String): Long? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(!it.isString) { "$key must be a JSON number or null" } }
+            .long
+    }
 }

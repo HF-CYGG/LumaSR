@@ -423,7 +423,11 @@ class LumaViewModel(
                     )
                     ProcessingTaskSubmission(
                         task = task,
-                        workSpec = ProcessingWorkSpec.fromParams(model.id, params)
+                        workSpec = ProcessingWorkSpec.fromParams(
+                            modelId = model.id,
+                            params = params,
+                            outputPixels = profile.outputPixelsFor(budgetDecision.scale)
+                        )
                     )
                 }
                 persistentController.submitBatch(submissions)

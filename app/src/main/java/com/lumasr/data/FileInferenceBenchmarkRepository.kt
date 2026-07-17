@@ -2,9 +2,12 @@ package com.lumasr.data
 
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
+import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
+import com.lumasr.domain.ResolutionTier
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -13,6 +16,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -95,18 +99,80 @@ class FileInferenceBenchmarkRepository(
         if (!file.isFile) return emptyList()
         return try {
             check(file.length() in 0..MAX_RECORD_BYTES) { "Benchmark record is too large" }
-            BenchmarkResultJson.decode(file.readText(Charsets.UTF_8)).also { results ->
-                check(results.size <= MAX_RESULT_COUNT) { "Too many benchmark results" }
-                check(results.map(InferenceBenchmarkResult::identity).distinct().size == results.size) {
-                    "Duplicate benchmark identity"
+            val records = BenchmarkResultJson.decodeRecords(file.readText(Charsets.UTF_8))
+            check(records.size <= MAX_RESULT_COUNT) { "Too many benchmark results" }
+            val identities = mutableSetOf<BenchmarkIdentity>()
+            var discardedRecord = false
+            val validResults = records.mapNotNull { record ->
+                try {
+                    BenchmarkResultJson.decodeResult(record).also(::validateResult).takeIf { result ->
+                        identities.add(result.identity).also { unique ->
+                            if (!unique) discardedRecord = true
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    discardedRecord = true
+                    null
                 }
-                results.forEach(::validateResult)
             }.sortedWith(RESULT_ORDER)
+            if (discardedRecord) {
+                if (validResults.isEmpty()) {
+                    quarantine(file)
+                } else {
+                    rewriteRecoveredRecords(validResults)
+                }
+            }
+            validResults
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             quarantine(file)
             emptyList()
+        }
+    }
+
+    private fun rewriteRecoveredRecords(results: List<InferenceBenchmarkResult>) {
+        val target = recordFile()
+        val rollback = try {
+            prepareRollbackCopy(target) ?: return
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return
+        }
+        val temporary = try {
+            prepareAtomic(BenchmarkResultJson.encode(results).toByteArray(Charsets.UTF_8))
+        } catch (cancelled: CancellationException) {
+            rollback.delete()
+            throw cancelled
+        } catch (_: Exception) {
+            rollback.delete()
+            return
+        }
+        try {
+            atomicMove(temporary, target)
+        } catch (cancelled: CancellationException) {
+            restoreRecoveredAggregate(target, rollback, cancelled)
+            throw cancelled
+        } catch (moveError: Exception) {
+            restoreRecoveredAggregate(target, rollback, moveError)
+        } finally {
+            temporary.delete()
+            rollback.delete()
+        }
+    }
+
+    private fun restoreRecoveredAggregate(
+        target: File,
+        rollback: File,
+        moveError: Exception
+    ) {
+        try {
+            rollbackPublication(target, rollback)
+        } catch (restoreError: Exception) {
+            moveError.addSuppressed(restoreError)
         }
     }
 
@@ -223,7 +289,7 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 2
+    private const val SCHEMA_VERSION = 3
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -232,12 +298,12 @@ private object BenchmarkResultJson {
         put("results", buildJsonArray { results.forEach { add(encodeResult(it)) } })
     }.toString()
 
-    fun decode(value: String): List<InferenceBenchmarkResult> {
+    fun decodeRecords(value: String): List<JsonElement> {
         val root = json.parseToJsonElement(value).jsonObject
         check(root.requiredInt("schemaVersion") == SCHEMA_VERSION) {
             "Unsupported benchmark schema"
         }
-        return root.requiredArray("results").map { decodeResult(it.jsonObject) }
+        return root.requiredArray("results")
     }
 
     private fun encodeResult(result: InferenceBenchmarkResult): JsonObject = buildJsonObject {
@@ -263,11 +329,32 @@ private object BenchmarkResultJson {
             put("p99ChannelError", result.fp16Quality.p99ChannelError)
         })
         put("recommendedCommandBatchSize", result.recommendedCommandBatchSize)
+        put("vulkanProfiles", buildJsonArray {
+            result.vulkanProfiles.forEach { add(encodeVulkanProfile(it)) }
+        })
+        put("cpuProfiles", buildJsonArray {
+            result.cpuProfiles.forEach { add(encodeCpuProfile(it)) }
+        })
         put("measuredAtEpochMs", result.measuredAtEpochMs)
         put("validUntilEpochMs", result.validUntilEpochMs)
     }
 
-    private fun decodeResult(record: JsonObject): InferenceBenchmarkResult {
+    private fun encodeVulkanProfile(profile: CalibratedVulkanProfile): JsonObject = buildJsonObject {
+        put("resolutionTier", profile.resolutionTier.name)
+        put("tileSize", profile.tileSize)
+        put("commandBatchSize", profile.commandBatchSize)
+    }
+
+    private fun encodeCpuProfile(profile: CalibratedCpuProfile): JsonObject = buildJsonObject {
+        put("resolutionTier", profile.resolutionTier.name)
+        put("tileSize", profile.tileSize)
+        put("cpuThreads", profile.cpuThreads)
+        put("openmpBlocktimeMs", profile.openmpBlocktimeMs)
+        put("postprocessThreads", profile.postprocessThreads)
+    }
+
+    fun decodeResult(element: JsonElement): InferenceBenchmarkResult {
+        val record = element.jsonObject
         val identity = record.getValue("identity").jsonObject
         val quality = record.getValue("quality").jsonObject
         return InferenceBenchmarkResult(
@@ -286,10 +373,32 @@ private object BenchmarkResultJson {
                 p99ChannelError = quality.requiredInt("p99ChannelError")
             ),
             recommendedCommandBatchSize = record.requiredInt("recommendedCommandBatchSize"),
+            vulkanProfiles = record.requiredArray("vulkanProfiles").map {
+                decodeVulkanProfile(it.jsonObject)
+            },
+            cpuProfiles = record.requiredArray("cpuProfiles").map {
+                decodeCpuProfile(it.jsonObject)
+            },
             measuredAtEpochMs = record.requiredLong("measuredAtEpochMs"),
             validUntilEpochMs = record.requiredLong("validUntilEpochMs")
         )
     }
+
+    private fun decodeVulkanProfile(record: JsonObject): CalibratedVulkanProfile =
+        CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
+            tileSize = record.requiredInt("tileSize"),
+            commandBatchSize = record.requiredInt("commandBatchSize")
+        )
+
+    private fun decodeCpuProfile(record: JsonObject): CalibratedCpuProfile =
+        CalibratedCpuProfile(
+            resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
+            tileSize = record.requiredInt("tileSize"),
+            cpuThreads = record.requiredInt("cpuThreads"),
+            openmpBlocktimeMs = record.requiredInt("openmpBlocktimeMs"),
+            postprocessThreads = record.requiredInt("postprocessThreads")
+        )
 
     private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive
         .also { check(it.isString) { "$key must be a JSON string" } }

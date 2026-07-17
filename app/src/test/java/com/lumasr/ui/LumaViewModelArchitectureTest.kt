@@ -26,10 +26,11 @@ class LumaViewModelArchitectureTest {
     fun resolvesCalibratedExecutionFieldsBeforePersistingEveryWorkSpec() {
         val source = File("src/main/java/com/lumasr/ui/LumaViewModel.kt").readText()
         val resolveIndex = source.indexOf("executionProfileResolver.resolve(")
-        val persistIndex = source.indexOf("ProcessingWorkSpec.fromParams(model.id, params)")
+        val persistIndex = source.indexOf("ProcessingWorkSpec.fromParams(")
 
         assertTrue(resolveIndex >= 0)
         assertTrue(persistIndex > resolveIndex)
+        assertTrue(source.contains("outputPixels = profile.outputPixelsFor(budgetDecision.scale)"))
     }
 
     @Test

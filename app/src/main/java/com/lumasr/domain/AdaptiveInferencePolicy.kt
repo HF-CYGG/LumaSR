@@ -99,12 +99,20 @@ data class InferenceBenchmarkResult(
     val fp16Quality: Fp16QualityMetrics,
     val recommendedCommandBatchSize: Int,
     val measuredAtEpochMs: Long,
-    val validUntilEpochMs: Long
+    val validUntilEpochMs: Long,
+    val vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
+    val cpuProfiles: List<CalibratedCpuProfile> = emptyList()
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Benchmark measurement time must be non-negative" }
         require(validUntilEpochMs >= measuredAtEpochMs) {
             "Benchmark validity end must not precede its measurement time"
+        }
+        require(vulkanProfiles.map(CalibratedVulkanProfile::resolutionTier).distinct().size == vulkanProfiles.size) {
+            "Calibrated Vulkan resolution tiers must be unique"
+        }
+        require(cpuProfiles.map(CalibratedCpuProfile::resolutionTier).distinct().size == cpuProfiles.size) {
+            "Calibrated CPU resolution tiers must be unique"
         }
     }
 }

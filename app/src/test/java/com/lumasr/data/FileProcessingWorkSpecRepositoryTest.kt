@@ -37,7 +37,28 @@ class FileProcessingWorkSpecRepositoryTest {
         val restored = repository.find(expected.taskId)
         assertEquals(expected, restored)
         assertEquals(expected.toUpscaleParams(), restored?.toUpscaleParams())
+        assertEquals(96_000_000L, restored?.outputPixels)
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+    }
+
+    @Test
+    fun readsLegacyWorkSpecWithoutOutputPixels() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-output-pixels")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText().replace("\"outputPixels\":96000000,", "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(expected.modelId, restored?.modelId)
+        assertEquals(expected.params, restored?.params)
+        assertNull(restored?.outputPixels)
+        assertTrue(sidecar.exists())
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
     @Test
@@ -135,7 +156,11 @@ class FileProcessingWorkSpecRepositoryTest {
             commandBatchSize = 4,
             modelCacheCapacity = 3
         )
-        return ProcessingWorkSpec.fromParams(modelId = "realesrgan-x4plus", params = params)
+        return ProcessingWorkSpec.fromParams(
+            modelId = "realesrgan-x4plus",
+            params = params,
+            outputPixels = 96_000_000L
+        )
     }
 
     private fun task(): ProcessingTask {

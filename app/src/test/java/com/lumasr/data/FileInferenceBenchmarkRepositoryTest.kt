@@ -2,13 +2,17 @@ package com.lumasr.data
 
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
+import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
+import com.lumasr.domain.ResolutionTier
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -80,6 +84,164 @@ class FileInferenceBenchmarkRepositoryTest {
         repository.save(second)
 
         assertEquals(listOf(first, second), repository.list())
+    }
+
+    @Test
+    fun roundTripsResolutionAwareVulkanAndCpuProfiles() = runBlocking {
+        val root = temporaryFolder.newFolder("resolution-profile-round-trip")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val expected = result(
+            identity = identity(),
+            vulkanProfiles = listOf(
+                CalibratedVulkanProfile(ResolutionTier.SMALL, tileSize = 768, commandBatchSize = 8),
+                CalibratedVulkanProfile(ResolutionTier.STANDARD, tileSize = 512, commandBatchSize = 4),
+                CalibratedVulkanProfile(ResolutionTier.LARGE, tileSize = 256, commandBatchSize = 2)
+            ),
+            cpuProfiles = listOf(
+                CalibratedCpuProfile(
+                    ResolutionTier.SMALL,
+                    tileSize = 512,
+                    cpuThreads = 6,
+                    openmpBlocktimeMs = 20,
+                    postprocessThreads = 4
+                ),
+                CalibratedCpuProfile(
+                    ResolutionTier.STANDARD,
+                    tileSize = 256,
+                    cpuThreads = 4,
+                    openmpBlocktimeMs = 40,
+                    postprocessThreads = 3
+                ),
+                CalibratedCpuProfile(
+                    ResolutionTier.LARGE,
+                    tileSize = 128,
+                    cpuThreads = 2,
+                    openmpBlocktimeMs = 60,
+                    postprocessThreads = 2
+                )
+            )
+        )
+
+        repository.save(expected)
+
+        assertEquals(listOf(expected), repository.list())
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":3"))
+    }
+
+    @Test
+    fun schemaV2RecordsAreInvalidated() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v2")
+        File(root, "inference-benchmarks.json").writeText(
+            """{"schemaVersion":2,"results":[${encodedLegacyResult()}]}"""
+        )
+
+        assertEquals(emptyList<InferenceBenchmarkResult>(), FileInferenceBenchmarkRepository(root).list())
+        assertFalse(File(root, "inference-benchmarks.json").exists())
+        assertTrue(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
+    fun dropsOnlyRecordWithUnknownResolutionTierAndAtomicallyKeepsValidCalibration() = runBlocking {
+        val root = temporaryFolder.newFolder("mixed-unknown-tier")
+        val record = File(root, "inference-benchmarks.json")
+        record.writeText(
+            encodedV3Aggregate(
+                encodedV3Result(profileHash = "valid-profile"),
+                encodedV3Result(
+                    profileHash = "invalid-tier-profile",
+                    vulkanResolutionTier = "UNKNOWN"
+                )
+            )
+        )
+        val repository = FileInferenceBenchmarkRepository(root)
+        val expected = resolutionAwareResult("valid-profile")
+
+        assertEquals(listOf(expected), repository.list())
+        assertEquals(listOf(expected), repository.list())
+        assertTrue(record.exists())
+        assertTrue(record.readText().contains("\"profileHash\":\"valid-profile\""))
+        assertFalse(record.readText().contains("invalid-tier-profile"))
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+    }
+
+    @Test
+    fun dropsOnlyRecordWithInvalidProfileNumberAndKeepsValidCalibration() = runBlocking {
+        val root = temporaryFolder.newFolder("mixed-invalid-number")
+        val record = File(root, "inference-benchmarks.json")
+        record.writeText(
+            encodedV3Aggregate(
+                encodedV3Result(profileHash = "valid-profile"),
+                encodedV3Result(
+                    profileHash = "invalid-number-profile",
+                    cpuThreads = 0
+                )
+            )
+        )
+        val repository = FileInferenceBenchmarkRepository(root)
+        val expected = resolutionAwareResult("valid-profile")
+
+        assertEquals(listOf(expected), repository.list())
+        assertTrue(record.exists())
+        assertTrue(record.readText().contains("\"profileHash\":\"valid-profile\""))
+        assertFalse(record.readText().contains("invalid-number-profile"))
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
+    fun destructiveRecoveryMoveFailureRestoresOriginalBytesAndReturnsValidCalibration() = runBlocking {
+        val root = temporaryFolder.newFolder("failed-recovery-rewrite")
+        val record = File(root, "inference-benchmarks.json")
+        record.writeText(
+            encodedV3Aggregate(
+                encodedV3Result(profileHash = "valid-profile"),
+                encodedV3Result(
+                    profileHash = "invalid-tier-profile",
+                    vulkanResolutionTier = "UNKNOWN"
+                )
+            )
+        )
+        val originalBytes = record.readBytes()
+        val repository = FileInferenceBenchmarkRepository(
+            directory = root,
+            atomicMove = { source, destination ->
+                if (source.name.endsWith(".tmp") && destination == record) {
+                    Files.deleteIfExists(destination.toPath())
+                    error("simulated destructive recovery move failure")
+                }
+                moveReplacingForTest(source, destination)
+            }
+        )
+        val expected = resolutionAwareResult("valid-profile")
+
+        assertEquals(listOf(expected), repository.list())
+        assertTrue(record.exists())
+        assertArrayEquals(originalBytes, record.readBytes())
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".rollback") })
+    }
+
+    @Test
+    fun rejectsDuplicateResolutionTierProfiles() {
+        assertThrows(IllegalArgumentException::class.java) {
+            result(
+                identity = identity(),
+                vulkanProfiles = listOf(
+                    CalibratedVulkanProfile(ResolutionTier.STANDARD, 512, 2),
+                    CalibratedVulkanProfile(ResolutionTier.STANDARD, 256, 4)
+                )
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            result(
+                identity = identity(),
+                cpuProfiles = listOf(
+                    CalibratedCpuProfile(ResolutionTier.LARGE, 256, 4, 20, 2),
+                    CalibratedCpuProfile(ResolutionTier.LARGE, 128, 2, 40, 2)
+                )
+            )
+        }
     }
 
     @Test
@@ -191,7 +353,7 @@ class FileInferenceBenchmarkRepositoryTest {
                 else -> "48.0"
             }
             File(root, "inference-benchmarks.json").writeText(
-                """{"schemaVersion":2,"results":[{"identity":$identityJson,"quality":{"ssim":$ssim,"psnrDb":$psnr,"p99ChannelError":1},"recommendedCommandBatchSize":4,"measuredAtEpochMs":1000,"validUntilEpochMs":2000}]}"""
+                """{"schemaVersion":3,"results":[{"identity":$identityJson,"quality":{"ssim":$ssim,"psnrDb":$psnr,"p99ChannelError":1},"recommendedCommandBatchSize":4,"vulkanProfiles":[],"cpuProfiles":[],"measuredAtEpochMs":1000,"validUntilEpochMs":2000}]}"""
             )
 
             assertEquals(emptyList<InferenceBenchmarkResult>(), FileInferenceBenchmarkRepository(root).list())
@@ -350,13 +512,46 @@ class FileInferenceBenchmarkRepositoryTest {
         quality: Fp16QualityMetrics = passingQuality(),
         batchSize: Int = 4,
         measuredAt: Long = 1_000L,
-        validUntil: Long = 2_000L
+        validUntil: Long = 2_000L,
+        vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
+        cpuProfiles: List<CalibratedCpuProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = quality,
         recommendedCommandBatchSize = batchSize,
+        vulkanProfiles = vulkanProfiles,
+        cpuProfiles = cpuProfiles,
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil
+    )
+
+    private fun encodedLegacyResult(): String =
+        """{"identity":{"schemaKey":"benchmark-v1","engineKey":"ncnn-v1:realcugan-x4plus","modelArtifactHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","runtimeBuildKey":"app-1:test:arm64-v8a","profileHash":"profile-a","deviceFingerprint":"$DEVICE_HASH_A","gpuDriverVersion":"driver-v1"},"quality":{"ssim":0.999,"psnrDb":48.0,"p99ChannelError":1},"recommendedCommandBatchSize":4,"measuredAtEpochMs":1000,"validUntilEpochMs":2000}"""
+
+    private fun encodedV3Aggregate(vararg results: String): String =
+        """{"schemaVersion":3,"results":[${results.joinToString(",")}]}"""
+
+    private fun encodedV3Result(
+        profileHash: String,
+        vulkanResolutionTier: String = "STANDARD",
+        cpuThreads: Int = 4
+    ): String =
+        """{"identity":{"schemaKey":"benchmark-v1","engineKey":"ncnn-v1:realcugan-x4plus","modelArtifactHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","runtimeBuildKey":"app-1:test:arm64-v8a","profileHash":"$profileHash","deviceFingerprint":"$DEVICE_HASH_A","gpuDriverVersion":"driver-v1"},"quality":{"ssim":0.999,"psnrDb":48.0,"p99ChannelError":1},"recommendedCommandBatchSize":4,"vulkanProfiles":[{"resolutionTier":"$vulkanResolutionTier","tileSize":512,"commandBatchSize":4}],"cpuProfiles":[{"resolutionTier":"STANDARD","tileSize":256,"cpuThreads":$cpuThreads,"openmpBlocktimeMs":20,"postprocessThreads":2}],"measuredAtEpochMs":1000,"validUntilEpochMs":2000}"""
+
+    private fun resolutionAwareResult(profileHash: String): InferenceBenchmarkResult = result(
+        identity = identity(profileHash = profileHash),
+        vulkanProfiles = listOf(
+            CalibratedVulkanProfile(ResolutionTier.STANDARD, tileSize = 512, commandBatchSize = 4)
+        ),
+        cpuProfiles = listOf(
+            CalibratedCpuProfile(
+                ResolutionTier.STANDARD,
+                tileSize = 256,
+                cpuThreads = 4,
+                openmpBlocktimeMs = 20,
+                postprocessThreads = 2
+            )
+        )
     )
 
     private fun blockingCommitMover(

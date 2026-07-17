@@ -4,7 +4,8 @@ import java.io.File
 
 data class ProcessingWorkSpec private constructor(
     val modelId: String,
-    val params: UpscaleParams
+    val params: UpscaleParams,
+    val outputPixels: Long?
 ) {
     val taskId: String
         get() = params.taskId
@@ -12,14 +13,25 @@ data class ProcessingWorkSpec private constructor(
     init {
         require(modelId.isNotBlank()) { "Model id must not be blank" }
         require(taskId.isNotBlank()) { "Task id must not be blank" }
+        require(outputPixels == null || outputPixels >= 0L) {
+            "Output pixels must be non-negative"
+        }
         validateParams(params)
     }
 
     fun toUpscaleParams(): UpscaleParams = params
 
     companion object {
-        fun fromParams(modelId: String, params: UpscaleParams): ProcessingWorkSpec {
-            return ProcessingWorkSpec(modelId = modelId, params = params)
+        fun fromParams(
+            modelId: String,
+            params: UpscaleParams,
+            outputPixels: Long? = null
+        ): ProcessingWorkSpec {
+            return ProcessingWorkSpec(
+                modelId = modelId,
+                params = params,
+                outputPixels = outputPixels
+            )
         }
 
         private fun validateParams(params: UpscaleParams) {
