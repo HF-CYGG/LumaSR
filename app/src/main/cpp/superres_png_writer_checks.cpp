@@ -1,6 +1,7 @@
 #include "superres_png_writer_checks.h"
 
 #include "superres_png_writer.h"
+#include "superres_stbi_decode.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -12,6 +13,10 @@
 #include "stb_image.h"
 
 namespace {
+
+void release_check_stbi_pixels(unsigned char* pixels) noexcept {
+    stbi_image_free(pixels);
+}
 
 uint32_t read_be32(const unsigned char* bytes) {
     return (static_cast<uint32_t>(bytes[0]) << 24) |
@@ -120,23 +125,17 @@ bool run_streaming_png_writer_runtime_checks(const char* outputPath) {
         return false;
     }
 
-    int decodedWidth = 0;
-    int decodedHeight = 0;
-    int decodedChannels = 0;
-    unsigned char* decoded = stbi_load(
-        checkPath.c_str(),
-        &decodedWidth,
-        &decodedHeight,
-        &decodedChannels,
-        3
+    SuperResRgbDecodeResult decoded = decode_superres_rgb_image(
+        checkPath,
+        SuperResStbiApi{stbi_load, stbi_failure_reason, release_check_stbi_pixels}
     );
-    bool pixelsMatch = decoded != nullptr && decodedWidth == width && decodedHeight == height;
+    bool pixelsMatch = decoded.status == SuperResRgbDecodeStatus::Ok &&
+        decoded.image.width() == width && decoded.image.height() == height;
     for (int y = 0; pixelsMatch && y < height; ++y) {
         const unsigned char* expected = source.data() + static_cast<size_t>(y) * stride;
-        const unsigned char* actual = decoded + static_cast<size_t>(y) * rowBytes;
+        const unsigned char* actual = decoded.image.data() + static_cast<size_t>(y) * rowBytes;
         pixelsMatch = std::equal(expected, expected + rowBytes, actual);
     }
-    stbi_image_free(decoded);
     remove_file(checkPath);
     if (!pixelsMatch || !write_sentinel(checkPath)) {
         remove_file(checkPath);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "superres_capability.h"
+#include "superres_rgb_image.h"
 #include "superres_runtime_control.h"
 
 #include <functional>
@@ -69,6 +70,9 @@ struct SuperResRawTile {
     int height;
 };
 
+// This snapshot is delivered before final-path publication so JNI callback failure cannot leave a
+// successful-looking output. saveMs/encodeMs include complete staging-file creation; totalMs ends
+// before the callback and atomic rename. Native post-publish logs carry publishMs/actualTotalMs.
 struct SuperResNativePerformance {
     bool hasValue = false;
     long long decodeMs = 0;
@@ -108,6 +112,12 @@ using SuperResRuntimeControlCallback = std::function<SuperResRuntimeInferenceCon
 
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
+SuperResNativeCode process_superres_rgb(
+    const SuperResNativeParams& params,
+    SuperResRgbImage image,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl
 );

@@ -119,6 +119,11 @@ data class UpscaleProgress(
     val performanceSnapshot: NativePerformanceSnapshot? = null
 )
 
+/**
+ * Safe pre-publish native timing snapshot. [saveMs] and [encodeMs] include complete temporary-file
+ * staging, while [totalMs] ends before the progress callback and atomic final-path publication.
+ * Native logs report post-publish `publishMs` and `actualTotalMs` separately.
+ */
 data class NativePerformanceSnapshot(
     val decodeMs: Long,
     val modelLoadMs: Long,

@@ -2,6 +2,32 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(localsr)
 
+if(NOT ANDROID)
+    include(CTest)
+    find_package(Threads REQUIRED)
+    add_executable(superres_rgb_image_checks_host
+        superres_atomic_publish.cpp
+        superres_output_finalizer.cpp
+        superres_process_internal.cpp
+        superres_rgb_image.cpp
+        superres_stbi_decode.cpp
+        superres_task_registry.cpp
+        superres_rgb_image_checks.cpp
+        superres_host_checks.cpp
+        tests/superres_rgb_image_checks_main.cpp
+    )
+    target_compile_features(superres_rgb_image_checks_host PRIVATE cxx_std_17)
+    target_include_directories(superres_rgb_image_checks_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(superres_rgb_image_checks_host PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(superres_rgb_image_checks_host PRIVATE /W4 /WX)
+    else()
+        target_compile_options(superres_rgb_image_checks_host PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME superres_rgb_image_checks COMMAND superres_rgb_image_checks_host)
+    return()
+endif()
+
 if(NOT DEFINED NCNN_ROOT)
     set(NCNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.deps/native/ncnn")
 endif()
@@ -9,11 +35,16 @@ endif()
 add_library(localsr SHARED
     superres_jni.cpp
     superres_engine.cpp
+    superres_process_internal.cpp
+    superres_rgb_image.cpp
+    superres_rgb_image_checks.cpp
+    superres_stbi_decode.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp
     superres_runtime_control_checks.cpp
     superres_png_streamer.cpp
     superres_atomic_publish.cpp
+    superres_output_finalizer.cpp
     superres_atomic_publish_checks.cpp
     superres_task_registry.cpp
     superres_task_registry_checks.cpp
