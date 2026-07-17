@@ -19,7 +19,8 @@ enum class SuperResNativeCode {
     InvalidParams = 6,
     OutOfMemory = 7,
     VulkanFailed = 8,
-    TileOutputMismatch = 9
+    TileOutputMismatch = 9,
+    PipelineFallbackRequired = 10
 };
 
 enum class SuperResNativeStage {
@@ -113,6 +114,13 @@ using SuperResRuntimeControlCallback = std::function<SuperResRuntimeInferenceCon
 
 SuperResNativeCode process_superres(
     const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
+SuperResNativeCode process_superres_pipeline(
+    const std::string& rootTaskId,
+    const std::vector<SuperResNativeParams>& passes,
+    size_t transportBudgetBytes,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl
 );

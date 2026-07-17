@@ -485,6 +485,144 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
 
 extern "C"
 JNIEXPORT jint JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_processMemoryPipelineNative(
+    JNIEnv* env,
+    jobject,
+    jstring task_id,
+    jstring input_path,
+    jstring output_path,
+    jobjectArray model_dirs,
+    jobjectArray model_file_bases,
+    jintArray pass_configs,
+    jlong transport_budget_bytes,
+    jobject progress_sink
+) {
+    constexpr jsize kPassConfigStride = 20;
+    return static_cast<jint>(run_superres_process_jni_boundary(env, [&]() -> int {
+        if (task_id == nullptr || input_path == nullptr || output_path == nullptr ||
+            model_dirs == nullptr || model_file_bases == nullptr || pass_configs == nullptr ||
+            transport_budget_bytes <= 0) {
+            return static_cast<int>(SuperResNativeCode::InvalidParams);
+        }
+        const jsize passCount = env->GetArrayLength(model_dirs);
+        throw_if_superres_jni_exception_pending(env);
+        const jsize modelBaseCount = env->GetArrayLength(model_file_bases);
+        throw_if_superres_jni_exception_pending(env);
+        const jsize configCount = env->GetArrayLength(pass_configs);
+        throw_if_superres_jni_exception_pending(env);
+        if (passCount < 2 || modelBaseCount != passCount ||
+            passCount > std::numeric_limits<jsize>::max() / kPassConfigStride ||
+            configCount != passCount * kPassConfigStride ||
+            static_cast<unsigned long long>(transport_budget_bytes) >
+                static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+            return static_cast<int>(SuperResNativeCode::InvalidParams);
+        }
+
+        std::vector<jint> configs(static_cast<size_t>(configCount));
+        env->GetIntArrayRegion(pass_configs, 0, configCount, configs.data());
+        throw_if_superres_jni_exception_pending(env);
+
+        const std::string taskId = to_string(env, task_id);
+        const std::string inputPath = to_string(env, input_path);
+        const std::string outputPath = to_string(env, output_path);
+        std::vector<SuperResNativeParams> passes;
+        passes.reserve(static_cast<size_t>(passCount));
+        for (jsize index = 0; index < passCount; ++index) {
+            jstring modelDir = static_cast<jstring>(
+                env->GetObjectArrayElement(model_dirs, index)
+            );
+            throw_if_superres_jni_exception_pending(env);
+            jstring modelFileBase = static_cast<jstring>(
+                env->GetObjectArrayElement(model_file_bases, index)
+            );
+            throw_if_superres_jni_exception_pending(env);
+            if (modelDir == nullptr || modelFileBase == nullptr) {
+                if (modelDir != nullptr) env->DeleteLocalRef(modelDir);
+                if (modelFileBase != nullptr) env->DeleteLocalRef(modelFileBase);
+                return static_cast<int>(SuperResNativeCode::InvalidParams);
+            }
+            const size_t base = static_cast<size_t>(index) *
+                static_cast<size_t>(kPassConfigStride);
+            SuperResNativeParams params{};
+            params.taskId = taskId;
+            params.inputPath = inputPath;
+            params.outputPath = outputPath;
+            params.modelDir = to_string(env, modelDir);
+            params.modelFileBase = to_string(env, modelFileBase);
+            env->DeleteLocalRef(modelDir);
+            env->DeleteLocalRef(modelFileBase);
+            params.engineType = static_cast<int>(configs[base]);
+            params.scale = static_cast<int>(configs[base + 1u]);
+            params.noise = static_cast<int>(configs[base + 2u]);
+            params.tileSize = static_cast<int>(configs[base + 3u]);
+            params.gpuHeadroomPercent = static_cast<int>(configs[base + 4u]);
+            params.accelerationMode = static_cast<int>(configs[base + 5u]);
+            params.tta = configs[base + 6u] != 0;
+            params.outputMode = static_cast<int>(configs[base + 7u]);
+            params.outputCropLeft = static_cast<int>(configs[base + 8u]);
+            params.outputCropTop = static_cast<int>(configs[base + 9u]);
+            params.outputCropWidth = static_cast<int>(configs[base + 10u]);
+            params.outputCropHeight = static_cast<int>(configs[base + 11u]);
+            params.retryCount = static_cast<int>(configs[base + 12u]);
+            params.regionIndex = static_cast<int>(configs[base + 13u]);
+            params.nativeBackend = static_cast<int>(configs[base + 14u]);
+            params.inferencePrecision = static_cast<int>(configs[base + 15u]);
+            params.cpuThreads = static_cast<int>(configs[base + 16u]);
+            params.openmpBlocktimeMs = static_cast<int>(configs[base + 17u]);
+            params.commandBatchSize = static_cast<int>(configs[base + 18u]);
+            params.modelCacheCapacity = static_cast<int>(configs[base + 19u]);
+            passes.push_back(std::move(params));
+        }
+
+        const SuperResProgressCallback progressCallback = [env, progress_sink](
+            SuperResNativeStage stage,
+            int currentTile,
+            int totalTiles,
+            float progress,
+            const std::string& message,
+            const SuperResNativePerformance& performance
+        ) {
+            emit_progress(
+                env,
+                progress_sink,
+                stage,
+                currentTile,
+                totalTiles,
+                progress,
+                message,
+                performance
+            );
+        };
+        const SuperResRuntimeControlCallback runtimeControl = [
+            env,
+            progress_sink,
+            lastControl = sanitize_runtime_control(
+                SuperResRuntimeInferenceControl{
+                    passes.front().commandBatchSize,
+                    0,
+                    false,
+                    1
+                }
+            )
+        ]() mutable {
+            SuperResRuntimeInferenceControl nextControl;
+            if (read_runtime_control(env, progress_sink, nextControl)) {
+                lastControl = nextControl;
+            }
+            return lastControl;
+        };
+        return static_cast<int>(process_superres_pipeline(
+            taskId,
+            passes,
+            static_cast<size_t>(transport_budget_bytes),
+            progressCallback,
+            runtimeControl
+        ));
+    }));
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
 Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
     JNIEnv* env,
     jobject,

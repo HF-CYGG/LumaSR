@@ -5,6 +5,7 @@
 #include "superres_atomic_publish.h"
 #include "superres_output_finalizer.h"
 #include "superres_pixel_io.h"
+#include "superres_pipeline_internal.h"
 #include "superres_process_internal.h"
 #include "superres_rgb_image_checks.h"
 #include "superres_rgb_output_target.h"
@@ -1465,6 +1466,127 @@ NcnnStageRunResult run_ncnn_stage(
     };
 }
 
+SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    bool useVulkan,
+    const SuperResRgbImage& image
+) {
+    static const bool executionProfileChecksPass = run_execution_profile_runtime_checks();
+    if (!executionProfileChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Execution profile runtime checks failed");
+        return {SuperResNativeCode::InvalidParams, {}};
+    }
+    static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
+    if (!pixelIoChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Pixel I/O runtime checks failed");
+        return {SuperResNativeCode::Unsupported, {}};
+    }
+    static const bool rgbImageChecksPass = run_superres_rgb_image_runtime_checks();
+    if (!rgbImageChecksPass) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "RGB image runtime checks failed");
+        return {SuperResNativeCode::InvalidParams, {}};
+    }
+    if (read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause ||
+        is_cancelled(params.taskId)) {
+        return {SuperResNativeCode::Cancelled, {}};
+    }
+
+    const ModelFiles files = select_model_files(params);
+    if (!is_regular_file(files.paramPath) || !is_regular_file(files.binPath)) {
+        return {SuperResNativeCode::ModelMissing, {}};
+    }
+    if (!useVulkan && params.engineType == kEngineRealEsrgan &&
+        is_large_realesrgan_model_base(params.modelFileBase.c_str())) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            "Rejecting CPU load for large Real-ESRGAN model in memory pipeline scale=%d",
+            params.scale
+        );
+        return {SuperResNativeCode::OutOfMemory, {}};
+    }
+    if (!image.valid()) {
+        return {SuperResNativeCode::InvalidParams, {}};
+    }
+    if (params.tta) {
+        static const bool d4RuntimeChecksPass = run_d4_tta_runtime_checks();
+        if (!d4RuntimeChecksPass) {
+            return {SuperResNativeCode::TileOutputMismatch, {}};
+        }
+    }
+    if (!output_pixels_within_budget(image.width(), image.height(), params.scale)) {
+        return {SuperResNativeCode::OutOfMemory, {}};
+    }
+
+    std::unique_lock<std::mutex> gpuLock(gpu_mutex, std::defer_lock);
+    if (useVulkan) {
+        gpuLock.lock();
+        if (!ensure_gpu_instance()) {
+            return {SuperResNativeCode::VulkanFailed, {}};
+        }
+    }
+
+    emit(onProgress, SuperResNativeStage::LoadingModel, 0, 0, 0.10f, "Loading ncnn model");
+    const SuperResExecutionProfile executionProfile = resolve_execution_profile(params, useVulkan);
+    SuperResNativePerformance performance;
+    performance.accelerationMode = useVulkan ? kAccelerationVulkan : 2;
+    performance.effectiveBackend = static_cast<int>(executionProfile.effectiveBackend);
+    performance.effectivePrecision = static_cast<int>(executionProfile.effectivePrecision);
+    performance.fallbackReason = static_cast<int>(executionProfile.fallbackReason);
+    const auto modelLoadStart = std::chrono::steady_clock::now();
+    LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
+    performance.modelLoadMs = elapsed_ms(modelLoadStart);
+    performance.cacheHit = loadedNet.cacheHit;
+    performance.cacheSize = cached_net_count();
+    performance.retryCount = params.retryCount;
+    performance.regionIndex = params.regionIndex;
+    std::shared_ptr<ncnn::Net> net = loadedNet.net;
+    if (!net) {
+        return {SuperResNativeCode::ModelMissing, {}};
+    }
+
+    const SuperResNcnnStageGeometry geometry = resolve_superres_ncnn_stage_geometry(
+        image.width(),
+        image.height(),
+        params.scale,
+        params.tileSize,
+        SuperResNcnnStageCrop{}
+    );
+    if (geometry.status != SuperResNcnnStageGeometryStatus::Ok) {
+        return {
+            geometry.status == SuperResNcnnStageGeometryStatus::OutputTooLarge
+                ? SuperResNativeCode::OutOfMemory
+                : SuperResNativeCode::InvalidParams,
+            {}
+        };
+    }
+
+    MemoryRgbOutput output;
+    const NcnnStageRunResult stageResult = run_ncnn_stage(
+        params,
+        onProgress,
+        runtimeControl,
+        useVulkan,
+        image,
+        files,
+        *net,
+        executionProfile,
+        geometry,
+        output,
+        performance
+    );
+    if (stageResult.code != SuperResNativeCode::Ok) {
+        return {stageResult.code, {}};
+    }
+    SuperResRgbImage next = output.take_image();
+    if (!next.valid()) {
+        return {SuperResNativeCode::OutOfMemory, {}};
+    }
+    return {SuperResNativeCode::Ok, std::move(next)};
+}
+
 SuperResNativeCode run_ncnn_image(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
@@ -1958,6 +2080,134 @@ SuperResNativeCode process_superres(const SuperResNativeParams& params,
         true,
         dependencies
     );
+}
+
+SuperResNativeCode process_superres_pipeline(
+    const std::string& rootTaskId,
+    const std::vector<SuperResNativeParams>& passes,
+    size_t transportBudgetBytes,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+) {
+    if (!task_registry_checks_pass()) {
+        return SuperResNativeCode::InvalidParams;
+    }
+
+    long long decodeMs = 0;
+    SuperResRgbPipelineDependencies dependencies;
+    dependencies.inputExists = [](const std::string& inputPath) {
+        return is_regular_file(inputPath);
+    };
+    dependencies.registerTask = [](const std::string& taskId) {
+        return task_registry.register_task(taskId);
+    };
+    dependencies.completeTask = [](const std::string& taskId) {
+        task_registry.complete_task(taskId);
+    };
+    dependencies.shouldStop = [&]() {
+        if (is_cancelled(rootTaskId)) {
+            return true;
+        }
+        const int defaultBatchSize = passes.empty() ? 1 : passes.front().commandBatchSize;
+        return read_runtime_control(runtimeControl, defaultBatchSize).shouldPause;
+    };
+    dependencies.loadImage = [&]() {
+        emit(onProgress, SuperResNativeStage::Preparing, 0, 0, 0.0f, "Preparing native pipeline");
+        emit(onProgress, SuperResNativeStage::Analyzing, 0, 0, 0.04f, "Decoding input image");
+        const auto decodeStart = std::chrono::steady_clock::now();
+        SuperResRgbImage image = load_rgb_image(passes.front().inputPath);
+        decodeMs = elapsed_ms(decodeStart);
+        return image;
+    };
+    dependencies.onEvent = [](SuperResRgbPipelineEvent event, size_t stageIndex) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            kLogTag,
+            event == SuperResRgbPipelineEvent::ForceCpu
+                ? "Pipeline stage forcing CPU stage=%zu"
+                : "Pipeline stage AUTO retrying CPU stage=%zu",
+            stageIndex
+        );
+    };
+    dependencies.runStage = [
+        &onProgress,
+        &runtimeControl,
+        &decodeMs
+    ](
+        const SuperResNativeParams& params,
+        const SuperResRgbImage& input,
+        bool useVulkan,
+        bool finalStage,
+        size_t stageIndex,
+        size_t stageCount
+    ) {
+        const SuperResProgressCallback stageProgress = [
+            &onProgress,
+            stageIndex,
+            stageCount
+        ](
+            SuperResNativeStage stage,
+            int currentTile,
+            int totalTiles,
+            float progress,
+            const std::string& message,
+            const SuperResNativePerformance& performance
+        ) {
+            if (!onProgress || stageCount == 0u) {
+                return;
+            }
+            const float boundedProgress = std::clamp(progress, 0.0f, 1.0f);
+            const float pipelineProgress = (
+                static_cast<float>(stageIndex) + boundedProgress
+            ) / static_cast<float>(stageCount);
+            onProgress(
+                stage,
+                currentTile,
+                totalTiles,
+                pipelineProgress,
+                message,
+                performance
+            );
+        };
+        if (finalStage) {
+            return SuperResRgbPipelineStageAttempt{
+                run_ncnn_image(
+                    params,
+                    stageProgress,
+                    runtimeControl,
+                    useVulkan,
+                    input,
+                    decodeMs
+                ),
+                {}
+            };
+        }
+        return run_ncnn_image_to_memory(
+            params,
+            stageProgress,
+            runtimeControl,
+            useVulkan,
+            input
+        );
+    };
+
+    const SuperResNativeCode code = process_superres_rgb_pipeline_internal(
+        rootTaskId,
+        passes,
+        transportBudgetBytes,
+        dependencies
+    );
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "PipelineTransport task=%s transportMode=%s passCount=%zu budgetBytes=%zu code=%d",
+        rootTaskId.c_str(),
+        code == SuperResNativeCode::PipelineFallbackRequired ? "png-fallback" : "rgb-memory",
+        passes.size(),
+        transportBudgetBytes,
+        static_cast<int>(code)
+    );
+    return code;
 }
 
 SuperResNativeCode process_superres_rgb(
