@@ -146,7 +146,8 @@ data class NativePerformanceSnapshot(
     val encodeMs: Long = saveMs,
     val effectiveBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
     val effectivePrecision: InferencePrecision = InferencePrecision.FP32,
-    val fallbackReason: NativeFallbackReason? = null
+    val fallbackReason: NativeFallbackReason? = null,
+    val requestedMaxPipelineDepth: Int = 1
 )
 
 enum class NativeFallbackReason {
@@ -178,14 +179,16 @@ data class UpscaleResult(
 data class RuntimeInferenceControl(
     val commandBatchSize: Int,
     val thermalHeadroomPercent: Int,
-    val shouldPause: Boolean
+    val shouldPause: Boolean,
+    val maxPipelineDepth: Int = 1
 ) {
     fun sanitized(): RuntimeInferenceControl = copy(
         commandBatchSize = commandBatchSize.coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE),
         thermalHeadroomPercent = thermalHeadroomPercent.coerceIn(
             MIN_THERMAL_HEADROOM_PERCENT,
             MAX_THERMAL_HEADROOM_PERCENT
-        )
+        ),
+        maxPipelineDepth = maxPipelineDepth.coerceIn(MIN_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH)
     )
 
     private companion object {
@@ -193,6 +196,8 @@ data class RuntimeInferenceControl(
         const val MAX_COMMAND_BATCH_SIZE = 8
         const val MIN_THERMAL_HEADROOM_PERCENT = 0
         const val MAX_THERMAL_HEADROOM_PERCENT = 25
+        const val MIN_PIPELINE_DEPTH = 1
+        const val MAX_PIPELINE_DEPTH = 2
     }
 }
 

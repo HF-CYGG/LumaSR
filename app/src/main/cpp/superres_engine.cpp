@@ -476,7 +476,7 @@ SuperResRuntimeInferenceControl read_runtime_control(
     int defaultCommandBatchSize
 ) {
     const SuperResRuntimeInferenceControl fallback = sanitize_runtime_control(
-        SuperResRuntimeInferenceControl{defaultCommandBatchSize, 0, false}
+        SuperResRuntimeInferenceControl{defaultCommandBatchSize, 0, false, 1}
     );
     if (!runtimeControl) {
         return fallback;
@@ -1034,6 +1034,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             runtimeControl,
             executionProfile.commandBatchSize
         );
+        performance.requestedMaxPipelineDepth = control.maxPipelineDepth;
         if (control.shouldPause) {
             return SuperResNativeCode::Cancelled;
         }
@@ -1440,6 +1441,7 @@ SuperResNativeCode run_ncnn_image(
                 runtimeControl,
                 executionProfile.commandBatchSize
             );
+            performance.requestedMaxPipelineDepth = control.maxPipelineDepth;
             if (control.shouldPause) {
                 return SuperResNativeCode::Cancelled;
             }
@@ -1761,7 +1763,7 @@ SuperResNativeCode run_ncnn_image(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
         params.taskId.c_str(),
         modelKey.c_str(),
         modelKey.c_str(),
@@ -1771,6 +1773,7 @@ SuperResNativeCode run_ncnn_image(
         performance.effectiveBackend,
         performance.effectivePrecision,
         performance.fallbackReason,
+        performance.requestedMaxPipelineDepth,
         executionProfile.cpuThreads,
         executionProfile.openmpBlocktimeMs,
         executionProfile.commandBatchSize,
@@ -1964,6 +1967,20 @@ SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot() {
     snapshot.supportsFp16Storage = gpuInfo.support_fp16_storage();
     snapshot.supportsFp16Arithmetic = gpuInfo.support_fp16_arithmetic();
     return snapshot;
+}
+
+long long read_superres_gpu_heap_budget_mib() {
+    std::lock_guard<std::mutex> gpuLock(gpu_mutex);
+    if (!ensure_gpu_instance()) {
+        return 0;
+    }
+    const int gpuIndex = ncnn::get_default_gpu_index();
+    const int gpuCount = ncnn::get_gpu_count();
+    if (gpuIndex < 0 || gpuIndex >= gpuCount) {
+        return 0;
+    }
+    const ncnn::VulkanDevice* device = ncnn::get_gpu_device(gpuIndex);
+    return device == nullptr ? 0 : static_cast<long long>(device->get_heap_budget());
 }
 
 namespace {

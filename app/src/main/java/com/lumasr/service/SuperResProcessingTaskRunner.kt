@@ -16,6 +16,9 @@ import com.lumasr.domain.ProcessingTaskRunner
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.RuntimeInferenceControl
 import com.lumasr.domain.RuntimeInferenceControlProvider
+import com.lumasr.domain.RuntimePipelineDepthPolicy
+import com.lumasr.domain.RuntimePipelineResourceProvider
+import com.lumasr.domain.RuntimePipelineResources
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.ThermalPolicyState
 import com.lumasr.domain.ThermalLevel
@@ -30,6 +33,9 @@ import java.util.concurrent.atomic.AtomicReference
 class SuperResProcessingTaskRunner(
     private val processor: SuperResProcessor = HybridSuperResProcessor(),
     private val thermalLevelProvider: () -> ThermalLevel? = { null },
+    private val runtimeResourceProvider: RuntimePipelineResourceProvider =
+        RuntimePipelineResourceProvider { null },
+    private val runtimePipelineDepthPolicy: RuntimePipelineDepthPolicy = RuntimePipelineDepthPolicy(),
     private val executionProfileResolver: ProcessingExecutionProfileResolver = FAIL_CLOSED_RESOLVER,
     private val clock: ProcessingClock = ProcessingClock(System::currentTimeMillis)
 ) : ProcessingTaskRunner {
@@ -74,6 +80,13 @@ class SuperResProcessingTaskRunner(
             )
         )
         val lastThermalLevel = AtomicReference(thermalLevel)
+        val initialResources = runCatching { runtimeResourceProvider.current() }
+            .getOrNull()
+            .takeIf { it.isCompleteSnapshot() }
+        val lastResources = AtomicReference<RuntimePipelineResources?>(initialResources)
+        val pipelineDepth = AtomicReference(
+            runtimePipelineDepthPolicy.decide(currentParams, thermalLevel, initialResources)
+        )
         val stoppedForCriticalThermal = AtomicBoolean(false)
         val result = processor.process(
             currentParams,
@@ -98,11 +111,25 @@ class SuperResProcessingTaskRunner(
                             )
                         }
                     }
+                    try {
+                        runtimeResourceProvider.current()
+                            .takeIf { it.isCompleteSnapshot() }
+                            ?.let(lastResources::set)
+                    } catch (_: Throwable) {
+                        // Runtime resource sampling is best-effort; retain the last valid snapshot.
+                    }
+                    pipelineDepth.set(
+                        runtimePipelineDepthPolicy.decide(
+                            params = currentParams,
+                            thermalLevel = lastThermalLevel.get(),
+                            resources = lastResources.get()
+                        )
+                    )
                 }
                 onProgress(progress)
             },
             runtimeControlProvider = RuntimeInferenceControlProvider {
-                thermalState.get().toRuntimeControl()
+                thermalState.get().toRuntimeControl(pipelineDepth.get().maxPipelineDepth)
             }
         )
         return when {
@@ -118,12 +145,17 @@ class SuperResProcessingTaskRunner(
         processor.cancel(taskId)
     }
 
-    private fun ThermalPolicyState.toRuntimeControl(): RuntimeInferenceControl =
+    private fun ThermalPolicyState.toRuntimeControl(maxPipelineDepth: Int): RuntimeInferenceControl =
         RuntimeInferenceControl(
             commandBatchSize = effectiveProfile.commandBatchSize,
             thermalHeadroomPercent = thermalHeadroomPercent,
-            shouldPause = shouldPause
+            shouldPause = shouldPause,
+            maxPipelineDepth = maxPipelineDepth
         ).sanitized()
+
+    private fun RuntimePipelineResources?.isCompleteSnapshot(): Boolean =
+        this?.availableRamBytes?.let { it > 0L } == true &&
+            this.gpuHeapBudgetBytes?.let { it > 0L } == true
 
     private fun logThermalTransition(previous: ThermalLevel, current: ThermalLevel) {
         runCatching { Log.i(LOG_TAG, "thermalLevel=${previous.name}->${current.name}") }

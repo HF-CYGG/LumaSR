@@ -17,6 +17,7 @@ import com.lumasr.data.FileProcessingTaskMaintenance
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.AndroidThermalSignalSource
+import com.lumasr.data.AndroidRuntimeResourceSource
 import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
@@ -71,6 +72,7 @@ class SuperResolutionService : Service() {
                 thermalLevelProvider = ThermalSampler(
                     AndroidThermalSignalSource(this)
                 )::sampleLevel,
+                runtimeResourceProvider = AndroidRuntimeResourceSource(this),
                 executionProfileResolver = createInferenceExecutionProfileResolver(this)
             ),
             maintenance = FileProcessingTaskMaintenance(

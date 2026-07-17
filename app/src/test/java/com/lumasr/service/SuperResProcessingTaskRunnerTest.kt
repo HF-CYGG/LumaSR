@@ -15,6 +15,8 @@ import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.RuntimeInferenceControl
 import com.lumasr.domain.RuntimeInferenceControlProvider
+import com.lumasr.domain.RuntimePipelineResources
+import com.lumasr.domain.RuntimePipelineResourceProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.ThermalLevel
@@ -112,6 +114,96 @@ class SuperResProcessingTaskRunnerTest {
             ),
             processor.controls
         )
+    }
+
+    @Test
+    fun runtimeDepthTracksThermalAndResourcesAtTileBoundariesAndCanRecoverToTwo() = runBlocking {
+        val processor = RecordingProcessor(boundariesToEmit = 3)
+        val thermalLevels = ArrayDeque(
+            listOf(
+                ThermalLevel.NORMAL,
+                ThermalLevel.MODERATE,
+                ThermalLevel.NORMAL,
+                ThermalLevel.LIGHT
+            )
+        )
+        val resources = ArrayDeque(
+            listOf(
+                abundantResources(),
+                abundantResources(),
+                scarceResources(),
+                abundantResources()
+            )
+        )
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { thermalLevels.removeFirst() },
+            runtimeResourceProvider = RuntimePipelineResourceProvider { resources.removeFirst() },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("depth-dynamic"), spec("depth-dynamic")) {}
+
+        assertEquals(ProcessingRunResult.Completed, result)
+        assertEquals(listOf(2, 1, 1, 2), processor.controls.map { it.maxPipelineDepth })
+    }
+
+    @Test
+    fun resourceProviderExceptionKeepsLastValidResourceAndControl() = runBlocking {
+        val processor = RecordingProcessor(boundariesToEmit = 2)
+        var samples = 0
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { ThermalLevel.NORMAL },
+            runtimeResourceProvider = RuntimePipelineResourceProvider {
+                if (++samples == 1) abundantResources() else error("resource probe unavailable")
+            },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("resource-last-valid"), spec("resource-last-valid")) {}
+
+        assertEquals(ProcessingRunResult.Completed, result)
+        assertEquals(listOf(2, 2, 2), processor.controls.map { it.maxPipelineDepth })
+    }
+
+    @Test
+    fun nullPartialAndThrowingResourceSamplesRetainTheLastCompleteSnapshot() = runBlocking {
+        val processor = RecordingProcessor(boundariesToEmit = 5)
+        var samples = 0
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { ThermalLevel.NORMAL },
+            runtimeResourceProvider = RuntimePipelineResourceProvider {
+                when (samples++) {
+                    0 -> abundantResources()
+                    1 -> null
+                    2 -> RuntimePipelineResources(Long.MAX_VALUE, null, false)
+                    3 -> RuntimePipelineResources(null, Long.MAX_VALUE, false)
+                    else -> error("resource probe unavailable")
+                }
+            },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        val result = runner.run(task("resource-complete-last-valid"), spec("resource-complete-last-valid")) {}
+
+        assertEquals(ProcessingRunResult.Completed, result)
+        assertEquals(listOf(2, 2, 2, 2, 2, 2), processor.controls.map { it.maxPipelineDepth })
+    }
+
+    @Test
+    fun defaultRuntimeResourceProviderFailsClosedAtDepthOne() = runBlocking {
+        val processor = RecordingProcessor()
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { ThermalLevel.NORMAL },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        assertEquals(ProcessingRunResult.Completed, runner.run(task("resource-default"), spec("resource-default")) {})
+
+        assertEquals(1, processor.controls.single().maxPipelineDepth)
     }
 
     @Test
@@ -304,6 +396,18 @@ class SuperResProcessingTaskRunnerTest {
     private fun spec(id: String) = ProcessingWorkSpec.fromParams("model", params(id))
 
     private fun passthroughResolver() = ProcessingExecutionProfileResolver { _, params, _ -> params }
+
+    private fun abundantResources() = RuntimePipelineResources(
+        availableRamBytes = Long.MAX_VALUE,
+        gpuHeapBudgetBytes = Long.MAX_VALUE,
+        isLowRamDevice = false
+    )
+
+    private fun scarceResources() = RuntimePipelineResources(
+        availableRamBytes = 1L,
+        gpuHeapBudgetBytes = 1L,
+        isLowRamDevice = false
+    )
 
     private fun params(id: String): UpscaleParams {
         val root = File("build/thermal/$id").absoluteFile

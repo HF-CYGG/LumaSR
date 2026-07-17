@@ -371,7 +371,8 @@ class NativeProgressSink(
         return intArrayOf(
             lastValidRuntimeControl.commandBatchSize,
             lastValidRuntimeControl.thermalHeadroomPercent,
-            if (lastValidRuntimeControl.shouldPause) 1 else 0
+            if (lastValidRuntimeControl.shouldPause) 1 else 0,
+            lastValidRuntimeControl.maxPipelineDepth
         )
     }
 
@@ -404,7 +405,8 @@ class NativeProgressSink(
         encodeMs: Long,
         effectiveBackendOrdinal: Int,
         effectivePrecisionOrdinal: Int,
-        fallbackReasonOrdinal: Int
+        fallbackReasonOrdinal: Int,
+        requestedMaxPipelineDepth: Int
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -443,7 +445,8 @@ class NativeProgressSink(
                         effectivePrecision = InferencePrecision.entries.getOrElse(effectivePrecisionOrdinal) {
                             InferencePrecision.FP32
                         },
-                        fallbackReason = NativeFallbackReason.entries.getOrNull(fallbackReasonOrdinal)
+                        fallbackReason = NativeFallbackReason.entries.getOrNull(fallbackReasonOrdinal),
+                        requestedMaxPipelineDepth = requestedMaxPipelineDepth.coerceIn(1, 2)
                     )
                 } else {
                     null
@@ -801,7 +804,7 @@ class NativeSuperResProcessor(
                     "inferenceMs=${snapshot.inferenceMs} downloadMs=${snapshot.downloadMs} " +
                     "postprocessMs=${snapshot.postprocessMs} encodeMs=${snapshot.encodeMs} " +
                     "backend=${snapshot.effectiveBackend} precision=${snapshot.effectivePrecision} " +
-                    "fallback=${snapshot.fallbackReason}"
+                    "fallback=${snapshot.fallbackReason} requestedPipelineDepth=${snapshot.requestedMaxPipelineDepth}"
             )
         }
     }

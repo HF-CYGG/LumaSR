@@ -9,6 +9,7 @@ import com.lumasr.domain.ProcessingExecutionProfileResolver
 import com.lumasr.domain.ProcessingOwnerHandoffResult
 import com.lumasr.domain.ProcessingSnapshotLease
 import com.lumasr.domain.ProcessingSnapshotOwner
+import com.lumasr.domain.RuntimePipelineResourceProvider
 import com.lumasr.domain.ThermalLevel
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -215,6 +216,8 @@ object ApplicationForegroundProcessingRuntime {
     fun getOrCreate(
         taskDirectory: File,
         thermalLevelProvider: () -> ThermalLevel? = { null },
+        runtimeResourceProvider: RuntimePipelineResourceProvider =
+            RuntimePipelineResourceProvider { null },
         executionProfileResolver: ProcessingExecutionProfileResolver? = null
     ): ForegroundProcessingRuntime {
         val normalizedDirectory = taskDirectory.absoluteFile.normalize()
@@ -238,10 +241,12 @@ object ApplicationForegroundProcessingRuntime {
                         runner = executionProfileResolver?.let { resolver ->
                             SuperResProcessingTaskRunner(
                                 thermalLevelProvider = thermalLevelProvider,
+                                runtimeResourceProvider = runtimeResourceProvider,
                                 executionProfileResolver = resolver
                             )
                         } ?: SuperResProcessingTaskRunner(
-                            thermalLevelProvider = thermalLevelProvider
+                            thermalLevelProvider = thermalLevelProvider,
+                            runtimeResourceProvider = runtimeResourceProvider
                         ),
                         maintenance = FileProcessingTaskMaintenance(
                             taskRoot = normalizedDirectory,

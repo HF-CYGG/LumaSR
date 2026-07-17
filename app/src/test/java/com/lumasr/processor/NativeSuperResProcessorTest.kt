@@ -41,7 +41,7 @@ class NativeSuperResProcessorTest {
             onProgress = {},
             runtimeControlProvider = RuntimeInferenceControlProvider {
                 if (++callCount == 1) {
-                    RuntimeInferenceControl(99, -5, shouldPause = true)
+                    RuntimeInferenceControl(99, -5, shouldPause = true, maxPipelineDepth = 99)
                 } else {
                     error("provider failed")
                 }
@@ -49,8 +49,8 @@ class NativeSuperResProcessorTest {
             defaultCommandBatchSize = 4
         )
 
-        assertArrayEquals(intArrayOf(8, 0, 1), sink.currentRuntimeControl())
-        assertArrayEquals(intArrayOf(8, 0, 1), sink.currentRuntimeControl())
+        assertArrayEquals(intArrayOf(8, 0, 1, 2), sink.currentRuntimeControl())
+        assertArrayEquals(intArrayOf(8, 0, 1, 2), sink.currentRuntimeControl())
     }
 
     @Test
@@ -196,7 +196,8 @@ class NativeSuperResProcessorTest {
             encodeMs = 133,
             effectiveBackend = NativeBackend.OPTIMIZED,
             effectivePrecision = InferencePrecision.FP16,
-            fallbackReason = NativeFallbackReason.FP16_UNSUPPORTED
+            fallbackReason = NativeFallbackReason.FP16_UNSUPPORTED,
+            requestedMaxPipelineDepth = 2
         )
         val bridge = FakeNativeBridge(
             code = NativeProcessCode.OK,
@@ -235,6 +236,7 @@ class NativeSuperResProcessorTest {
         assertEquals(NativeBackend.OPTIMIZED, progressSnapshots.single().effectiveBackend)
         assertEquals(InferencePrecision.FP16, progressSnapshots.single().effectivePrecision)
         assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, progressSnapshots.single().fallbackReason)
+        assertEquals(2, progressSnapshots.single().requestedMaxPipelineDepth)
     }
 
     @Test
@@ -270,7 +272,8 @@ class NativeSuperResProcessorTest {
             encodeMs = 60,
             effectiveBackendOrdinal = NativeBackend.OPTIMIZED.ordinal,
             effectivePrecisionOrdinal = InferencePrecision.FP32.ordinal,
-            fallbackReasonOrdinal = NativeFallbackReason.FP16_UNSUPPORTED.ordinal
+            fallbackReasonOrdinal = NativeFallbackReason.FP16_UNSUPPORTED.ordinal,
+            requestedMaxPipelineDepth = 2
         )
 
         val snapshot = events.single().performanceSnapshot!!
@@ -283,6 +286,7 @@ class NativeSuperResProcessorTest {
         assertEquals(NativeBackend.OPTIMIZED, snapshot.effectiveBackend)
         assertEquals(InferencePrecision.FP32, snapshot.effectivePrecision)
         assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, snapshot.fallbackReason)
+        assertEquals(2, snapshot.requestedMaxPipelineDepth)
     }
 
     @Test

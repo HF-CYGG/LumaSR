@@ -97,6 +97,7 @@ struct SuperResNativePerformance {
     int effectiveBackend = 0;
     int effectivePrecision = 0;
     int fallbackReason = -1;
+    int requestedMaxPipelineDepth = 1;
 };
 
 using SuperResProgressCallback = std::function<void(
@@ -115,6 +116,9 @@ SuperResNativeCode process_superres(
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl
 );
+
+// Returns the current ncnn Vulkan heap budget in MiB, or zero when unavailable.
+long long read_superres_gpu_heap_budget_mib();
 SuperResNativeCode process_superres_rgb(
     const SuperResNativeParams& params,
     SuperResRgbImage image,

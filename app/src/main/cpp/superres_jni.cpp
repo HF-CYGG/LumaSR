@@ -52,7 +52,7 @@ void emit_progress(
         method = env->GetMethodID(
             sink_class,
             "onProgress",
-            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIII)V"
+            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIIII)V"
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {
@@ -100,7 +100,8 @@ void emit_progress(
             static_cast<jlong>(performance.encodeMs),
             static_cast<jint>(performance.effectiveBackend),
             static_cast<jint>(performance.effectivePrecision),
-            static_cast<jint>(performance.fallbackReason)
+            static_cast<jint>(performance.fallbackReason),
+            static_cast<jint>(performance.requestedMaxPipelineDepth)
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {
@@ -165,19 +166,22 @@ bool read_runtime_control(
         env->DeleteLocalRef(values);
         return false;
     }
-    jint raw[3] = {};
-    env->GetIntArrayRegion(values, 0, 3, raw);
+    jint raw[4] = {};
+    const jsize fieldsToRead = value_count >= 4 ? 4 : 3;
+    env->GetIntArrayRegion(values, 0, fieldsToRead, raw);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         env->DeleteLocalRef(values);
         return false;
     }
     env->DeleteLocalRef(values);
-    control = sanitize_runtime_control(SuperResRuntimeInferenceControl{
+    control = decode_runtime_control_values(
+        static_cast<int>(value_count),
         static_cast<int>(raw[0]),
         static_cast<int>(raw[1]),
-        raw[2] != 0
-    });
+        raw[2] != 0,
+        static_cast<int>(raw[3])
+    );
     return true;
 }
 
@@ -466,7 +470,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
             env,
             progress_sink,
             last_control = sanitize_runtime_control(
-                SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+                SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false, 1}
             )
         ]() mutable {
             SuperResRuntimeInferenceControl next_control;
@@ -559,7 +563,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
             env,
             progress_sink,
             last_control = sanitize_runtime_control(
-                SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false}
+                SuperResRuntimeInferenceControl{params.commandBatchSize, 0, false, 1}
             )
         ]() mutable {
             SuperResRuntimeInferenceControl next_control;
@@ -585,6 +589,15 @@ Java_com_lumasr_processor_JniNativeProcessBridge_cancelNative(
     jstring task_id
 ) {
     cancel_superres(to_string(env, task_id));
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_com_lumasr_data_NativeRuntimeResourceJni_readGpuHeapBudgetMiB(
+    JNIEnv*,
+    jobject
+) {
+    return static_cast<jlong>(read_superres_gpu_heap_budget_mib());
 }
 
 extern "C"
