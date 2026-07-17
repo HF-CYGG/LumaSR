@@ -1,5 +1,6 @@
 package com.lumasr.data
 
+import com.lumasr.processor.RuntimePipelineExtremeResourceProfileProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -111,6 +112,26 @@ class RuntimeResourceSourceTest {
 
         assertEquals(2_000_000_000L, source.current()!!.availableRamBytes)
         assertEquals(1_500_000_000L, source.current()!!.availableRamBytes)
+        assertEquals(1, gpuCalls)
+    }
+
+    @Test
+    fun extremeProfileAdapterReusesTheSourceCachedGpuBudget() {
+        var gpuCalls = 0
+        val source = AndroidRuntimeResourceSource(
+            memoryReader = RuntimeMemoryInfoReader {
+                RuntimeMemoryInfo(availableRamBytes = 2_000_000_000L, isLowRamDevice = false)
+            },
+            gpuHeapBudgetSource = NativeGpuHeapBudgetSource {
+                gpuCalls += 1
+                300_000_000L
+            }
+        )
+
+        assertEquals(300_000_000L, source.current()!!.gpuHeapBudgetBytes)
+        val profile = RuntimePipelineExtremeResourceProfileProvider(source).profile(1024, 1024)
+
+        assertEquals(2_000_000_000L, profile.availableMemoryBytes)
         assertEquals(1, gpuCalls)
     }
 

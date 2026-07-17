@@ -18,6 +18,7 @@ import com.lumasr.domain.NativeGpuHealthProbe
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.ProcessingResourceProfile
 import com.lumasr.domain.RuntimeInferenceControlProvider
+import com.lumasr.domain.RuntimePipelineResourceProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
@@ -43,6 +44,20 @@ fun interface ExtremeRegionSourceFactory {
 
 fun interface ExtremeResourceProfileProvider {
     fun profile(imageWidth: Int, imageHeight: Int): ProcessingResourceProfile
+}
+
+class RuntimePipelineExtremeResourceProfileProvider(
+    private val runtimeResourceProvider: RuntimePipelineResourceProvider
+) : ExtremeResourceProfileProvider {
+    override fun profile(imageWidth: Int, imageHeight: Int): ProcessingResourceProfile {
+        val resources = runCatching { runtimeResourceProvider.current() }.getOrNull()
+        return ProcessingResourceProfile(
+            imageWidth = imageWidth,
+            imageHeight = imageHeight,
+            isLowRamDevice = resources?.isLowRamDevice == true,
+            availableMemoryBytes = resources?.availableRamBytes?.takeIf { it > 0L }
+        )
+    }
 }
 
 interface ExtremeRegionSource : AutoCloseable {

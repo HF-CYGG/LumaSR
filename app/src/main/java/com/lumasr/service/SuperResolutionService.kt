@@ -65,14 +65,15 @@ class SuperResolutionService : Service() {
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
         val taskRepository = FileProcessingTaskRepository(taskDirectory)
         val workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory)
+        val runtimeResourceSource = AndroidRuntimeResourceSource(this)
         coordinator = ProcessingCoordinator(
             taskRepository = taskRepository,
             workSpecRepository = workSpecRepository,
-            runner = SuperResProcessingTaskRunner(
+            runner = createRuntimeAwareTaskRunner(
                 thermalLevelProvider = ThermalSampler(
                     AndroidThermalSignalSource(this)
                 )::sampleLevel,
-                runtimeResourceProvider = AndroidRuntimeResourceSource(this),
+                runtimeResourceProvider = runtimeResourceSource,
                 executionProfileResolver = createInferenceExecutionProfileResolver(this)
             ),
             maintenance = FileProcessingTaskMaintenance(

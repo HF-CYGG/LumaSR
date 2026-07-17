@@ -239,14 +239,15 @@ object ApplicationForegroundProcessingRuntime {
                         taskRepository = taskRepository,
                         workSpecRepository = workSpecRepository,
                         runner = executionProfileResolver?.let { resolver ->
-                            SuperResProcessingTaskRunner(
+                            createRuntimeAwareTaskRunner(
                                 thermalLevelProvider = thermalLevelProvider,
                                 runtimeResourceProvider = runtimeResourceProvider,
                                 executionProfileResolver = resolver
                             )
-                        } ?: SuperResProcessingTaskRunner(
+                        } ?: createRuntimeAwareTaskRunner(
                             thermalLevelProvider = thermalLevelProvider,
-                            runtimeResourceProvider = runtimeResourceProvider
+                            runtimeResourceProvider = runtimeResourceProvider,
+                            executionProfileResolver = null
                         ),
                         maintenance = FileProcessingTaskMaintenance(
                             taskRoot = normalizedDirectory,
