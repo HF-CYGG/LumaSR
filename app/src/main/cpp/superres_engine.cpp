@@ -442,6 +442,74 @@ std::string performance_model_key(const SuperResNativeParams& params) {
     return key.empty() ? "unknown" : key;
 }
 
+void log_native_performance_sample(
+    const SuperResNativeParams& params,
+    bool useVulkan,
+    const SuperResExecutionProfile& executionProfile,
+    const SuperResNativePerformance& performance,
+    const char* timingScope,
+    bool finalPublishPending
+) {
+    const std::string modelKey = performance_model_key(params);
+    unsigned int driverId = 0u;
+    unsigned int driverVersion = 0u;
+    if (useVulkan) {
+        const int gpuIndex = ncnn::get_default_gpu_index();
+        const int gpuCount = ncnn::get_gpu_count();
+        if (gpuIndex >= 0 && gpuIndex < gpuCount) {
+            const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
+            driverId = static_cast<unsigned int>(gpuInfo.driver_id());
+            driverVersion = static_cast<unsigned int>(gpuInfo.driver_version());
+        }
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=%s finalPublishPending=%d",
+        params.taskId.c_str(),
+        modelKey.c_str(),
+        modelKey.c_str(),
+        driverId,
+        driverVersion,
+        acceleration_name(useVulkan),
+        performance.effectiveBackend,
+        performance.effectivePrecision,
+        performance.fallbackReason,
+        performance.requestedMaxPipelineDepth,
+        performance.effectivePipelineDepth,
+        performance.peakOccupiedPipelineSlots,
+        performance.peakPipelineSlotBytes,
+        performance.producerWaitMs,
+        performance.consumerWaitMs,
+        performance.pipelineOverlapMs,
+        executionProfile.cpuThreads,
+        executionProfile.openmpBlocktimeMs,
+        executionProfile.postprocessThreads,
+        executionProfile.commandBatchSize,
+        executionProfile.modelCacheCapacity,
+        performance.cacheHit ? 1 : 0,
+        performance.cacheSize,
+        performance.retryCount,
+        performance.regionIndex,
+        performance.tileSize,
+        performance.decodeMs,
+        performance.modelLoadMs,
+        performance.tileInputMs,
+        performance.tileExtractMs,
+        performance.tileCopyMs,
+        performance.saveMs,
+        performance.preprocessMs,
+        performance.uploadMs,
+        performance.inferenceMs,
+        performance.downloadMs,
+        performance.postprocessMs,
+        performance.encodeMs,
+        performance.totalMs,
+        timingScope,
+        finalPublishPending ? 1 : 0
+    );
+}
+
 std::string join_path(const std::string& dir, const std::string& name) {
     if (dir.empty()) {
         return name;
@@ -2494,6 +2562,14 @@ SuperResNativeCode run_ncnn_image_to_extreme_target_attempt(
     performance.postprocessMs = performance.tileCopyMs;
     performance.totalMs = elapsed_ms(totalStart);
     performance.hasValue = true;
+    log_native_performance_sample(
+        params,
+        useVulkan,
+        executionProfile,
+        performance,
+        "extreme_region",
+        true
+    );
     emit(
         onProgress,
         SuperResNativeStage::ProcessingTile,
@@ -2887,61 +2963,13 @@ SuperResNativeCode run_ncnn_image_attempt(
     performance.encodeMs = safeTiming.encodeMs;
     performance.totalMs = safeTiming.totalMs;
     performance.hasValue = true;
-    const std::string modelKey = performance_model_key(params);
-    unsigned int driverId = 0u;
-    unsigned int driverVersion = 0u;
-    if (useVulkan) {
-        const int gpuIndex = ncnn::get_default_gpu_index();
-        const int gpuCount = ncnn::get_gpu_count();
-        if (gpuIndex >= 0 && gpuIndex < gpuCount) {
-            const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(gpuIndex);
-            driverId = static_cast<unsigned int>(gpuInfo.driver_id());
-            driverVersion = static_cast<unsigned int>(gpuInfo.driver_version());
-        }
-    }
-    __android_log_print(
-        ANDROID_LOG_INFO,
-        kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
-        params.taskId.c_str(),
-        modelKey.c_str(),
-        modelKey.c_str(),
-        driverId,
-        driverVersion,
-        acceleration_name(useVulkan),
-        performance.effectiveBackend,
-        performance.effectivePrecision,
-        performance.fallbackReason,
-        performance.requestedMaxPipelineDepth,
-        performance.effectivePipelineDepth,
-        performance.peakOccupiedPipelineSlots,
-        performance.peakPipelineSlotBytes,
-        performance.producerWaitMs,
-        performance.consumerWaitMs,
-        performance.pipelineOverlapMs,
-        executionProfile.cpuThreads,
-        executionProfile.openmpBlocktimeMs,
-        executionProfile.postprocessThreads,
-        executionProfile.commandBatchSize,
-        executionProfile.modelCacheCapacity,
-        performance.cacheHit ? 1 : 0,
-        performance.cacheSize,
-        performance.retryCount,
-        performance.regionIndex,
-        performance.tileSize,
-        performance.decodeMs,
-        performance.modelLoadMs,
-        performance.tileInputMs,
-        performance.tileExtractMs,
-        performance.tileCopyMs,
-        performance.saveMs,
-        performance.preprocessMs,
-        performance.uploadMs,
-        performance.inferenceMs,
-        performance.downloadMs,
-        performance.postprocessMs,
-        performance.encodeMs,
-        performance.totalMs
+    log_native_performance_sample(
+        params,
+        useVulkan,
+        executionProfile,
+        performance,
+        "pre_publish_safe",
+        true
     );
 
     const auto emitPerformance = [&]() {

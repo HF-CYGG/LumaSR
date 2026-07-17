@@ -145,6 +145,12 @@ android {
             version = "3.22.1"
         }
     }
+
+    sourceSets {
+        getByName("test").java.srcDir(
+            rootProject.file("benchmark-shared/src/main/kotlin")
+        )
+    }
 }
 
 dependencies {

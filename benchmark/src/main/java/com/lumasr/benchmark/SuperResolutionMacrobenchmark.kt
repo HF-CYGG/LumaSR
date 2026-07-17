@@ -95,9 +95,44 @@ class SuperResolutionMacrobenchmark {
     @Test
     fun animeVideo4Mp2xWarm() = benchmark(ANIME_VIDEO_4_MP, CacheMode.WARM)
 
-    private fun benchmark(scenario: Scenario, cacheMode: CacheMode) {
+    @Test
+    fun waifu2xExtreme67Mp2xWarm() = benchmark(
+        scenario = WAIFU2X_EXTREME_67_MP,
+        cacheMode = CacheMode.WARM,
+        forcedProfileMode = ProfileMode.LEGACY
+    )
+
+    @Test
+    fun realEsrganPipeline4xWarm() = benchmark(
+        scenario = REALESRGAN_PIPELINE_4X,
+        cacheMode = CacheMode.WARM,
+        forcedProfileMode = ProfileMode.LEGACY
+    )
+
+    @Test
+    fun waifu2xTtaSafeWarm() = benchmark(
+        scenario = WAIFU2X_TTA_SAFE,
+        cacheMode = CacheMode.WARM,
+        forcedProfileMode = ProfileMode.LEGACY
+    )
+
+    @Test
+    fun waifu2xTtaOptimizedWarm() = benchmark(
+        scenario = WAIFU2X_TTA_OPTIMIZED,
+        cacheMode = CacheMode.WARM,
+        forcedProfileMode = ProfileMode.OPTIMIZED
+    )
+
+    private fun benchmark(
+        scenario: Scenario,
+        cacheMode: CacheMode,
+        forcedProfileMode: ProfileMode? = null
+    ) {
         ensurePhysicalGateIsInformationalOnly()
-        val profileMode = requestedProfileMode()
+        val profileMode = forcedProfileMode ?: requestedProfileMode()
+        forcedProfileMode?.let { forced ->
+            resetTargetAppStateForForcedProfile(scenario, forced)
+        }
         generatedAssets += SyntheticMediaAsset.create(
             context = context,
             scenarioId = scenario.id,
@@ -144,6 +179,16 @@ class SuperResolutionMacrobenchmark {
         )
     }
 
+    private fun resetTargetAppStateForForcedProfile(
+        scenario: Scenario,
+        profileMode: ProfileMode
+    ) {
+        val output = device.executeShellCommand("pm clear $TARGET_PACKAGE")
+        check(output.trim() == "Success") {
+            "Cannot isolate ${scenario.id} ${profileMode.outputLabel}: pm clear returned '${output.trim()}'"
+        }
+    }
+
     private fun MacrobenchmarkScope.prepareScenario(
         scenario: Scenario,
         cacheMode: CacheMode,
@@ -160,7 +205,7 @@ class SuperResolutionMacrobenchmark {
             killProcess()
             launchAndSelectScenario(scenario)
         }
-        selectStableProcessingDefaults()
+        selectStableProcessingDefaults(scenario)
         scrollToStartButton().also { start ->
             check(start.isEnabled) { "Start button stayed disabled for ${scenario.id}" }
         }
@@ -215,15 +260,52 @@ class SuperResolutionMacrobenchmark {
         navigateTo("处理")
     }
 
-    private fun selectStableProcessingDefaults() {
+    private fun selectStableProcessingDefaults(scenario: Scenario) {
+        scenario.pipelineDenoiseLevel?.let(::selectPipelineDenoiseLevel)
         val gpu = scrollUntilFound(By.text("GPU"), maxSwipes = 12)
             ?: error("Cannot select the stable AUTO GPU profile")
         gpu.click()
         device.waitForIdle()
-        val automaticTile = scrollUntilFound(By.text("自动"), maxSwipes = 6)
-            ?: error("Cannot select automatic tile sizing")
-        automaticTile.click()
+        val tileLabel = scenario.tileSize?.toString() ?: "自动"
+        val tile = scrollUntilFound(By.text(tileLabel), maxSwipes = 6)
+            ?: error("Cannot select tile sizing '$tileLabel' for ${scenario.id}")
+        tile.click()
         device.waitForIdle()
+        if (scenario.tta) {
+            enableTtaThroughProductionSwitch(scenario)
+        }
+    }
+
+    private fun selectPipelineDenoiseLevel(level: Int) {
+        require(level in 1..3) { "Pipeline denoise level must be in 1..3" }
+        scrollUntilFound(By.text("预降噪"), maxSwipes = 8)
+            ?: error("Cannot find the production pre-denoise control")
+        val slider = device.findObjects(By.clazz("android.widget.SeekBar")).singleOrNull()
+            ?: error("Expected one production pre-denoise slider")
+        val bounds = slider.visibleBounds
+        val targetX = bounds.left + (bounds.width() * level / 3f).toInt()
+        check(device.click(targetX.coerceIn(bounds.left + 1, bounds.right - 1), bounds.centerY())) {
+            "Cannot select pre-denoise level $level"
+        }
+        device.waitForIdle()
+    }
+
+    private fun enableTtaThroughProductionSwitch(scenario: Scenario) {
+        scrollUntilFound(By.text(TTA_TEXT), maxSwipes = 6)
+            ?: error("Cannot find the production TTA control for ${scenario.id}")
+        val ttaSwitch = device.findObjects(By.clazz("android.widget.Switch")).singleOrNull()
+            ?: error("Expected one production TTA switch for ${scenario.id}")
+        check(ttaSwitch.isEnabled) { "TTA switch is disabled for ${scenario.id}" }
+        if (!ttaSwitch.isChecked) {
+            ttaSwitch.click()
+        }
+        val deadline = SystemClock.uptimeMillis() + UI_TIMEOUT_MS
+        while (SystemClock.uptimeMillis() < deadline) {
+            val current = device.findObjects(By.clazz("android.widget.Switch")).singleOrNull()
+            if (current?.isChecked == true) return
+            SystemClock.sleep(100)
+        }
+        error("TTA switch did not become checked for ${scenario.id}")
     }
 
     private fun navigateTo(destination: String) {
@@ -255,8 +337,14 @@ class SuperResolutionMacrobenchmark {
         check(nativeFields["accel"] == "vulkan") {
             "${scenario.id} expected the requested AUTO GPU path, accel=${nativeFields["accel"]}"
         }
-        check(nativeFields["region"] == "-1") {
-            "${scenario.id} expected a whole-task native record, region=${nativeFields["region"]}"
+        val region = nativeFields["region"]?.toIntOrNull()
+        check(
+            when (scenario.nativeEvidenceMode) {
+                NativeEvidenceMode.WHOLE_TASK -> region == -1
+                NativeEvidenceMode.EXTREME_TILES -> region != null && region >= 0
+            }
+        ) {
+            "${scenario.id} emitted an unexpected native region=${nativeFields["region"]}"
         }
         check(nativeFields["retry"] == "0") {
             "${scenario.id} must not publish fallback/retry evidence as the measured run"
@@ -268,6 +356,15 @@ class SuperResolutionMacrobenchmark {
         listOf("driverId", "driverVersion").forEach { field ->
             check(nativeFields[field] !in INVALID_DRIVER_IDENTITY_VALUES) {
                 "${scenario.id} requires a non-zero Vulkan $field, got ${nativeFields[field]}"
+            }
+        }
+        if (scenario.tta) {
+            val expectedBatch = if (profileMode == ProfileMode.OPTIMIZED) "2" else "1"
+            check(nativeFields["batch"] == expectedBatch) {
+                "${scenario.id} expected TTA pass batch $expectedBatch, got ${nativeFields["batch"]}"
+            }
+            check(nativeFields["pipelineDepth"] == "1") {
+                "${scenario.id} must keep TTA at pipelineDepth=1"
             }
         }
     }
@@ -444,58 +541,81 @@ class SuperResolutionMacrobenchmark {
     private fun waitForNativePerformanceEvidence(scenario: Scenario): Map<String, String> {
         val deadline = SystemClock.uptimeMillis() + NATIVE_LOG_TIMEOUT_MS
         while (SystemClock.uptimeMillis() < deadline) {
-            val lines = device.executeShellCommand("logcat -d -v raw -s LumaSRNative:I")
+            val lines = readPerformanceLogLines()
                 .lineSequence()
                 .filter { it.startsWith("Performance task=") }
                 .toList()
             if (lines.isNotEmpty()) {
                 // Completion UI is already visible; a short settle avoids accepting a partial log snapshot.
                 SystemClock.sleep(NATIVE_LOG_SETTLE_MS)
-                return validateNativePerformanceEvidence(
+                val settledLines = readPerformanceLogLines().lineSequence().toList()
+                val performanceLines = settledLines
+                    .filter { it.startsWith("Performance task=") }
+                val taskIds = performanceLines.map(BenchmarkNativeEvidence::parseFields)
+                    .mapNotNull { fields -> fields["task"] }
+                    .filter(String::isNotBlank)
+                    .distinct()
+                check(taskIds.size == 1) {
+                    "${scenario.id} expected one native task after log reset, got $taskIds"
+                }
+                val transportMode = resolveTransportMode(
                     scenario = scenario,
-                    lines = device.executeShellCommand("logcat -d -v raw -s LumaSRNative:I")
-                        .lineSequence()
-                        .filter { it.startsWith("Performance task=") }
-                        .toList()
+                    lines = settledLines,
+                    taskId = taskIds.single()
                 )
+                val nativeFields = validateNativePerformanceEvidence(
+                    scenario = scenario,
+                    lines = performanceLines,
+                    transportMode = transportMode
+                )
+                return nativeFields + ("transportMode" to transportMode)
             }
             SystemClock.sleep(250)
         }
         error("${scenario.id} did not emit native stage timings")
     }
 
-    private fun validateNativePerformanceEvidence(
+    private fun readPerformanceLogLines(): String =
+        device.executeShellCommand(
+            "logcat -d -v raw -s LumaSRNative:I LumaSRPerformance:I"
+        )
+
+    private fun resolveTransportMode(
         scenario: Scenario,
-        lines: List<String>
-    ): Map<String, String> {
-        val evidence = lines.map(::parseNativeFields)
-        val taskIds = evidence.mapNotNull { fields -> fields["task"] }
-            .filter(String::isNotBlank)
+        lines: List<String>,
+        taskId: String
+    ): String {
+        if (!scenario.requiresPipelineTransportEvidence) return "not-applicable"
+        val transportModes = lines
+            .filter { it.startsWith("task=") && it.contains("transportMode=") }
+            .map(BenchmarkNativeEvidence::parseFields)
+            .filter { fields -> fields["task"] == taskId }
+            .mapNotNull { fields -> fields["transportMode"] }
             .distinct()
-        check(taskIds.size == 1 && evidence.all { fields -> fields["task"] == taskIds.single() }) {
-            "${scenario.id} expected one native task after log reset, got $taskIds"
+        check(transportModes.size == 1) {
+            "${scenario.id} expected one pipeline transport mode for task=$taskId, got $transportModes"
         }
-        val finalEvidence = evidence.filter { fields ->
-            fields["region"] == "-1" && fields["retry"] == "0"
-        }
-        check(finalEvidence.size == 1) {
-            "${scenario.id} expected exactly one final region=-1 retry=0 record, " +
-                "got ${finalEvidence.size} from ${lines.size} lines"
-        }
-        val nativeFields = finalEvidence.single()
-        REQUIRED_NATIVE_EVIDENCE_FIELDS.forEach { field ->
-            val value = nativeFields[field]
-            check(!value.isNullOrBlank() && value != "missing" && value != "unknown") {
-                "${scenario.id} native evidence is missing required field '$field'"
-            }
-        }
-        return nativeFields
+        return transportModes.single()
     }
 
-    private fun parseNativeFields(line: String): Map<String, String> {
-        return NATIVE_FIELD_PATTERN.findAll(line)
-            .associate { match -> match.groupValues[1] to match.groupValues[2] }
-    }
+    private fun validateNativePerformanceEvidence(
+        scenario: Scenario,
+        lines: List<String>,
+        transportMode: String
+    ): Map<String, String> = BenchmarkNativeEvidence.validate(
+        lines = lines,
+        spec = BenchmarkNativeEvidenceSpec(
+            scenarioId = scenario.id,
+            mode = when (scenario.nativeEvidenceMode) {
+                NativeEvidenceMode.WHOLE_TASK -> BenchmarkNativeEvidenceMode.WHOLE_TASK
+                NativeEvidenceMode.EXTREME_TILES -> BenchmarkNativeEvidenceMode.EXTREME_TILES
+            },
+            expectedNativeModelKey = scenario.expectedNativeModelKey,
+            transportMode = transportMode,
+            expectedPipelinePassCount = scenario.expectedPipelinePassCount,
+            expectedPipelineModelKeys = scenario.expectedPipelineModelKeys
+        )
+    )
 
     private fun emitDiscardedWarmupResult(
         scenario: Scenario,
@@ -506,9 +626,11 @@ class SuperResolutionMacrobenchmark {
         val runtimeIdentity = runtimeIdentityFields(scenario, profileMode, sample.nativeFields)
         Log.i(
             OUTPUT_TAG,
-            "LUMASR_BENCHMARK schema=1 phase=warmup_discarded scenario=${scenario.id} " +
+            "LUMASR_BENCHMARK schema=2 phase=warmup_discarded scenario=${scenario.id} " +
+                "workload=${scenario.workload.outputLabel} " +
                 "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
-                "cache=warm width=${scenario.width} height=${scenario.height} tta=false iteration=0 " +
+                "cache=warm width=${scenario.width} height=${scenario.height} " +
+                "outputPixels=${scenario.outputPixels} tta=${scenario.tta} iteration=0 " +
                 "elapsedMs=${format(sample.elapsedMs)} ${deviceIdentityFields()} $runtimeIdentity $native"
         )
     }
@@ -530,14 +652,22 @@ class SuperResolutionMacrobenchmark {
             "${scenario.id} runtime identity changed across measured samples: $runtimeIdentities"
         }
         val runtimeIdentity = runtimeIdentities.single()
+        val transportModes = measured.map { sample -> sample.nativeFields.getValue("transportMode") }
+            .distinct()
+        check(transportModes.size == 1) {
+            "${scenario.id} transport mode changed across measured samples: $transportModes"
+        }
+        val transportMode = transportModes.single()
         measured.forEachIndexed { index, sample ->
             val native = formatNativeFields(sample.nativeFields)
             Log.i(
                 OUTPUT_TAG,
-                "LUMASR_BENCHMARK schema=1 phase=measured scenario=${scenario.id} " +
+                "LUMASR_BENCHMARK schema=2 phase=measured scenario=${scenario.id} " +
+                    "workload=${scenario.workload.outputLabel} " +
                     "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
                     "cache=${cacheMode.name.lowercase()} " +
-                    "width=${scenario.width} height=${scenario.height} tta=false iteration=${index + 1} " +
+                    "width=${scenario.width} height=${scenario.height} " +
+                    "outputPixels=${scenario.outputPixels} tta=${scenario.tta} iteration=${index + 1} " +
                     "elapsedMs=${format(sample.elapsedMs)} $identity $runtimeIdentity $native"
             )
         }
@@ -548,9 +678,11 @@ class SuperResolutionMacrobenchmark {
         val thirdVsFirst = elapsed.last() / elapsed.first()
         Log.i(
             OUTPUT_TAG,
-            "LUMASR_BENCHMARK schema=1 phase=summary scenario=${scenario.id} " +
+            "LUMASR_BENCHMARK schema=2 phase=summary scenario=${scenario.id} " +
+                "workload=${scenario.workload.outputLabel} " +
                 "modelId=${scenario.modelId} requestedProfile=${profileMode.outputLabel} " +
                 "cache=${cacheMode.name.lowercase()} " +
+                "outputPixels=${scenario.outputPixels} tta=${scenario.tta} transportMode=$transportMode " +
                 "samples=${elapsed.size} medianMs=${format(median)} geometricMeanMs=${format(geometricMean)} " +
                 "thirdVsFirst=${format(thirdVsFirst)} $identity $runtimeIdentity"
         )
@@ -664,8 +796,49 @@ class SuperResolutionMacrobenchmark {
         val expectedNativeModelKey: String,
         val width: Int,
         val height: Int,
-        val timeoutMillis: Long
-    )
+        val timeoutMillis: Long,
+        val scale: Int = 2,
+        val tileSize: Int? = null,
+        val pipelineDenoiseLevel: Int? = null,
+        val tta: Boolean = false,
+        val workload: Workload = Workload.STANDARD,
+        val nativeEvidenceMode: NativeEvidenceMode = NativeEvidenceMode.WHOLE_TASK,
+        val requiresPipelineTransportEvidence: Boolean = false,
+        val expectedPipelinePassCount: Int = 0,
+        val expectedPipelineModelKeys: List<String> = emptyList()
+    ) {
+        val outputPixels: Long = width.toLong() * height.toLong() * scale.toLong() * scale.toLong()
+
+        init {
+            require(width > 0 && height > 0 && scale > 0)
+            if (workload == Workload.EXTREME) {
+                require(outputPixels > EXTREME_OUTPUT_MIN_PIXELS) {
+                    "Extreme benchmark output must be greater than 64MP"
+                }
+            }
+            require(
+                (workload == Workload.MULTI_STAGE_PIPELINE) ==
+                    (
+                        requiresPipelineTransportEvidence &&
+                            expectedPipelinePassCount >= 2 &&
+                            expectedPipelineModelKeys.size == expectedPipelinePassCount
+                        )
+            )
+            require((workload == Workload.TTA) == tta)
+        }
+    }
+
+    private enum class Workload(val outputLabel: String) {
+        STANDARD("standard"),
+        EXTREME("extreme"),
+        MULTI_STAGE_PIPELINE("multi-stage-pipeline"),
+        TTA("tta")
+    }
+
+    private enum class NativeEvidenceMode {
+        WHOLE_TASK,
+        EXTREME_TILES
+    }
 
     private companion object {
         const val TARGET_PACKAGE = "com.lumasr"
@@ -681,7 +854,8 @@ class SuperResolutionMacrobenchmark {
         const val NATIVE_LOG_SETTLE_MS = 250L
         const val CALIBRATION_TIMEOUT_MS = 6L * 60L * 1_000L
         const val FIRST_RUN_PROMPT_TIMEOUT_MS = 3_000L
-        val NATIVE_FIELD_PATTERN = Regex("([A-Za-z][A-Za-z0-9]*)=([^\\s]+)")
+        const val TTA_TEXT = "TTA 高质量"
+        const val EXTREME_OUTPUT_MIN_PIXELS = 64_000_000L
         val NATIVE_OUTPUT_FIELDS = listOf(
             "task",
             "modelKey",
@@ -699,6 +873,8 @@ class SuperResolutionMacrobenchmark {
             "producerWaitMs",
             "consumerWaitMs",
             "overlapMs",
+            "transportMode",
+            "nativeRecordCount",
             "threads",
             "blocktimeMs",
             "postprocessThreads",
@@ -721,25 +897,6 @@ class SuperResolutionMacrobenchmark {
             "downloadMs",
             "postprocessMs",
             "encodeMs",
-            "totalMs"
-        )
-        val REQUIRED_NATIVE_EVIDENCE_FIELDS = listOf(
-            "task",
-            "modelKey",
-            "driverId",
-            "driverVersion",
-            "region",
-            "retry",
-            "backend",
-            "precision",
-            "requestedPipelineDepth",
-            "pipelineDepth",
-            "peakOccupiedSlots",
-            "peakSlotBytes",
-            "producerWaitMs",
-            "consumerWaitMs",
-            "overlapMs",
-            "postprocessThreads",
             "totalMs"
         )
         val INVALID_DRIVER_IDENTITY_VALUES = setOf(
@@ -776,6 +933,59 @@ class SuperResolutionMacrobenchmark {
             width = 2_000,
             height = 2_000,
             timeoutMillis = 20 * 60 * 1_000L
+        )
+        val WAIFU2X_EXTREME_67_MP = Scenario(
+            id = "waifu2x_extreme_67mp_2x",
+            modelId = "waifu2x-cunet",
+            modelCardText = "CUnet",
+            expectedNativeModelKey = "waifu2x-cunet",
+            width = 4_096,
+            height = 4_096,
+            timeoutMillis = 60 * 60 * 1_000L,
+            scale = 2,
+            workload = Workload.EXTREME,
+            nativeEvidenceMode = NativeEvidenceMode.EXTREME_TILES
+        )
+        val REALESRGAN_PIPELINE_4X = Scenario(
+            id = "realesrgan_pipeline_1mp_4x",
+            modelId = "realesrgan-general-x4",
+            modelCardText = "通用4x",
+            expectedNativeModelKey = "realesrgan-x4plus",
+            width = 1_000,
+            height = 1_000,
+            timeoutMillis = 30 * 60 * 1_000L,
+            scale = 4,
+            pipelineDenoiseLevel = 1,
+            workload = Workload.MULTI_STAGE_PIPELINE,
+            requiresPipelineTransportEvidence = true,
+            expectedPipelinePassCount = 2,
+            expectedPipelineModelKeys = listOf("waifu2x-cunet", "realesrgan-x4plus")
+        )
+        val WAIFU2X_TTA_SAFE = Scenario(
+            id = "waifu2x_1mp_2x_tta_safe",
+            modelId = "waifu2x-cunet",
+            modelCardText = "CUnet",
+            expectedNativeModelKey = "waifu2x-cunet",
+            width = 512,
+            height = 512,
+            timeoutMillis = 30 * 60 * 1_000L,
+            scale = 2,
+            tileSize = 128,
+            tta = true,
+            workload = Workload.TTA
+        )
+        val WAIFU2X_TTA_OPTIMIZED = Scenario(
+            id = "waifu2x_1mp_2x_tta_optimized",
+            modelId = "waifu2x-cunet",
+            modelCardText = "CUnet",
+            expectedNativeModelKey = "waifu2x-cunet",
+            width = 512,
+            height = 512,
+            timeoutMillis = 30 * 60 * 1_000L,
+            scale = 2,
+            tileSize = 128,
+            tta = true,
+            workload = Workload.TTA
         )
     }
 }
