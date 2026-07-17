@@ -8,6 +8,7 @@ import android.os.Build
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.ExtremeAccelerationPolicy
 import com.lumasr.domain.ExtremeExportPlanner
 import com.lumasr.domain.ExtremeExportTileSpec
@@ -82,10 +83,14 @@ class HybridSuperResProcessor(
     }
 
     override fun cancel(taskId: String) {
+        cancel(taskId, InferenceStopReason.USER_REQUEST)
+    }
+
+    override fun cancel(taskId: String, reason: InferenceStopReason) {
         if (nativeAvailable()) {
-            nativeProcessor.cancel(taskId)
+            nativeProcessor.cancel(taskId, reason)
         }
-        if (allowMockFallback) fallbackProcessor.cancel(taskId)
+        if (allowMockFallback) fallbackProcessor.cancel(taskId, reason)
     }
 
     override fun clearNativeCache() {

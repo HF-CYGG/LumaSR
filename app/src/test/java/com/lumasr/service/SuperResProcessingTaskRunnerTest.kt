@@ -3,6 +3,7 @@ package com.lumasr.service
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.CalibrationExecutionGate
 import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingClock
@@ -150,6 +151,10 @@ class SuperResProcessingTaskRunnerTest {
             result
         )
         assertEquals(listOf("thermal-boundary"), processor.cancelledTaskIds)
+        assertEquals(
+            listOf(InferenceStopReason.THERMAL_CRITICAL_PAUSE),
+            processor.stopReasons
+        )
         assertEquals(
             RuntimeInferenceControl(1, 20, shouldPause = true),
             processor.controls.last()
@@ -314,6 +319,7 @@ class SuperResProcessingTaskRunnerTest {
         val requests = mutableListOf<UpscaleParams>()
         val controls = mutableListOf<RuntimeInferenceControl>()
         val cancelledTaskIds = mutableListOf<String>()
+        val stopReasons = mutableListOf<InferenceStopReason>()
 
         override suspend fun process(
             params: UpscaleParams,
@@ -349,6 +355,11 @@ class SuperResProcessingTaskRunnerTest {
 
         override fun cancel(taskId: String) {
             cancelledTaskIds += taskId
+        }
+
+        override fun cancel(taskId: String, reason: InferenceStopReason) {
+            cancelledTaskIds += taskId
+            stopReasons += reason
         }
     }
 }

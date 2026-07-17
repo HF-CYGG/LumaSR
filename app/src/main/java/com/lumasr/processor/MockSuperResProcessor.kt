@@ -1,5 +1,6 @@
 package com.lumasr.processor
 
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.UpscaleParams
@@ -68,6 +69,10 @@ class MockSuperResProcessor(
     }
 
     override fun cancel(taskId: String) {
+        cancel(taskId, InferenceStopReason.USER_REQUEST)
+    }
+
+    override fun cancel(taskId: String, reason: InferenceStopReason) {
         cancelledTasks += taskId
     }
 

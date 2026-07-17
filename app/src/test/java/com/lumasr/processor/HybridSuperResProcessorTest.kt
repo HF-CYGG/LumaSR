@@ -3,6 +3,7 @@ package com.lumasr.processor
 import android.graphics.Bitmap
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.RuntimeInferenceControl
@@ -257,7 +258,28 @@ class HybridSuperResProcessorTest {
         processor.cancel("task-1")
 
         assertEquals(listOf("task-1"), nativeProcessor.cancelledTaskIds)
+        assertEquals(
+            listOf(InferenceStopReason.USER_REQUEST),
+            nativeProcessor.stopReasons
+        )
         assertEquals(0, nativeProcessor.clearCacheCount)
+    }
+
+    @Test
+    fun thermalPauseCancelReasonIsForwardedToNativeProcessor() {
+        val nativeProcessor = RecordingCacheProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            nativeAvailable = { true }
+        )
+
+        processor.cancel("task-1", InferenceStopReason.THERMAL_CRITICAL_PAUSE)
+
+        assertEquals(listOf("task-1"), nativeProcessor.cancelledTaskIds)
+        assertEquals(
+            listOf(InferenceStopReason.THERMAL_CRITICAL_PAUSE),
+            nativeProcessor.stopReasons
+        )
     }
 
     @Test
@@ -318,6 +340,7 @@ private class RecordingProcessor : SuperResProcessor {
 
 private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
     val cancelledTaskIds = mutableListOf<String>()
+    val stopReasons = mutableListOf<InferenceStopReason>()
     var clearCacheCount = 0
         private set
 
@@ -331,6 +354,11 @@ private class RecordingCacheProcessor : SuperResProcessor, NativeCacheOwner {
 
     override fun cancel(taskId: String) {
         cancelledTaskIds += taskId
+    }
+
+    override fun cancel(taskId: String, reason: InferenceStopReason) {
+        cancelledTaskIds += taskId
+        stopReasons += reason
     }
 
     override fun clearNativeCache() {

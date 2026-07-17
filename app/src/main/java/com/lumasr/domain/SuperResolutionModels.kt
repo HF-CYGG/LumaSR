@@ -195,6 +195,11 @@ fun interface RuntimeInferenceControlProvider {
     fun current(): RuntimeInferenceControl
 }
 
+enum class InferenceStopReason {
+    USER_REQUEST,
+    THERMAL_CRITICAL_PAUSE
+}
+
 interface SuperResProcessor {
     suspend fun process(
         params: UpscaleParams,
@@ -208,4 +213,6 @@ interface SuperResProcessor {
     ): UpscaleResult
 
     fun cancel(taskId: String)
+
+    fun cancel(taskId: String, reason: InferenceStopReason) = cancel(taskId)
 }

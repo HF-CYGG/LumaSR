@@ -5,6 +5,7 @@ import com.lumasr.domain.AdaptiveInferencePolicy
 import com.lumasr.domain.CalibrationExecutionGate
 import com.lumasr.domain.InferenceExecutionProfileMapper
 import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.ProcessingFailureCode
 import com.lumasr.domain.ProcessingClock
@@ -90,7 +91,10 @@ class SuperResProcessingTaskRunner(
                             nextLevel == ThermalLevel.CRITICAL &&
                             stoppedForCriticalThermal.compareAndSet(false, true)
                         ) {
-                            processor.cancel(currentParams.taskId)
+                            processor.cancel(
+                                currentParams.taskId,
+                                InferenceStopReason.THERMAL_CRITICAL_PAUSE
+                            )
                         }
                     }
                 }

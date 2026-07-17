@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
@@ -20,7 +21,12 @@ import com.lumasr.domain.UpscaleResult
 import com.lumasr.domain.UpscaleStage
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 enum class NativeProcessCode(val rawCode: Int) {
     OK(0),
@@ -447,6 +453,56 @@ class NativeProgressSink(
     }
 }
 
+private class ActiveNativeStopState {
+    private val stopDeliveryLock = ReentrantLock()
+    private var acceptingStops = true
+    private var firstNativeProgressSeen = false
+    private var stopReason: InferenceStopReason? = null
+
+    fun beginStopDelivery(reason: InferenceStopReason): NativeStopDeliveryLease? {
+        stopDeliveryLock.lock()
+        if (!acceptingStops) {
+            stopDeliveryLock.unlock()
+            return null
+        }
+        stopReason = when {
+            stopReason == InferenceStopReason.USER_REQUEST -> InferenceStopReason.USER_REQUEST
+            reason == InferenceStopReason.USER_REQUEST -> InferenceStopReason.USER_REQUEST
+            else -> InferenceStopReason.THERMAL_CRITICAL_PAUSE
+        }
+        return NativeStopDeliveryLease(stopDeliveryLock)
+    }
+
+    fun pendingStopAtFirstNativeProgress(): InferenceStopReason? {
+        return stopDeliveryLock.withLock {
+            if (firstNativeProgressSeen) return@withLock null
+            firstNativeProgressSeen = true
+            stopReason
+        }
+    }
+
+    fun finish(): InferenceStopReason? {
+        return stopDeliveryLock.withLock {
+            acceptingStops = false
+            stopReason
+        }
+    }
+}
+
+private class NativeStopDeliveryLease(
+    private val stopDeliveryLock: ReentrantLock
+) : AutoCloseable {
+    override fun close() {
+        stopDeliveryLock.unlock()
+    }
+}
+
+private sealed interface NativeTaskRunResult {
+    data class Completed(val code: NativeProcessCode) : NativeTaskRunResult
+
+    data object Busy : NativeTaskRunResult
+}
+
 class NativeSuperResProcessor(
     private val bridge: NativeProcessBridge = JniNativeProcessBridge,
     isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
@@ -454,6 +510,8 @@ class NativeSuperResProcessor(
     private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit = ::logPerformance
 ) : SuperResProcessor, NativeCacheOwner, NativeRawTileMerger, NativeBitmapRegionProcessor {
     private val isNativeAvailable = isAvailable
+    // Entries exist only while their matching bridge call is active; state identity prevents cross-run cleanup.
+    private val activeStopStates = ConcurrentHashMap<String, ActiveNativeStopState>()
 
     override suspend fun process(
         params: UpscaleParams,
@@ -470,23 +528,28 @@ class NativeSuperResProcessor(
             )
         }
 
-        onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native inference", 0f))
-        onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
         val request = params.toNativeRequest()
         // Native ncnn/Vulkan execution can monopolize a thread, so it must never run on Main.
-        val code = withContext(inferenceDispatcher) {
-            val nativeCode = bridge.process(
+        val taskResult = runNativeTask(
+            taskId = params.taskId,
+            onStarted = {
+                onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native inference", 0f))
+                onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
+            }
+        ) { stopState ->
+            bridge.process(
                 request = request,
                 onProgress = { event ->
+                    if (stopState.pendingStopAtFirstNativeProgress() != null) {
+                        bridge.cancel(params.taskId)
+                    }
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
                 },
                 runtimeControlProvider = runtimeControlProvider
             )
-            if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
-            nativeCode
         }
-        return code.toResult(params, onProgress)
+        return taskResult.toResult(params, onProgress)
     }
 
     override suspend fun processBitmapRegion(
@@ -513,28 +576,49 @@ class NativeSuperResProcessor(
                 message = UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
             )
 
-        onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native region inference", 0f))
-        onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
         val request = params.toNativeRequest()
-        val code = withContext(inferenceDispatcher) {
-            val nativeCode = regionBridge.processBitmapRegion(
+        val taskResult = runNativeTask(
+            taskId = params.taskId,
+            onStarted = {
+                onProgress(params.progress(UpscaleStage.PREPARING, "Preparing native region inference", 0f))
+                onProgress(params.progress(UpscaleStage.LOADING_MODEL, "Loading ${params.modelName}", 0.12f))
+            }
+        ) { stopState ->
+            regionBridge.processBitmapRegion(
                 request = request,
                 bitmap = bitmap,
                 onProgress = { event ->
+                    if (stopState.pendingStopAtFirstNativeProgress() != null) {
+                        bridge.cancel(params.taskId)
+                    }
                     event.performanceSnapshot?.let { performanceLogger(params, it) }
                     onProgress(params.progress(event))
                 },
                 runtimeControlProvider = runtimeControlProvider
             )
-            if (nativeCode == NativeProcessCode.CANCELLED) bridge.clearCache()
-            nativeCode
         }
-        return code.toResult(params, onProgress)
+        return taskResult.toResult(params, onProgress)
     }
 
     override fun cancel(taskId: String) {
-        if (isNativeAvailable()) {
-            bridge.cancel(taskId)
+        cancel(taskId, InferenceStopReason.USER_REQUEST)
+    }
+
+    override fun cancel(taskId: String, reason: InferenceStopReason) {
+        if (!isNativeAvailable()) return
+
+        var deliveryLease: NativeStopDeliveryLease? = null
+        activeStopStates.compute(taskId) { _, state ->
+            // Keep this task generation registered until its native cancel side effect is delivered.
+            deliveryLease = state?.beginStopDelivery(reason)
+            state
+        }
+        deliveryLease?.let { lease ->
+            try {
+                bridge.cancel(taskId)
+            } finally {
+                lease.close()
+            }
         }
     }
 
@@ -550,6 +634,54 @@ class NativeSuperResProcessor(
     ): NativeProcessCode {
         if (!isNativeAvailable()) return NativeProcessCode.UNSUPPORTED
         return bridge.mergeRawTilesToPng(outputPath, outputWidth, outputHeight, tiles)
+    }
+
+    private suspend fun runNativeTask(
+        taskId: String,
+        onStarted: () -> Unit,
+        operation: (ActiveNativeStopState) -> NativeProcessCode
+    ): NativeTaskRunResult {
+        val stopState = ActiveNativeStopState()
+        if (activeStopStates.putIfAbsent(taskId, stopState) != null) {
+            return NativeTaskRunResult.Busy
+        }
+        val nativeCode = AtomicReference<NativeProcessCode?>(null)
+        return try {
+            onStarted()
+            val code = withContext(inferenceDispatcher) {
+                operation(stopState).also(nativeCode::set)
+            }
+            NativeTaskRunResult.Completed(code)
+        } finally {
+            val stopReason = finishNativeTask(taskId, stopState)
+            val shouldClearCache =
+                stopReason == InferenceStopReason.USER_REQUEST ||
+                    (
+                        nativeCode.get() == NativeProcessCode.CANCELLED &&
+                            stopReason != InferenceStopReason.THERMAL_CRITICAL_PAUSE
+                    )
+            if (shouldClearCache) {
+                withContext(NonCancellable + inferenceDispatcher) {
+                    bridge.clearCache()
+                }
+            }
+        }
+    }
+
+    private fun finishNativeTask(
+        taskId: String,
+        stopState: ActiveNativeStopState
+    ): InferenceStopReason? {
+        var finalReason: InferenceStopReason? = null
+        activeStopStates.compute(taskId) { _, activeState ->
+            if (activeState === stopState) {
+                finalReason = stopState.finish()
+                null
+            } else {
+                activeState
+            }
+        }
+        return finalReason
     }
 
     private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: Float) = UpscaleProgress(
@@ -596,6 +728,22 @@ class NativeSuperResProcessor(
         return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, message)
     }
 
+    private fun NativeTaskRunResult.toResult(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit
+    ): UpscaleResult {
+        return when (this) {
+            is NativeTaskRunResult.Completed -> code.toResult(params, onProgress)
+            NativeTaskRunResult.Busy -> UpscaleResult(
+                taskId = params.taskId,
+                stage = UpscaleStage.FAILED,
+                outputPath = null,
+                success = false,
+                message = TASK_ALREADY_RUNNING_MESSAGE
+            )
+        }
+    }
+
     private fun NativeProcessCode.toErrorCode(): UpscaleErrorCode {
         return when (this) {
             NativeProcessCode.OK -> UpscaleErrorCode.UNKNOWN
@@ -632,6 +780,7 @@ class NativeSuperResProcessor(
 
     companion object {
         private const val LOG_TAG = "LumaSRPerformance"
+        private const val TASK_ALREADY_RUNNING_MESSAGE = "Task is already running."
 
         private val loaded: Boolean by lazy {
             runCatching { System.loadLibrary("localsr") }.isSuccess
