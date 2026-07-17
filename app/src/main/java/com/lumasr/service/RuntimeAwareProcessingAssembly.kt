@@ -34,7 +34,14 @@ internal fun createRuntimeAwareTaskRunner(
 
 private val DEFAULT_RUNTIME_AWARE_PROCESSOR_FACTORY:
     (ExtremeResourceProfileProvider) -> SuperResProcessor = { resourceProfileProvider ->
-    HybridSuperResProcessor(extremeResourceProfileProvider = resourceProfileProvider)
+    HybridSuperResProcessor(
+        extremeResourceProfileProvider = resourceProfileProvider,
+        rgbTransportBudgetProvider =
+            resourceProfileProvider as? com.lumasr.processor.RgbTransportBudgetProvider
+                ?: com.lumasr.processor.RgbTransportBudgetProvider {
+                    com.lumasr.domain.RuntimeRgbTransportBudgetPolicy().decide(null)
+                }
+    )
 }
 
 private fun createDefaultRuntimeAwareTaskRunner(

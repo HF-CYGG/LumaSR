@@ -17,6 +17,8 @@ import com.lumasr.domain.ExtremeTileScheduler
 import com.lumasr.domain.NativeGpuHealthProbe
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.ProcessingResourceProfile
+import com.lumasr.domain.RgbTransportBudgetDecision
+import com.lumasr.domain.RuntimeRgbTransportBudgetPolicy
 import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.RuntimePipelineResourceProvider
 import com.lumasr.domain.SuperResProcessor
@@ -46,9 +48,54 @@ fun interface ExtremeResourceProfileProvider {
     fun profile(imageWidth: Int, imageHeight: Int): ProcessingResourceProfile
 }
 
+fun interface RgbTransportBudgetProvider {
+    fun current(): RgbTransportBudgetDecision
+}
+
+enum class PipelineTransportMode {
+    RGB_MEMORY,
+    PNG_FALLBACK
+}
+
+enum class PipelineTransportFallbackReason {
+    CAPABILITY_UNAVAILABLE,
+    INVALID_REQUEST,
+    NATIVE_PREFLIGHT
+}
+
+data class PipelineTransportEvent(
+    val taskId: String,
+    val mode: PipelineTransportMode,
+    val fallbackReason: PipelineTransportFallbackReason?,
+    val budgetBytes: Long,
+    val passCount: Int,
+    val started: Boolean
+)
+
+fun interface PipelineTransportReporter {
+    fun report(event: PipelineTransportEvent)
+}
+
+private val DEFAULT_RGB_TRANSPORT_BUDGET_PROVIDER = RgbTransportBudgetProvider {
+    RuntimeRgbTransportBudgetPolicy().decide(resources = null)
+}
+
+private val DEFAULT_PIPELINE_TRANSPORT_REPORTER = PipelineTransportReporter { event ->
+    runCatching {
+        Log.i(
+            "LumaSRPerformance",
+            "task=${event.taskId} transportMode=${event.mode.name.lowercase()} " +
+                "fallback=${event.fallbackReason?.name ?: "none"} budgetBytes=${event.budgetBytes} " +
+                "passCount=${event.passCount} started=${if (event.started) 1 else 0}"
+        )
+    }
+}
+
 class RuntimePipelineExtremeResourceProfileProvider(
-    private val runtimeResourceProvider: RuntimePipelineResourceProvider
-) : ExtremeResourceProfileProvider {
+    private val runtimeResourceProvider: RuntimePipelineResourceProvider,
+    private val rgbTransportBudgetPolicy: RuntimeRgbTransportBudgetPolicy =
+        RuntimeRgbTransportBudgetPolicy()
+) : ExtremeResourceProfileProvider, RgbTransportBudgetProvider {
     override fun profile(imageWidth: Int, imageHeight: Int): ProcessingResourceProfile {
         val resources = runCatching { runtimeResourceProvider.current() }.getOrNull()
         return ProcessingResourceProfile(
@@ -57,6 +104,11 @@ class RuntimePipelineExtremeResourceProfileProvider(
             isLowRamDevice = resources?.isLowRamDevice == true,
             availableMemoryBytes = resources?.availableRamBytes?.takeIf { it > 0L }
         )
+    }
+
+    override fun current(): RgbTransportBudgetDecision {
+        val resources = runCatching { runtimeResourceProvider.current() }.getOrNull()
+        return rgbTransportBudgetPolicy.decide(resources)
     }
 }
 
@@ -80,6 +132,10 @@ class HybridSuperResProcessor(
     private val extremeResourceProfileProvider: ExtremeResourceProfileProvider = ExtremeResourceProfileProvider { width, height ->
         ProcessingResourceProfile(width, height)
     },
+    private val rgbTransportBudgetProvider: RgbTransportBudgetProvider =
+        DEFAULT_RGB_TRANSPORT_BUDGET_PROVIDER,
+    private val pipelineTransportReporter: PipelineTransportReporter =
+        DEFAULT_PIPELINE_TRANSPORT_REPORTER,
     private val onExtremeGpuDisabled: (String) -> Unit = {}
 ) : SuperResProcessor, NativeCacheOwner {
     private val sessionDisabledExtremeGpuKeys = mutableSetOf<String>()
@@ -140,10 +196,8 @@ class HybridSuperResProcessor(
         onProgress: (UpscaleProgress) -> Unit,
         runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
-        var currentInput = params.inputPath
         val tempFiles = mutableListOf<File>()
-
-        scalePlan.forEachIndexed { index, passScale ->
+        val passParams = scalePlan.mapIndexed { index, passScale ->
             val isLastPass = index == scalePlan.lastIndex
             val passOutput = if (isLastPass) {
                 params.outputPath
@@ -152,8 +206,8 @@ class HybridSuperResProcessor(
                     .also(tempFiles::add)
                     .absolutePath
             }
-            val passParams = params.copy(
-                inputPath = currentInput,
+            params.copy(
+                inputPath = if (index == 0) params.inputPath else tempFiles[index - 1].absolutePath,
                 outputPath = passOutput,
                 scale = passScale,
                 outputMode = if (isLastPass) params.outputMode else NativeOutputMode.PNG_IMAGE,
@@ -163,35 +217,43 @@ class HybridSuperResProcessor(
                 outputCropHeight = if (isLastPass) params.outputCropHeight else 0,
                 pipelinePasses = emptyList()
             )
-            val result = nativeProcessor.process(
-                params = passParams,
-                onProgress = { progress ->
-                    onProgress(progress.asChainedProgress(index, scalePlan.size))
-                },
-                runtimeControlProvider = runtimeControlProvider
-            )
-            if (!result.success) {
-                tempFiles.forEach { it.delete() }
-                return result
-            }
-            currentInput = passOutput
         }
-
-        tempFiles.forEach { it.delete() }
-        onProgress(
-            params.progress(
-                stage = UpscaleStage.DONE,
-                message = "Chained native inference complete",
-                value = 1f
+        return try {
+            processMemoryPipelineIfEligible(
+                rootParams = params,
+                passes = passParams,
+                onProgress = onProgress,
+                runtimeControlProvider = runtimeControlProvider
+            )?.let { return it }
+            passParams.forEachIndexed { index, pass ->
+                val result = nativeProcessor.process(
+                    params = pass,
+                    onProgress = { progress ->
+                        onProgress(progress.asChainedProgress(index, passParams.size))
+                    },
+                    runtimeControlProvider = runtimeControlProvider
+                )
+                if (!result.success) {
+                    return result
+                }
+            }
+            onProgress(
+                params.progress(
+                    stage = UpscaleStage.DONE,
+                    message = "Chained native inference complete",
+                    value = 1f
+                )
             )
-        )
-        return UpscaleResult(
-            taskId = params.taskId,
-            stage = UpscaleStage.DONE,
-            outputPath = params.outputPath,
-            success = true,
-            message = "Chained native inference complete"
-        )
+            UpscaleResult(
+                taskId = params.taskId,
+                stage = UpscaleStage.DONE,
+                outputPath = params.outputPath,
+                success = true,
+                message = "Chained native inference complete"
+            )
+        } finally {
+            tempFiles.forEach { it.delete() }
+        }
     }
 
     private suspend fun processExplicitPipeline(
@@ -201,31 +263,122 @@ class HybridSuperResProcessor(
     ): UpscaleResult {
         val passes = params.pipelinePasses
         val tempFiles = passes.dropLast(1).map { File(it.outputPath) }
+        return try {
+            if (passes.all { it.nativeScalePlan().size == 1 }) {
+                processMemoryPipelineIfEligible(
+                    rootParams = params,
+                    passes = passes,
+                    onProgress = onProgress,
+                    runtimeControlProvider = runtimeControlProvider
+                )?.let { return it }
+            }
+            passes.forEachIndexed { index, pass ->
+                val result = processSingleOrChainedPass(
+                    params = pass,
+                    onProgress = { progress ->
+                        onProgress(progress.asChainedProgress(index, passes.size))
+                    },
+                    runtimeControlProvider = runtimeControlProvider
+                )
+                if (!result.success) {
+                    return result.copy(taskId = params.taskId)
+                }
+            }
+            val message = params.pipelineLabel ?: "Pipeline native inference complete"
+            onProgress(params.progress(UpscaleStage.DONE, message, 1f))
+            UpscaleResult(
+                taskId = params.taskId,
+                stage = UpscaleStage.DONE,
+                outputPath = params.outputPath,
+                success = true,
+                message = message
+            )
+        } finally {
+            tempFiles.forEach { it.delete() }
+        }
+    }
 
-        passes.forEachIndexed { index, pass ->
-            val result = processSingleOrChainedPass(
-                params = pass,
-                onProgress = { progress ->
-                    onProgress(progress.asChainedProgress(index, passes.size))
-                },
+    private suspend fun processMemoryPipelineIfEligible(
+        rootParams: UpscaleParams,
+        passes: List<UpscaleParams>,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): UpscaleResult? {
+        if (passes.size < 2 || rootParams.outputMode != NativeOutputMode.PNG_IMAGE) {
+            return null
+        }
+        val capability = nativeProcessor as? NativeMemoryPipelineProcessor
+        if (capability == null) {
+            pipelineTransportReporter.report(
+                PipelineTransportEvent(
+                    taskId = rootParams.taskId,
+                    mode = PipelineTransportMode.PNG_FALLBACK,
+                    fallbackReason = PipelineTransportFallbackReason.CAPABILITY_UNAVAILABLE,
+                    budgetBytes = 0L,
+                    passCount = passes.size,
+                    started = false
+                )
+            )
+            return null
+        }
+        val budget = rgbTransportBudgetProvider.current()
+        val attempt = try {
+            capability.processMemoryPipeline(
+                rootParams = rootParams,
+                passes = passes,
+                transportBudgetBytes = budget.budgetBytes,
+                onProgress = onProgress,
                 runtimeControlProvider = runtimeControlProvider
             )
-            if (!result.success) {
-                tempFiles.forEach { it.delete() }
-                return result.copy(taskId = params.taskId)
+        } catch (failure: Throwable) {
+            pipelineTransportReporter.report(
+                PipelineTransportEvent(
+                    taskId = rootParams.taskId,
+                    mode = PipelineTransportMode.RGB_MEMORY,
+                    fallbackReason = null,
+                    budgetBytes = budget.budgetBytes,
+                    passCount = passes.size,
+                    started = true
+                )
+            )
+            throw failure
+        }
+        return when (attempt) {
+            is NativeMemoryPipelineAttempt.Started -> {
+                pipelineTransportReporter.report(
+                    PipelineTransportEvent(
+                        taskId = rootParams.taskId,
+                        mode = PipelineTransportMode.RGB_MEMORY,
+                        fallbackReason = null,
+                        budgetBytes = budget.budgetBytes,
+                        passCount = passes.size,
+                        started = true
+                    )
+                )
+                attempt.result
+            }
+            is NativeMemoryPipelineAttempt.NotStarted -> {
+                val fallbackReason = when (attempt.reason) {
+                    NativeMemoryPipelinePreflightReason.CAPABILITY_UNAVAILABLE ->
+                        PipelineTransportFallbackReason.CAPABILITY_UNAVAILABLE
+                    NativeMemoryPipelinePreflightReason.INVALID_REQUEST ->
+                        PipelineTransportFallbackReason.INVALID_REQUEST
+                    NativeMemoryPipelinePreflightReason.NATIVE_PREFLIGHT ->
+                        PipelineTransportFallbackReason.NATIVE_PREFLIGHT
+                }
+                pipelineTransportReporter.report(
+                    PipelineTransportEvent(
+                        taskId = rootParams.taskId,
+                        mode = PipelineTransportMode.PNG_FALLBACK,
+                        fallbackReason = fallbackReason,
+                        budgetBytes = budget.budgetBytes,
+                        passCount = passes.size,
+                        started = false
+                    )
+                )
+                null
             }
         }
-
-        tempFiles.forEach { it.delete() }
-        val message = params.pipelineLabel ?: "Pipeline native inference complete"
-        onProgress(params.progress(UpscaleStage.DONE, message, 1f))
-        return UpscaleResult(
-            taskId = params.taskId,
-            stage = UpscaleStage.DONE,
-            outputPath = params.outputPath,
-            success = true,
-            message = message
-        )
     }
 
     private suspend fun processExtremeSinglePng(

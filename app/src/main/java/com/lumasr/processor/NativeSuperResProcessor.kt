@@ -38,7 +38,8 @@ enum class NativeProcessCode(val rawCode: Int) {
     INVALID_PARAMS(6),
     OUT_OF_MEMORY(7),
     VULKAN_FAILED(8),
-    TILE_OUTPUT_MISMATCH(9);
+    TILE_OUTPUT_MISMATCH(9),
+    PIPELINE_FALLBACK_REQUIRED(10);
 
     companion object {
         fun fromRawCode(rawCode: Int): NativeProcessCode {
@@ -169,7 +170,10 @@ interface NativeBitmapRegionProcessor {
     ): UpscaleResult
 }
 
-object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
+object JniNativeProcessBridge :
+    NativeProcessBridge,
+    NativeBitmapRegionBridge,
+    NativeMemoryPipelineBridge {
     override fun process(
         request: NativeProcessRequest,
         onProgress: (NativeProgressEvent) -> Unit,
@@ -217,6 +221,33 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
 
     override fun clearCache() {
         clearCacheNative()
+    }
+
+    override fun processMemoryPipeline(
+        request: NativeMemoryPipelineRequest,
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): NativeProcessCode {
+        if (request.passes.size < 2 || request.transportBudgetBytes <= 0L) {
+            return NativeProcessCode.INVALID_PARAMS
+        }
+        val encoding = encodeNativeMemoryPipelinePasses(request.passes)
+        return NativeProcessCode.fromRawCode(
+            processMemoryPipelineNative(
+                taskId = request.rootTaskId,
+                inputPath = request.passes.first().inputPath,
+                outputPath = request.passes.last().outputPath,
+                modelDirs = encoding.modelDirs,
+                modelFileBases = encoding.modelFileBases,
+                passConfigs = encoding.passConfigs,
+                transportBudgetBytes = request.transportBudgetBytes,
+                progressSink = NativeProgressSink(
+                    onProgress = onProgress,
+                    runtimeControlProvider = runtimeControlProvider,
+                    defaultCommandBatchSize = request.passes.first().commandBatchSize
+                )
+            )
+        )
     }
 
     override fun mergeRawTilesToPng(
@@ -304,6 +335,17 @@ object JniNativeProcessBridge : NativeProcessBridge, NativeBitmapRegionBridge {
         openmpBlocktimeMs: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
+        progressSink: NativeProgressSink
+    ): Int
+
+    private external fun processMemoryPipelineNative(
+        taskId: String,
+        inputPath: String,
+        outputPath: String,
+        modelDirs: Array<String>,
+        modelFileBases: Array<String>,
+        passConfigs: IntArray,
+        transportBudgetBytes: Long,
         progressSink: NativeProgressSink
     ): Int
 
@@ -511,7 +553,12 @@ class NativeSuperResProcessor(
     isAvailable: () -> Boolean = { NativeSuperResProcessor.isAvailable() },
     private val inferenceDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit = ::logPerformance
-) : SuperResProcessor, NativeCacheOwner, NativeRawTileMerger, NativeBitmapRegionProcessor {
+) :
+    SuperResProcessor,
+    NativeCacheOwner,
+    NativeRawTileMerger,
+    NativeBitmapRegionProcessor,
+    NativeMemoryPipelineProcessor {
     private val isNativeAvailable = isAvailable
     // Entries exist only while their matching bridge call is active; state identity prevents cross-run cleanup.
     private val activeStopStates = ConcurrentHashMap<String, ActiveNativeStopState>()
@@ -601,6 +648,59 @@ class NativeSuperResProcessor(
             )
         }
         return taskResult.toResult(params, onProgress)
+    }
+
+    override suspend fun processMemoryPipeline(
+        rootParams: UpscaleParams,
+        passes: List<UpscaleParams>,
+        transportBudgetBytes: Long,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): NativeMemoryPipelineAttempt {
+        if (!isNativeAvailable()) {
+            return NativeMemoryPipelineAttempt.NotStarted(
+                NativeMemoryPipelinePreflightReason.CAPABILITY_UNAVAILABLE
+            )
+        }
+        if (passes.size < 2 || transportBudgetBytes <= 0L) {
+            return NativeMemoryPipelineAttempt.NotStarted(
+                NativeMemoryPipelinePreflightReason.INVALID_REQUEST
+            )
+        }
+        val memoryBridge = bridge as? NativeMemoryPipelineBridge
+            ?: return NativeMemoryPipelineAttempt.NotStarted(
+                NativeMemoryPipelinePreflightReason.CAPABILITY_UNAVAILABLE
+            )
+        val request = NativeMemoryPipelineRequest(
+            rootTaskId = rootParams.taskId,
+            passes = passes.map(UpscaleParams::toNativeRequest),
+            transportBudgetBytes = transportBudgetBytes
+        )
+        val taskResult = runNativeTask(
+            taskId = rootParams.taskId,
+            onStarted = {
+                onProgress(rootParams.progress(UpscaleStage.PREPARING, "Preparing native memory pipeline", 0f))
+            }
+        ) { stopState ->
+            memoryBridge.processMemoryPipeline(
+                request = request,
+                onProgress = { event ->
+                    if (stopState.pendingStopAtFirstNativeProgress() != null) {
+                        bridge.cancel(rootParams.taskId)
+                    }
+                    event.performanceSnapshot?.let { performanceLogger(rootParams, it) }
+                    onProgress(rootParams.progress(event))
+                },
+                runtimeControlProvider = runtimeControlProvider
+            )
+        }
+        if (taskResult is NativeTaskRunResult.Completed &&
+            taskResult.code == NativeProcessCode.PIPELINE_FALLBACK_REQUIRED) {
+            return NativeMemoryPipelineAttempt.NotStarted(
+                NativeMemoryPipelinePreflightReason.NATIVE_PREFLIGHT
+            )
+        }
+        return NativeMemoryPipelineAttempt.Started(taskResult.toResult(rootParams, onProgress))
     }
 
     override fun cancel(taskId: String) {
@@ -759,6 +859,7 @@ class NativeSuperResProcessor(
             NativeProcessCode.OUT_OF_MEMORY -> UpscaleErrorCode.OUT_OF_MEMORY
             NativeProcessCode.VULKAN_FAILED -> UpscaleErrorCode.VULKAN_RUNTIME_FAILED
             NativeProcessCode.TILE_OUTPUT_MISMATCH -> UpscaleErrorCode.TILE_OUTPUT_MISMATCH
+            NativeProcessCode.PIPELINE_FALLBACK_REQUIRED -> UpscaleErrorCode.INPUT_UNSUPPORTED
         }
     }
 
@@ -810,7 +911,7 @@ class NativeSuperResProcessor(
     }
 }
 
-private fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
+internal fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     taskId = taskId,
     inputPath = inputPath,
     outputPath = outputPath,
