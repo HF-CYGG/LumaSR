@@ -5,6 +5,8 @@ import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.InferencePrecision
 import com.lumasr.domain.InferenceStopReason
+import com.lumasr.domain.ExtremeExportPlan
+import com.lumasr.domain.ExtremeExportTileSpec
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeFallbackReason
 import com.lumasr.domain.NativePerformanceSnapshot
@@ -20,10 +22,12 @@ import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleResult
 import com.lumasr.domain.UpscaleStage
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -137,6 +141,36 @@ interface NativeBitmapRegionBridge {
     ): NativeProcessCode
 }
 
+data class NativeExtremePngSessionRequest(
+    val taskId: String,
+    val outputPath: String,
+    val outputWidth: Int,
+    val outputHeight: Int,
+    val maximumBandHeight: Int,
+    val tileConfigs: IntArray
+)
+
+data class NativeExtremePngSessionPlanEncoding(
+    val maximumBandHeight: Int,
+    val tileConfigs: IntArray
+)
+
+interface NativeExtremePngSessionBridge {
+    fun beginExtremePngSession(request: NativeExtremePngSessionRequest): Long
+
+    fun processExtremePngSessionBitmap(
+        handle: Long,
+        request: NativeProcessRequest,
+        bitmap: Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): NativeProcessCode
+
+    fun finishExtremePngSession(handle: Long): NativeProcessCode
+
+    fun abortExtremePngSession(handle: Long)
+}
+
 interface NativeCacheOwner {
     fun clearNativeCache()
 }
@@ -173,7 +207,8 @@ interface NativeBitmapRegionProcessor {
 object JniNativeProcessBridge :
     NativeProcessBridge,
     NativeBitmapRegionBridge,
-    NativeMemoryPipelineBridge {
+    NativeMemoryPipelineBridge,
+    NativeExtremePngSessionBridge {
     override fun process(
         request: NativeProcessRequest,
         onProgress: (NativeProgressEvent) -> Unit,
@@ -309,6 +344,67 @@ object JniNativeProcessBridge :
         )
     }
 
+    override fun beginExtremePngSession(request: NativeExtremePngSessionRequest): Long {
+        return beginExtremePngSessionNative(
+            taskId = request.taskId,
+            outputPath = request.outputPath,
+            outputWidth = request.outputWidth,
+            outputHeight = request.outputHeight,
+            maximumBandHeight = request.maximumBandHeight,
+            tileConfigs = request.tileConfigs
+        )
+    }
+
+    override fun processExtremePngSessionBitmap(
+        handle: Long,
+        request: NativeProcessRequest,
+        bitmap: Bitmap?,
+        onProgress: (NativeProgressEvent) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): NativeProcessCode {
+        return NativeProcessCode.fromRawCode(
+            processExtremePngSessionBitmapNative(
+                handle = handle,
+                bitmap = bitmap,
+                engineType = request.engineType,
+                modelDir = request.modelDir,
+                modelFileBase = request.modelFileBase.orEmpty(),
+                scale = request.scale,
+                noise = request.noise,
+                tileSize = request.tileSize,
+                gpuHeadroomPercent = request.gpuHeadroomPercent,
+                accelerationMode = request.accelerationMode,
+                tta = request.tta,
+                outputMode = request.outputMode,
+                outputCropLeft = request.outputCropLeft,
+                outputCropTop = request.outputCropTop,
+                outputCropWidth = request.outputCropWidth,
+                outputCropHeight = request.outputCropHeight,
+                retryCount = request.retryCount,
+                regionIndex = request.regionIndex,
+                nativeBackend = request.nativeBackend,
+                inferencePrecision = request.inferencePrecision,
+                cpuThreads = request.cpuThreads,
+                openmpBlocktimeMs = request.openmpBlocktimeMs,
+                commandBatchSize = request.commandBatchSize,
+                modelCacheCapacity = request.modelCacheCapacity,
+                progressSink = NativeProgressSink(
+                    onProgress = onProgress,
+                    runtimeControlProvider = runtimeControlProvider,
+                    defaultCommandBatchSize = request.commandBatchSize
+                )
+            )
+        )
+    }
+
+    override fun finishExtremePngSession(handle: Long): NativeProcessCode {
+        return NativeProcessCode.fromRawCode(finishExtremePngSessionNative(handle))
+    }
+
+    override fun abortExtremePngSession(handle: Long) {
+        abortExtremePngSessionNative(handle)
+    }
+
     private external fun processNative(
         taskId: String,
         inputPath: String,
@@ -389,6 +485,47 @@ object JniNativeProcessBridge :
         modelCacheCapacity: Int,
         progressSink: NativeProgressSink
     ): Int
+
+    private external fun beginExtremePngSessionNative(
+        taskId: String,
+        outputPath: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        maximumBandHeight: Int,
+        tileConfigs: IntArray
+    ): Long
+
+    private external fun processExtremePngSessionBitmapNative(
+        handle: Long,
+        bitmap: Bitmap?,
+        engineType: Int,
+        modelDir: String,
+        modelFileBase: String,
+        scale: Int,
+        noise: Int,
+        tileSize: Int,
+        gpuHeadroomPercent: Int,
+        accelerationMode: Int,
+        tta: Boolean,
+        outputMode: Int,
+        outputCropLeft: Int,
+        outputCropTop: Int,
+        outputCropWidth: Int,
+        outputCropHeight: Int,
+        retryCount: Int,
+        regionIndex: Int,
+        nativeBackend: Int,
+        inferencePrecision: Int,
+        cpuThreads: Int,
+        openmpBlocktimeMs: Int,
+        commandBatchSize: Int,
+        modelCacheCapacity: Int,
+        progressSink: NativeProgressSink
+    ): Int
+
+    private external fun finishExtremePngSessionNative(handle: Long): Int
+
+    private external fun abortExtremePngSessionNative(handle: Long)
 }
 
 class NativeProgressSink(
@@ -534,6 +671,33 @@ private class ActiveNativeStopState {
     }
 }
 
+private class ActiveExtremeSessionStopState {
+    private val stopDeliveryLock = ReentrantLock()
+    private var acceptingStops = true
+    private var stopReason: InferenceStopReason? = null
+
+    fun beginStopDelivery(reason: InferenceStopReason): NativeStopDeliveryLease? {
+        stopDeliveryLock.lock()
+        if (!acceptingStops) {
+            stopDeliveryLock.unlock()
+            return null
+        }
+        stopReason = when {
+            stopReason == InferenceStopReason.USER_REQUEST -> InferenceStopReason.USER_REQUEST
+            reason == InferenceStopReason.USER_REQUEST -> InferenceStopReason.USER_REQUEST
+            else -> InferenceStopReason.THERMAL_CRITICAL_PAUSE
+        }
+        return NativeStopDeliveryLease(stopDeliveryLock)
+    }
+
+    fun finish(): InferenceStopReason? {
+        return stopDeliveryLock.withLock {
+            acceptingStops = false
+            stopReason
+        }
+    }
+}
+
 private class NativeStopDeliveryLease(
     private val stopDeliveryLock: ReentrantLock
 ) : AutoCloseable {
@@ -558,10 +722,50 @@ class NativeSuperResProcessor(
     NativeCacheOwner,
     NativeRawTileMerger,
     NativeBitmapRegionProcessor,
-    NativeMemoryPipelineProcessor {
+    NativeMemoryPipelineProcessor,
+    NativeExtremePngSessionProcessor {
     private val isNativeAvailable = isAvailable
     // Entries exist only while their matching bridge call is active; state identity prevents cross-run cleanup.
     private val activeStopStates = ConcurrentHashMap<String, ActiveNativeStopState>()
+    // Extreme sessions stay active between tile calls, so cancellation cannot fall into an idle gap.
+    private val activeExtremeStopStates = ConcurrentHashMap<String, ActiveExtremeSessionStopState>()
+
+    override fun begin(params: UpscaleParams, plan: ExtremeExportPlan): NativeExtremePngSession? {
+        if (!isNativeAvailable()) return null
+        val extremeBridge = bridge as? NativeExtremePngSessionBridge ?: return null
+        if (plan.scale != params.scale || params.taskId.isBlank() || params.outputPath.isBlank()) return null
+        val encoding = encodeNativeExtremePngSessionPlan(plan) ?: return null
+        val request = NativeExtremePngSessionRequest(
+            taskId = params.taskId,
+            outputPath = params.outputPath,
+            outputWidth = plan.outputWidth,
+            outputHeight = plan.outputHeight,
+            maximumBandHeight = encoding.maximumBandHeight,
+            tileConfigs = encoding.tileConfigs
+        )
+        val stopState = ActiveExtremeSessionStopState()
+        if (activeExtremeStopStates.putIfAbsent(params.taskId, stopState) != null) return null
+        val handle = try {
+            extremeBridge.beginExtremePngSession(request)
+        } catch (failure: CancellationException) {
+            releaseExtremeSession(params.taskId, stopState)
+            throw failure
+        } catch (_: Exception) {
+            releaseExtremeSession(params.taskId, stopState)
+            return null
+        }
+        if (handle <= 0L) {
+            releaseExtremeSession(params.taskId, stopState)
+            return null
+        }
+        return NativeExtremePngSessionImpl(
+            bridge = extremeBridge,
+            handle = handle,
+            inferenceDispatcher = inferenceDispatcher,
+            performanceLogger = performanceLogger,
+            onRelease = { releaseExtremeSession(params.taskId, stopState) }
+        )
+    }
 
     override suspend fun process(
         params: UpscaleParams,
@@ -723,6 +927,19 @@ class NativeSuperResProcessor(
                 lease.close()
             }
         }
+
+        var extremeDeliveryLease: NativeStopDeliveryLease? = null
+        activeExtremeStopStates.compute(taskId) { _, state ->
+            extremeDeliveryLease = state?.beginStopDelivery(reason)
+            state
+        }
+        extremeDeliveryLease?.let { lease ->
+            try {
+                bridge.cancel(taskId)
+            } finally {
+                lease.close()
+            }
+        }
     }
 
     override fun clearNativeCache() {
@@ -785,6 +1002,24 @@ class NativeSuperResProcessor(
             }
         }
         return finalReason
+    }
+
+    private fun releaseExtremeSession(
+        taskId: String,
+        stopState: ActiveExtremeSessionStopState
+    ) {
+        var finalReason: InferenceStopReason? = null
+        activeExtremeStopStates.compute(taskId) { _, activeState ->
+            if (activeState === stopState) {
+                finalReason = stopState.finish()
+                null
+            } else {
+                activeState
+            }
+        }
+        if (finalReason == InferenceStopReason.USER_REQUEST) {
+            bridge.clearCache()
+        }
     }
 
     private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: Float) = UpscaleProgress(
@@ -910,6 +1145,185 @@ class NativeSuperResProcessor(
         }
     }
 }
+
+private class NativeExtremePngSessionImpl(
+    private val bridge: NativeExtremePngSessionBridge,
+    private val handle: Long,
+    private val inferenceDispatcher: CoroutineDispatcher,
+    private val performanceLogger: (UpscaleParams, NativePerformanceSnapshot) -> Unit,
+    private val onRelease: () -> Unit
+) : NativeExtremePngSession {
+    private val lifecycle = AtomicReference(NativeExtremeSessionLifecycle.OPEN)
+    private var finishResult: NativeProcessCode? = null
+
+    override suspend fun processBitmapTile(
+        params: UpscaleParams,
+        bitmap: Bitmap?,
+        tile: ExtremeExportTileSpec,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): UpscaleResult {
+        check(lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.PROCESSING)) {
+            "Extreme PNG session is not open for tile processing."
+        }
+        val acceptsProgress = AtomicBoolean(true)
+        return try {
+            val request = params.toNativeRequest().copy(regionIndex = tile.index)
+            val code = withContext(inferenceDispatcher) {
+                try {
+                    bridge.processExtremePngSessionBitmap(
+                        handle = handle,
+                        request = request,
+                        bitmap = bitmap,
+                        onProgress = { event ->
+                            if (acceptsProgress.get()) {
+                                event.performanceSnapshot?.let { performanceLogger(params, it) }
+                                onProgress(params.toExtremeSessionProgress(event))
+                            }
+                        },
+                        runtimeControlProvider = runtimeControlProvider
+                    )
+                } finally {
+                    acceptsProgress.set(false)
+                }
+            }
+            code.toExtremeSessionResult(params, onProgress)
+        } finally {
+            acceptsProgress.set(false)
+            lifecycle.compareAndSet(NativeExtremeSessionLifecycle.PROCESSING, NativeExtremeSessionLifecycle.OPEN)
+        }
+    }
+
+    @Synchronized
+    override fun finish(): NativeProcessCode {
+        finishResult?.let { return it }
+        check(lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.FINISHED)) {
+            "Extreme PNG session cannot be finished from its current state."
+        }
+        return try {
+            bridge.finishExtremePngSession(handle).also { finishResult = it }
+        } finally {
+            onRelease()
+        }
+    }
+
+    @Synchronized
+    override fun abort() {
+        if (!lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.ABORTED)) {
+            return
+        }
+        try {
+            bridge.abortExtremePngSession(handle)
+        } finally {
+            onRelease()
+        }
+    }
+}
+
+private enum class NativeExtremeSessionLifecycle {
+    OPEN,
+    PROCESSING,
+    FINISHED,
+    ABORTED
+}
+
+private fun UpscaleParams.toExtremeSessionProgress(event: NativeProgressEvent) = UpscaleProgress(
+    taskId = taskId,
+    stage = event.stage,
+    progress = event.progress,
+    currentTile = event.currentTile,
+    totalTiles = event.totalTiles,
+    completedTiles = event.currentTile,
+    message = event.message,
+    estimatedRemainingMs = null,
+    performanceSnapshot = event.performanceSnapshot
+)
+
+private fun UpscaleParams.toExtremeSessionTerminalProgress(
+    stage: UpscaleStage,
+    message: String,
+    progress: Float
+) = UpscaleProgress(
+    taskId = taskId,
+    stage = stage,
+    progress = progress,
+    currentTile = if (stage == UpscaleStage.DONE) 1 else 0,
+    totalTiles = 1,
+    completedTiles = if (stage == UpscaleStage.DONE) 1 else 0,
+    message = message,
+    estimatedRemainingMs = null
+)
+
+private fun NativeProcessCode.toExtremeSessionResult(
+    params: UpscaleParams,
+    onProgress: (UpscaleProgress) -> Unit
+): UpscaleResult {
+    if (this == NativeProcessCode.OK) {
+        val message = "Native extreme tile inference complete"
+        onProgress(params.toExtremeSessionTerminalProgress(UpscaleStage.DONE, message, 1f))
+        return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, message)
+    }
+    if (this == NativeProcessCode.CANCELLED) {
+        val message = UpscaleErrorMapper.userMessage(UpscaleErrorCode.CANCELLED)
+        onProgress(params.toExtremeSessionTerminalProgress(UpscaleStage.CANCELLED, message, 0f))
+        return UpscaleResult(params.taskId, UpscaleStage.CANCELLED, null, false, message)
+    }
+    val errorCode = when (this) {
+        NativeProcessCode.INPUT_MISSING -> UpscaleErrorCode.INPUT_NOT_FOUND
+        NativeProcessCode.OUTPUT_FAILED -> UpscaleErrorCode.OUTPUT_WRITE_FAILED
+        NativeProcessCode.UNSUPPORTED,
+        NativeProcessCode.PIPELINE_FALLBACK_REQUIRED -> UpscaleErrorCode.INPUT_UNSUPPORTED
+        NativeProcessCode.MODEL_MISSING -> UpscaleErrorCode.MODEL_NOT_FOUND
+        NativeProcessCode.OUT_OF_MEMORY -> UpscaleErrorCode.OUT_OF_MEMORY
+        NativeProcessCode.VULKAN_FAILED -> UpscaleErrorCode.VULKAN_RUNTIME_FAILED
+        NativeProcessCode.TILE_OUTPUT_MISMATCH -> UpscaleErrorCode.TILE_OUTPUT_MISMATCH
+        NativeProcessCode.INVALID_PARAMS,
+        NativeProcessCode.OK,
+        NativeProcessCode.CANCELLED -> UpscaleErrorCode.UNKNOWN
+    }
+    val message = UpscaleErrorMapper.userMessage(errorCode)
+    onProgress(params.toExtremeSessionTerminalProgress(UpscaleStage.FAILED, message, 0f))
+    return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, message)
+}
+
+internal fun encodeNativeExtremePngSessionPlan(
+    plan: ExtremeExportPlan
+): NativeExtremePngSessionPlanEncoding? {
+    if (plan.outputWidth <= 0 || plan.outputHeight <= 0 || plan.scale <= 0 ||
+        plan.coreBandInputHeight <= 0 || plan.tiles.isEmpty()) {
+        return null
+    }
+    val maximumBandHeight = try {
+        Math.multiplyExact(plan.coreBandInputHeight, plan.scale)
+    } catch (_: ArithmeticException) {
+        return null
+    }
+    if (maximumBandHeight <= 0 || maximumBandHeight > plan.outputHeight) return null
+    val configSize = try {
+        Math.multiplyExact(plan.tiles.size, NATIVE_EXTREME_TILE_CONFIG_STRIDE)
+    } catch (_: ArithmeticException) {
+        return null
+    }
+    val seenIndexes = HashSet<Int>(plan.tiles.size)
+    val configs = IntArray(configSize)
+    plan.tiles.forEachIndexed { position, tile ->
+        if (tile.index < 0 || !seenIndexes.add(tile.index) || tile.outputX < 0 || tile.outputY < 0 ||
+            tile.outputW <= 0 || tile.outputH <= 0 ||
+            tile.outputX.toLong() + tile.outputW > plan.outputWidth.toLong() ||
+            tile.outputY.toLong() + tile.outputH > plan.outputHeight.toLong()) {
+            return null
+        }
+        val offset = position * NATIVE_EXTREME_TILE_CONFIG_STRIDE
+        configs[offset] = tile.index
+        configs[offset + 1] = tile.outputX
+        configs[offset + 2] = tile.outputY
+        configs[offset + 3] = tile.outputW
+        configs[offset + 4] = tile.outputH
+    }
+    return NativeExtremePngSessionPlanEncoding(maximumBandHeight, configs)
+}
+
+private const val NATIVE_EXTREME_TILE_CONFIG_STRIDE = 5
 
 internal fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     taskId = taskId,
