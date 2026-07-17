@@ -30,6 +30,10 @@ public:
 
 class MemoryRgbOutput final : public RgbOutputTarget {
 public:
+    explicit MemoryRgbOutput(
+        SuperResRgbRelease release = delete_superres_rgb_array
+    ) noexcept;
+
     SuperResNativeCode initialize(
         const std::string& outputPath,
         int width,
@@ -41,12 +45,15 @@ public:
     SuperResNativeCode finish_attempt(SuperResStagedOutput& stagedOutput) override;
     SuperResNativeCode failure_code() const override;
     std::chrono::steady_clock::duration encoding_duration() const override;
+    SuperResRgbImage take_image() noexcept;
 
 private:
+    SuperResRgbRelease release_ = delete_superres_rgb_array;
     int width_ = 0;
     int height_ = 0;
     size_t rowBytes_ = 0;
-    std::vector<unsigned char> bytes_;
+    size_t byteSize_ = 0;
+    SuperResRgbPixels pixels_;
     std::chrono::steady_clock::duration encodingDuration_{};
     SuperResNativeCode lastFailure_ = SuperResNativeCode::Ok;
 };

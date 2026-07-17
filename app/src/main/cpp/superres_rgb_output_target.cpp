@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <utility>
 
 namespace {
@@ -18,12 +19,22 @@ bool checked_rgb_row_bytes(int width, size_t& rowBytes) {
 
 } // namespace
 
+MemoryRgbOutput::MemoryRgbOutput(SuperResRgbRelease release) noexcept
+    : release_(release == nullptr ? delete_superres_rgb_array : release),
+      pixels_(nullptr, SuperResRgbDeleter{release_}) {}
+
 SuperResNativeCode MemoryRgbOutput::initialize(
     const std::string&,
     int width,
     int height,
     int
 ) {
+    pixels_.reset();
+    width_ = 0;
+    height_ = 0;
+    rowBytes_ = 0;
+    byteSize_ = 0;
+    encodingDuration_ = {};
     if (!checked_rgb_row_bytes(width, rowBytes_) || height <= 0) {
         lastFailure_ = SuperResNativeCode::InvalidParams;
         return lastFailure_;
@@ -33,13 +44,17 @@ SuperResNativeCode MemoryRgbOutput::initialize(
         lastFailure_ = SuperResNativeCode::OutOfMemory;
         return lastFailure_;
     }
-    const size_t byteSize = rowBytes_ * static_cast<size_t>(height);
-    try {
-        bytes_.assign(byteSize, 0);
-    } catch (...) {
+    byteSize_ = rowBytes_ * static_cast<size_t>(height);
+    pixels_ = SuperResRgbPixels(
+        new (std::nothrow) unsigned char[byteSize_],
+        SuperResRgbDeleter{release_}
+    );
+    if (pixels_ == nullptr) {
+        byteSize_ = 0;
         lastFailure_ = SuperResNativeCode::OutOfMemory;
         return lastFailure_;
     }
+    std::fill_n(pixels_.get(), byteSize_, static_cast<unsigned char>(0));
     width_ = width;
     height_ = height;
     lastFailure_ = SuperResNativeCode::Ok;
@@ -56,12 +71,16 @@ unsigned char* MemoryRgbOutput::row(int destinationY, int destinationX) {
         destinationX < 0 || destinationX >= width_) {
         return nullptr;
     }
-    return bytes_.data() + static_cast<size_t>(destinationY) * rowBytes_ +
+    return pixels_.get() + static_cast<size_t>(destinationY) * rowBytes_ +
         static_cast<size_t>(destinationX) * 3u;
 }
 
 SuperResNativeCode MemoryRgbOutput::finish_attempt(SuperResStagedOutput& stagedOutput) {
-    const SuperResStageResult result = stagedOutput.stage_bytes(bytes_.data(), bytes_.size());
+    if (pixels_ == nullptr || byteSize_ == 0) {
+        lastFailure_ = SuperResNativeCode::InvalidParams;
+        return lastFailure_;
+    }
+    const SuperResStageResult result = stagedOutput.stage_bytes(pixels_.get(), byteSize_);
     encodingDuration_ = std::chrono::milliseconds(result.stagingMs);
     lastFailure_ = result.status == SuperResStageStatus::Ok
         ? SuperResNativeCode::Ok
@@ -75,6 +94,28 @@ SuperResNativeCode MemoryRgbOutput::failure_code() const {
 
 std::chrono::steady_clock::duration MemoryRgbOutput::encoding_duration() const {
     return encodingDuration_;
+}
+
+SuperResRgbImage MemoryRgbOutput::take_image() noexcept {
+    if (width_ <= 0 || height_ <= 0 || rowBytes_ == 0 || byteSize_ == 0 ||
+        pixels_ == nullptr) {
+        return {};
+    }
+    const int width = width_;
+    const int height = height_;
+    const size_t rowBytes = rowBytes_;
+    const size_t byteSize = byteSize_;
+    width_ = 0;
+    height_ = 0;
+    rowBytes_ = 0;
+    byteSize_ = 0;
+    return SuperResRgbImage(
+        width,
+        height,
+        rowBytes,
+        byteSize,
+        std::move(pixels_)
+    );
 }
 
 StreamingPngOutput::StreamingPngOutput(StreamingPngOutputOps operations)

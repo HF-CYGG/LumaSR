@@ -618,6 +618,61 @@ bool memory_target_stages_tight_cropped_bytes_check() {
     return passed;
 }
 
+int memoryReleaseCount = 0;
+
+void release_counted_memory(unsigned char* pixels) noexcept {
+    ++memoryReleaseCount;
+    delete[] pixels;
+}
+
+bool memory_target_transfers_tight_rgb_without_copy_check() {
+    const std::vector<unsigned char> expected{
+        1, 2, 3, 4, 5, 6,
+        7, 8, 9, 10, 11, 12
+    };
+    memoryReleaseCount = 0;
+    unsigned char* writtenPointer = nullptr;
+    {
+        MemoryRgbOutput target(release_counted_memory);
+        if (target.initialize("unused-memory-transport", 2, 2, 1) !=
+                SuperResNativeCode::Ok ||
+            !target.prepare_window(0, 2)) {
+            return false;
+        }
+        writtenPointer = target.row(0, 0);
+        if (writtenPointer == nullptr) {
+            return false;
+        }
+        std::copy(expected.begin(), expected.end(), writtenPointer);
+        SuperResRgbImage image = target.take_image();
+        if (!image.valid() || image.data() != writtenPointer || image.width() != 2 ||
+            image.height() != 2 || image.row_stride_bytes() != 6u ||
+            image.byte_size() != expected.size() ||
+            !std::equal(expected.begin(), expected.end(), image.data()) ||
+            target.take_image().valid() || memoryReleaseCount != 0) {
+            return false;
+        }
+    }
+    return memoryReleaseCount == 1;
+}
+
+bool memory_target_reinitialize_releases_previous_buffer_once_check() {
+    memoryReleaseCount = 0;
+    {
+        MemoryRgbOutput target(release_counted_memory);
+        if (target.initialize("first", 1, 1, 1) != SuperResNativeCode::Ok ||
+            target.initialize("second", 2, 1, 1) != SuperResNativeCode::Ok ||
+            memoryReleaseCount != 1) {
+            return false;
+        }
+        SuperResRgbImage image = target.take_image();
+        if (!image.valid() || memoryReleaseCount != 1) {
+            return false;
+        }
+    }
+    return memoryReleaseCount == 2;
+}
+
 } // namespace
 
 bool run_rgb_output_target_runtime_checks() {
@@ -634,5 +689,7 @@ bool run_rgb_output_target_runtime_checks() {
         production_streaming_target_late_callback_preserves_old_final_check() &&
         production_streaming_target_cancel_preserves_old_final_check() &&
         production_streaming_target_rename_failure_preserves_old_final_check() &&
-        memory_target_stages_tight_cropped_bytes_check();
+        memory_target_stages_tight_cropped_bytes_check() &&
+        memory_target_transfers_tight_rgb_without_copy_check() &&
+        memory_target_reinitialize_releases_previous_buffer_once_check();
 }

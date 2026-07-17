@@ -27,6 +27,7 @@ if(NOT ANDROID)
         superres_task_registry.cpp
         superres_rgb_image_checks.cpp
         superres_rgb_output_target_checks.cpp
+        superres_rgb_transport_checks.cpp
         superres_ncnn_stage_contract_checks.cpp
         superres_host_checks.cpp
         tests/stb_image_host.cpp
@@ -62,6 +63,7 @@ add_library(localsr SHARED
     superres_rgb_output_target.cpp
     superres_rgb_output_target_writer.cpp
     superres_rgb_output_target_checks.cpp
+    superres_rgb_transport_checks.cpp
     superres_stbi_decode.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp
