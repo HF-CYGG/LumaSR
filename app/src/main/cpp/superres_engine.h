@@ -59,6 +59,7 @@ struct SuperResNativeParams {
     int inferencePrecision = 0;
     int cpuThreads = 0;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
 };

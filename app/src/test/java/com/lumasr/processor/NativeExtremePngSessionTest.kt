@@ -122,6 +122,43 @@ class NativeExtremePngSessionTest {
     }
 
     @Test
+    fun cancellationWhileNativeBeginIsRegisteringIsReplayedAfterHandleCreation() = runBlocking {
+        val bridge = RecordingExtremeBridge(beginHandle = 41L, blockBegin = true)
+        val processor = NativeSuperResProcessor(bridge = bridge, isAvailable = { true })
+        val beginning = async(Dispatchers.Default) {
+            processor.begin(defaultParams(), defaultPlan())
+        }
+
+        assertTrue(bridge.awaitBeginEntered())
+        processor.cancel("extreme-task", com.lumasr.domain.InferenceStopReason.USER_REQUEST)
+        bridge.releaseBlockedBegin()
+
+        val session = requireNotNull(beginning.await())
+        assertEquals(listOf("extreme-task"), bridge.cancelledAfterBeginTaskIds)
+        session.abort()
+    }
+
+    @Test
+    fun cancelledBeginWithNoHandleThrowsInsteadOfAllowingRawFallback() = runBlocking {
+        val bridge = RecordingExtremeBridge(beginHandle = 0L, blockBegin = true)
+        val processor = NativeSuperResProcessor(bridge = bridge, isAvailable = { true })
+        val beginning = async(Dispatchers.Default) {
+            processor.begin(defaultParams(), defaultPlan())
+        }
+
+        assertTrue(bridge.awaitBeginEntered())
+        processor.cancel("extreme-task", com.lumasr.domain.InferenceStopReason.USER_REQUEST)
+        bridge.releaseBlockedBegin()
+
+        try {
+            beginning.await()
+            fail("Expected cancellation instead of a fallback-capable null session")
+        } catch (_: CancellationException) {
+            // Expected: a cancelled task must never start the raw tile fallback.
+        }
+    }
+
+    @Test
     fun processBitmapTileForwardsRequestProgressPerformanceAndRuntimeOnInferenceDispatcher() = runBlocking {
         val snapshot = performanceSnapshot(regionIndex = 0)
         val bridge = RecordingExtremeBridge(
@@ -162,6 +199,7 @@ class NativeExtremePngSessionTest {
                 inferencePrecision = InferencePrecision.FP16,
                 cpuThreads = 5,
                 openmpBlocktimeMs = 45,
+                postprocessThreads = 3,
                 commandBatchSize = 3,
                 modelCacheCapacity = 2
             )
@@ -182,6 +220,7 @@ class NativeExtremePngSessionTest {
             assertEquals(InferencePrecision.FP16.ordinal, bridge.lastProcessRequest?.inferencePrecision)
             assertEquals(5, bridge.lastProcessRequest?.cpuThreads)
             assertEquals(45, bridge.lastProcessRequest?.openmpBlocktimeMs)
+            assertEquals(3, bridge.lastProcessRequest?.postprocessThreads)
             assertEquals(3, bridge.lastProcessRequest?.commandBatchSize)
             assertEquals(2, bridge.lastProcessRequest?.modelCacheCapacity)
             assertSame(provider, bridge.lastRuntimeControlProvider)
@@ -190,6 +229,7 @@ class NativeExtremePngSessionTest {
             assertSame(snapshot, progress.first().performanceSnapshot)
             assertEquals(listOf(params to snapshot), logged)
             assertEquals(UpscaleStage.DONE, result.stage)
+            assertTrue(progress.none { it.stage == UpscaleStage.DONE })
             assertEquals(params.outputPath, result.outputPath)
             session.close()
         }
@@ -234,6 +274,25 @@ class NativeExtremePngSessionTest {
         } catch (_: IllegalStateException) {
             // Expected: native handle has already been consumed by finish.
         }
+    }
+
+    @Test
+    fun failedFinishAbortsAndReleasesSessionSoTaskCanBeginAgain() {
+        val bridge = RecordingExtremeBridge(
+            beginHandle = 41L,
+            finishCode = NativeProcessCode.INVALID_PARAMS
+        )
+        val processor = NativeSuperResProcessor(bridge = bridge, isAvailable = { true })
+        val session = requireNotNull(processor.begin(defaultParams(), defaultPlan()))
+
+        assertEquals(NativeProcessCode.INVALID_PARAMS, session.finish())
+        session.abort()
+        session.close()
+
+        assertEquals(1, bridge.finishCount)
+        assertEquals(1, bridge.abortCount)
+        val replacement = requireNotNull(processor.begin(defaultParams(), defaultPlan()))
+        replacement.abort()
     }
 
     @Test
@@ -287,6 +346,24 @@ class NativeExtremePngSessionTest {
         session.close()
         assertEquals(listOf("extreme-task"), bridge.cancelledTaskIds)
         assertEquals(1, bridge.clearCacheCount)
+    }
+
+    @Test
+    fun closeDuringProcessingAbortsAfterTheInFlightTileReturns() = runBlocking {
+        val bridge = RecordingExtremeBridge(beginHandle = 41L, blockProcess = true)
+        val processor = NativeSuperResProcessor(bridge = bridge, isAvailable = { true })
+        val session = requireNotNull(processor.begin(defaultParams(), defaultPlan()))
+        val result = async(Dispatchers.Default) {
+            session.processBitmapTile(defaultParams(), null, defaultPlan().tiles.single(), {}, null)
+        }
+
+        assertTrue(bridge.awaitProcessEntered())
+        session.close()
+        bridge.releaseBlockedProcess()
+        assertTrue(result.await().success)
+
+        assertEquals(1, bridge.abortCount)
+        requireNotNull(processor.begin(defaultParams(), defaultPlan())).abort()
     }
 
     @Test
@@ -416,7 +493,9 @@ private class RecordingExtremeBridge(
     private val processCode: NativeProcessCode = NativeProcessCode.OK,
     private val progressEvents: List<NativeProgressEvent> = emptyList(),
     private val emitLateProgressOnFinish: Boolean = false,
-    private val blockProcess: Boolean = false
+    private val blockProcess: Boolean = false,
+    private val blockBegin: Boolean = false,
+    private val finishCode: NativeProcessCode = NativeProcessCode.OK
 ) : NativeProcessBridge, NativeExtremePngSessionBridge {
     var beginCount = 0
         private set
@@ -439,16 +518,26 @@ private class RecordingExtremeBridge(
     var lateProgressAttemptCount = 0
         private set
     val cancelledTaskIds = CopyOnWriteArrayList<String>()
+    val cancelledAfterBeginTaskIds = CopyOnWriteArrayList<String>()
     var clearCacheCount = 0
         private set
     private var lastProgress: ((NativeProgressEvent) -> Unit)? = null
     private val processEntered = CountDownLatch(1)
     private val releaseProcess = CountDownLatch(1)
+    private val beginEntered = CountDownLatch(1)
+    private val releaseBegin = CountDownLatch(1)
+    @Volatile
+    private var beginCompleted = false
 
     override fun beginExtremePngSession(request: NativeExtremePngSessionRequest): Long {
         beginCount += 1
         lastBeginRequest = request
         beginFailure?.let { throw it }
+        if (blockBegin) {
+            beginEntered.countDown()
+            check(releaseBegin.await(5, TimeUnit.SECONDS))
+        }
+        beginCompleted = true
         return beginHandle
     }
 
@@ -486,7 +575,7 @@ private class RecordingExtremeBridge(
                 )
             )
         }
-        return NativeProcessCode.OK
+        return finishCode
     }
 
     override fun abortExtremePngSession(handle: Long) {
@@ -501,6 +590,7 @@ private class RecordingExtremeBridge(
 
     override fun cancel(taskId: String) {
         cancelledTaskIds += taskId
+        if (beginCompleted) cancelledAfterBeginTaskIds += taskId
     }
 
     override fun clearCache() {
@@ -518,6 +608,12 @@ private class RecordingExtremeBridge(
     }
 
     fun awaitProcessEntered(): Boolean = processEntered.await(5, TimeUnit.SECONDS)
+
+    fun awaitBeginEntered(): Boolean = beginEntered.await(5, TimeUnit.SECONDS)
+
+    fun releaseBlockedBegin() {
+        releaseBegin.countDown()
+    }
 
     fun releaseBlockedProcess() {
         releaseProcess.countDown()

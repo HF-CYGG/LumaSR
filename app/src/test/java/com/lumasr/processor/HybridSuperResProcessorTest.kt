@@ -266,6 +266,7 @@ class HybridSuperResProcessorTest {
             supportedAbisProvider = { listOf("arm64-v8a") },
             regionSourceFactory = ExtremeRegionSourceFactory { regionSource }
         )
+        val progress = mutableListOf<UpscaleProgress>()
 
         val result = processor.process(
             defaultParams().copy(
@@ -274,7 +275,7 @@ class HybridSuperResProcessorTest {
                 outputPath = File(outputDir, "output.png").absolutePath,
                 exportMode = ExportMode.EXTREME_SINGLE_PNG
             )
-        ) {}
+        ) { progress += it }
 
         assertTrue(result.success)
         assertEquals(1, nativeProcessor.beginCount)
@@ -285,10 +286,12 @@ class HybridSuperResProcessorTest {
         assertEquals(nativeProcessor.plan!!.tiles.map { it.index }, regionSource.decodedTileIndexes)
         assertTrue(nativeProcessor.session.calls.none { it.params.outputPath.endsWith(".rgb") })
         assertTrue(outputDir.listFiles().orEmpty().none { it.extension == "rgb" })
+        assertEquals(UpscaleStage.DONE, progress.last().stage)
+        assertTrue(progress.dropLast(1).none { it.stage == UpscaleStage.DONE })
     }
 
     @Test
-    fun extremeSessionDoesNotNotifyProgressAfterFinish() = runBlocking {
+    fun extremeSessionOnlyReportsFinalDoneAfterSuccessfulFinish() = runBlocking {
         val nativeProcessor = RecordingExtremeSessionProcessor()
         val processor = HybridSuperResProcessor(
             nativeProcessor = nativeProcessor,
@@ -299,7 +302,7 @@ class HybridSuperResProcessorTest {
                 RecordingExtremeRegionSource(width = 256, height = 128)
             }
         )
-        val callbackAfterFinish = mutableListOf<Boolean>()
+        val callbacks = mutableListOf<Pair<UpscaleStage, Boolean>>()
 
         val result = processor.process(
             defaultParams().copy(
@@ -309,11 +312,12 @@ class HybridSuperResProcessorTest {
                 exportMode = ExportMode.EXTREME_SINGLE_PNG
             )
         ) {
-            callbackAfterFinish += nativeProcessor.session.isFinished
+            callbacks += it.stage to nativeProcessor.session.isFinished
         }
 
         assertTrue(result.success)
-        assertTrue(callbackAfterFinish.none { it })
+        assertEquals(listOf(UpscaleStage.DONE), callbacks.filter { it.second }.map { it.first })
+        assertTrue(callbacks.filterNot { it.second }.none { it.first == UpscaleStage.DONE })
     }
 
     @Test

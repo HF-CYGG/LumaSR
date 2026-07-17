@@ -76,6 +76,7 @@ data class NativeProcessRequest(
     val inferencePrecision: Int = InferencePrecision.FP32.ordinal,
     val cpuThreads: Int = 0,
     val openmpBlocktimeMs: Int = 20,
+    val postprocessThreads: Int = 1,
     val commandBatchSize: Int = 1,
     val modelCacheCapacity: Int = 1
 )
@@ -239,6 +240,7 @@ object JniNativeProcessBridge :
                 inferencePrecision = request.inferencePrecision,
                 cpuThreads = request.cpuThreads,
                 openmpBlocktimeMs = request.openmpBlocktimeMs,
+                postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
                 progressSink = NativeProgressSink(
@@ -333,6 +335,7 @@ object JniNativeProcessBridge :
                 inferencePrecision = request.inferencePrecision,
                 cpuThreads = request.cpuThreads,
                 openmpBlocktimeMs = request.openmpBlocktimeMs,
+                postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
                 progressSink = NativeProgressSink(
@@ -386,6 +389,7 @@ object JniNativeProcessBridge :
                 inferencePrecision = request.inferencePrecision,
                 cpuThreads = request.cpuThreads,
                 openmpBlocktimeMs = request.openmpBlocktimeMs,
+                postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
                 progressSink = NativeProgressSink(
@@ -429,6 +433,7 @@ object JniNativeProcessBridge :
         inferencePrecision: Int,
         cpuThreads: Int,
         openmpBlocktimeMs: Int,
+        postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
         progressSink: NativeProgressSink
@@ -481,6 +486,7 @@ object JniNativeProcessBridge :
         inferencePrecision: Int,
         cpuThreads: Int,
         openmpBlocktimeMs: Int,
+        postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
         progressSink: NativeProgressSink
@@ -518,6 +524,7 @@ object JniNativeProcessBridge :
         inferencePrecision: Int,
         cpuThreads: Int,
         openmpBlocktimeMs: Int,
+        postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
         progressSink: NativeProgressSink
@@ -696,6 +703,8 @@ private class ActiveExtremeSessionStopState {
             stopReason
         }
     }
+
+    fun pendingReason(): InferenceStopReason? = stopDeliveryLock.withLock { stopReason }
 }
 
 private class NativeStopDeliveryLease(
@@ -751,12 +760,23 @@ class NativeSuperResProcessor(
             releaseExtremeSession(params.taskId, stopState)
             throw failure
         } catch (_: Exception) {
-            releaseExtremeSession(params.taskId, stopState)
+            val finalReason = releaseExtremeSession(params.taskId, stopState)
+            if (finalReason != null) {
+                throw CancellationException("Extreme PNG session begin cancelled: $finalReason")
+            }
             return null
         }
         if (handle <= 0L) {
-            releaseExtremeSession(params.taskId, stopState)
+            val finalReason = releaseExtremeSession(params.taskId, stopState)
+            if (finalReason != null) {
+                throw CancellationException("Extreme PNG session begin cancelled: $finalReason")
+            }
             return null
+        }
+        if (stopState.pendingReason() != null) {
+            // Native registration happens inside begin. Replaying closes the window where an
+            // earlier cancellation could have reached the registry before that registration.
+            bridge.cancel(params.taskId)
         }
         return NativeExtremePngSessionImpl(
             bridge = extremeBridge,
@@ -1007,7 +1027,7 @@ class NativeSuperResProcessor(
     private fun releaseExtremeSession(
         taskId: String,
         stopState: ActiveExtremeSessionStopState
-    ) {
+    ): InferenceStopReason? {
         var finalReason: InferenceStopReason? = null
         activeExtremeStopStates.compute(taskId) { _, activeState ->
             if (activeState === stopState) {
@@ -1020,6 +1040,7 @@ class NativeSuperResProcessor(
         if (finalReason == InferenceStopReason.USER_REQUEST) {
             bridge.clearCache()
         }
+        return finalReason
     }
 
     private fun UpscaleParams.progress(stage: UpscaleStage, message: String, value: Float) = UpscaleProgress(
@@ -1154,6 +1175,8 @@ private class NativeExtremePngSessionImpl(
     private val onRelease: () -> Unit
 ) : NativeExtremePngSession {
     private val lifecycle = AtomicReference(NativeExtremeSessionLifecycle.OPEN)
+    private val abortRequested = AtomicBoolean(false)
+    private val released = AtomicBoolean(false)
     private var finishResult: NativeProcessCode? = null
 
     override suspend fun processBitmapTile(
@@ -1190,39 +1213,87 @@ private class NativeExtremePngSessionImpl(
             code.toExtremeSessionResult(params, onProgress)
         } finally {
             acceptsProgress.set(false)
-            lifecycle.compareAndSet(NativeExtremeSessionLifecycle.PROCESSING, NativeExtremeSessionLifecycle.OPEN)
+            if (abortRequested.get()) {
+                if (lifecycle.compareAndSet(
+                        NativeExtremeSessionLifecycle.PROCESSING,
+                        NativeExtremeSessionLifecycle.ABORTED
+                    )) {
+                    abortNativeAndRelease()
+                }
+            } else if (lifecycle.compareAndSet(
+                    NativeExtremeSessionLifecycle.PROCESSING,
+                    NativeExtremeSessionLifecycle.OPEN
+                ) && abortRequested.get()) {
+                abort()
+            }
         }
     }
 
     @Synchronized
     override fun finish(): NativeProcessCode {
         finishResult?.let { return it }
-        check(lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.FINISHED)) {
+        check(lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.FINISHING)) {
             "Extreme PNG session cannot be finished from its current state."
         }
         return try {
-            bridge.finishExtremePngSession(handle).also { finishResult = it }
-        } finally {
-            onRelease()
+            val code = bridge.finishExtremePngSession(handle)
+            if (code == NativeProcessCode.OK) {
+                finishResult = code
+                lifecycle.set(NativeExtremeSessionLifecycle.FINISHED)
+                releaseOnce()
+            } else {
+                lifecycle.set(NativeExtremeSessionLifecycle.ABORTED)
+                runCatching { abortNativeAndRelease() }
+            }
+            code
+        } catch (failure: Throwable) {
+            lifecycle.set(NativeExtremeSessionLifecycle.ABORTED)
+            runCatching { abortNativeAndRelease() }
+                .exceptionOrNull()
+                ?.let(failure::addSuppressed)
+            throw failure
         }
     }
 
     @Synchronized
     override fun abort() {
-        if (!lifecycle.compareAndSet(NativeExtremeSessionLifecycle.OPEN, NativeExtremeSessionLifecycle.ABORTED)) {
-            return
+        abortRequested.set(true)
+        while (true) {
+            when (lifecycle.get()) {
+                NativeExtremeSessionLifecycle.OPEN -> {
+                    if (lifecycle.compareAndSet(
+                            NativeExtremeSessionLifecycle.OPEN,
+                            NativeExtremeSessionLifecycle.ABORTED
+                        )) {
+                        abortNativeAndRelease()
+                        return
+                    }
+                }
+                NativeExtremeSessionLifecycle.PROCESSING,
+                NativeExtremeSessionLifecycle.FINISHING,
+                NativeExtremeSessionLifecycle.FINISHED,
+                NativeExtremeSessionLifecycle.ABORTED -> return
+            }
         }
+    }
+
+    private fun abortNativeAndRelease() {
         try {
             bridge.abortExtremePngSession(handle)
         } finally {
-            onRelease()
+            releaseOnce()
         }
+    }
+
+    private fun releaseOnce() {
+        if (released.compareAndSet(false, true)) onRelease()
     }
 }
 
 private enum class NativeExtremeSessionLifecycle {
     OPEN,
     PROCESSING,
+    FINISHING,
     FINISHED,
     ABORTED
 }
@@ -1260,7 +1331,18 @@ private fun NativeProcessCode.toExtremeSessionResult(
 ): UpscaleResult {
     if (this == NativeProcessCode.OK) {
         val message = "Native extreme tile inference complete"
-        onProgress(params.toExtremeSessionTerminalProgress(UpscaleStage.DONE, message, 1f))
+        onProgress(
+            UpscaleProgress(
+                taskId = params.taskId,
+                stage = UpscaleStage.PROCESSING_TILE,
+                progress = 1f,
+                currentTile = 1,
+                totalTiles = 1,
+                completedTiles = 1,
+                message = message,
+                estimatedRemainingMs = null
+            )
+        )
         return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, message)
     }
     if (this == NativeProcessCode.CANCELLED) {
@@ -1349,6 +1431,7 @@ internal fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     inferencePrecision = inferencePrecision.ordinal,
     cpuThreads = cpuThreads,
     openmpBlocktimeMs = openmpBlocktimeMs,
+    postprocessThreads = postprocessThreads,
     commandBatchSize = commandBatchSize,
     modelCacheCapacity = modelCacheCapacity
 )

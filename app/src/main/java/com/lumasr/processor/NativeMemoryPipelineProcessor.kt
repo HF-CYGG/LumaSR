@@ -5,7 +5,7 @@ import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleResult
 
-internal const val NATIVE_MEMORY_PIPELINE_CONFIG_STRIDE = 20
+internal const val NATIVE_MEMORY_PIPELINE_CONFIG_STRIDE = 21
 
 enum class NativeMemoryPipelinePreflightReason {
     CAPABILITY_UNAVAILABLE,
@@ -73,8 +73,9 @@ internal fun encodeNativeMemoryPipelinePasses(
         configs[base + 15] = pass.inferencePrecision
         configs[base + 16] = pass.cpuThreads
         configs[base + 17] = pass.openmpBlocktimeMs
-        configs[base + 18] = pass.commandBatchSize
-        configs[base + 19] = pass.modelCacheCapacity
+        configs[base + 18] = pass.postprocessThreads
+        configs[base + 19] = pass.commandBatchSize
+        configs[base + 20] = pass.modelCacheCapacity
     }
     return NativeMemoryPipelineEncoding(
         modelDirs = passes.map { it.modelDir }.toTypedArray(),

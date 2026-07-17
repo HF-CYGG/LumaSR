@@ -425,6 +425,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
     jint inference_precision,
     jint cpu_threads,
     jint openmp_blocktime_ms,
+    jint postprocess_threads,
     jint command_batch_size,
     jint model_cache_capacity,
     jobject progress_sink
@@ -454,6 +455,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processNative(
             static_cast<int>(inference_precision),
             static_cast<int>(cpu_threads),
             static_cast<int>(openmp_blocktime_ms),
+            static_cast<int>(postprocess_threads),
             static_cast<int>(command_batch_size),
             static_cast<int>(model_cache_capacity)
         };
@@ -498,7 +500,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processMemoryPipelineNative(
     jlong transport_budget_bytes,
     jobject progress_sink
 ) {
-    constexpr jsize kPassConfigStride = 20;
+    constexpr jsize kPassConfigStride = 21;
     return static_cast<jint>(run_superres_process_jni_boundary(env, [&]() -> int {
         if (task_id == nullptr || input_path == nullptr || output_path == nullptr ||
             model_dirs == nullptr || model_file_bases == nullptr || pass_configs == nullptr ||
@@ -570,8 +572,9 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processMemoryPipelineNative(
             params.inferencePrecision = static_cast<int>(configs[base + 15u]);
             params.cpuThreads = static_cast<int>(configs[base + 16u]);
             params.openmpBlocktimeMs = static_cast<int>(configs[base + 17u]);
-            params.commandBatchSize = static_cast<int>(configs[base + 18u]);
-            params.modelCacheCapacity = static_cast<int>(configs[base + 19u]);
+            params.postprocessThreads = static_cast<int>(configs[base + 18u]);
+            params.commandBatchSize = static_cast<int>(configs[base + 19u]);
+            params.modelCacheCapacity = static_cast<int>(configs[base + 20u]);
             passes.push_back(std::move(params));
         }
 
@@ -650,6 +653,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
     jint inference_precision,
     jint cpu_threads,
     jint openmp_blocktime_ms,
+    jint postprocess_threads,
     jint command_batch_size,
     jint model_cache_capacity,
     jobject progress_sink
@@ -685,6 +689,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processBitmapRegionNative(
             static_cast<int>(inference_precision),
             static_cast<int>(cpu_threads),
             static_cast<int>(openmp_blocktime_ms),
+            static_cast<int>(postprocess_threads),
             static_cast<int>(command_batch_size),
             static_cast<int>(model_cache_capacity)
         };
@@ -821,6 +826,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processExtremePngSessionBitmapN
     jint inference_precision,
     jint cpu_threads,
     jint openmp_blocktime_ms,
+    jint postprocess_threads,
     jint command_batch_size,
     jint model_cache_capacity,
     jobject progress_sink
@@ -858,6 +864,7 @@ Java_com_lumasr_processor_JniNativeProcessBridge_processExtremePngSessionBitmapN
             static_cast<int>(inference_precision),
             static_cast<int>(cpu_threads),
             static_cast<int>(openmp_blocktime_ms),
+            static_cast<int>(postprocess_threads),
             static_cast<int>(command_batch_size),
             static_cast<int>(model_cache_capacity)
         };

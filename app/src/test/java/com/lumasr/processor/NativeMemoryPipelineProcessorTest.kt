@@ -91,6 +91,7 @@ class NativeMemoryPipelineProcessorTest {
             inferencePrecision = InferencePrecision.FP16,
             cpuThreads = 6,
             openmpBlocktimeMs = 35,
+            postprocessThreads = 3,
             commandBatchSize = 4,
             modelCacheCapacity = 2
         ).toNativeRequest()
@@ -109,8 +110,9 @@ class NativeMemoryPipelineProcessorTest {
         assertEquals(request.inferencePrecision, encoding.passConfigs[15])
         assertEquals(request.cpuThreads, encoding.passConfigs[16])
         assertEquals(request.openmpBlocktimeMs, encoding.passConfigs[17])
-        assertEquals(request.commandBatchSize, encoding.passConfigs[18])
-        assertEquals(request.modelCacheCapacity, encoding.passConfigs[19])
+        assertEquals(request.postprocessThreads, encoding.passConfigs[18])
+        assertEquals(request.commandBatchSize, encoding.passConfigs[19])
+        assertEquals(request.modelCacheCapacity, encoding.passConfigs[20])
     }
 
     private fun params(taskId: String) = UpscaleParams(

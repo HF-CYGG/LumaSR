@@ -85,6 +85,7 @@ data class UpscaleParams(
     val inferencePrecision: InferencePrecision = InferencePrecision.FP32,
     val cpuThreads: Int = 0,
     val openmpBlocktimeMs: Int = 20,
+    val postprocessThreads: Int = 1,
     val commandBatchSize: Int = 1,
     val modelCacheCapacity: Int = 1
 )

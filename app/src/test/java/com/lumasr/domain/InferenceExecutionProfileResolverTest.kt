@@ -12,6 +12,39 @@ import org.junit.Test
 
 class InferenceExecutionProfileResolverTest {
     @Test
+    fun mapperPersistsOpenmpAndPostprocessExecutionControls() {
+        val base = params()
+        val profile = InferenceExecutionProfileMapper.from(base).copy(
+            openmpBlocktimeMs = 37,
+            postprocessThreads = 3
+        )
+
+        val resolved = InferenceExecutionProfileMapper.apply(base, profile)
+
+        assertEquals(37, resolved.openmpBlocktimeMs)
+        assertEquals(3, resolved.postprocessThreads)
+        assertEquals(37, InferenceExecutionProfileMapper.from(resolved).openmpBlocktimeMs)
+        assertEquals(3, InferenceExecutionProfileMapper.from(resolved).postprocessThreads)
+    }
+
+    @Test
+    fun legacyResolutionPreservesConfiguredCpuExecutionControls() = runBlocking {
+        val base = params().copy(
+            accelerationMode = AccelerationMode.CPU,
+            openmpBlocktimeMs = 33,
+            postprocessThreads = 4
+        )
+        val resolved = resolver(FakeBenchmarkRepository(null)).resolve(
+            "model-a",
+            base,
+            nowEpochMs = 1_500L
+        )
+
+        assertEquals(33, resolved.openmpBlocktimeMs)
+        assertEquals(4, resolved.postprocessThreads)
+    }
+
+    @Test
     fun lazyResolverDefersCapabilityProbeAndRunsResolutionOffCallerThread() = runBlocking {
         val dispatcher = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "calibration-io")

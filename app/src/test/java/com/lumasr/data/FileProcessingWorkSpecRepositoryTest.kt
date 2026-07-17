@@ -62,6 +62,26 @@ class FileProcessingWorkSpecRepositoryTest {
     }
 
     @Test
+    fun readsLegacyWorkSpecWithoutPostprocessThreadsUsingSafeDefault() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-postprocess-threads")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText()
+                .replace(",\"postprocessThreads\":5", "")
+                .replace(",\"postprocessThreads\":3", "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(1, restored?.params?.postprocessThreads)
+        assertTrue(restored?.params?.pipelinePasses.orEmpty().all { it.postprocessThreads == 1 })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
     fun corruptSidecarIsQuarantinedWithoutAffectingTaskRecords() = runBlocking {
         val root = temporaryFolder.newFolder("corrupt")
         val taskRepository = FileProcessingTaskRepository(root)
@@ -120,6 +140,7 @@ class FileProcessingWorkSpecRepositoryTest {
             inferencePrecision = InferencePrecision.FP32,
             cpuThreads = 3,
             openmpBlocktimeMs = 31,
+            postprocessThreads = 3,
             commandBatchSize = 2,
             modelCacheCapacity = 2
         )
@@ -153,6 +174,7 @@ class FileProcessingWorkSpecRepositoryTest {
             inferencePrecision = InferencePrecision.FP16,
             cpuThreads = 6,
             openmpBlocktimeMs = 45,
+            postprocessThreads = 5,
             commandBatchSize = 4,
             modelCacheCapacity = 3
         )

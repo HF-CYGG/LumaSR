@@ -705,6 +705,7 @@ class HybridSuperResProcessor(
                 return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Extreme PNG session finalization failed.")
             }
             finished = true
+            onProgress(params.progress(UpscaleStage.DONE, "Extreme export complete", 1f))
             return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "Extreme export complete")
         } finally {
             acceptsSessionProgress = false

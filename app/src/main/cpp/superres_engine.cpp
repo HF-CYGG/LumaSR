@@ -204,6 +204,7 @@ SuperResExecutionProfile resolve_execution_profile(
             inference_precision_from_code(params.inferencePrecision),
             params.cpuThreads,
             params.openmpBlocktimeMs,
+            params.postprocessThreads,
             params.commandBatchSize,
             params.modelCacheCapacity
         },
@@ -761,7 +762,12 @@ bool copy_output_tile(
     return true;
 }
 
-bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normalized, long long& tileCopyMs) {
+bool normalize_output_tile_for_copy(
+    const ncnn::Mat& source,
+    int postprocessThreads,
+    ncnn::Mat& normalized,
+    long long& tileCopyMs
+) {
     const auto normalizeStart = std::chrono::steady_clock::now();
     if (source.empty()) {
         normalized = source;
@@ -770,7 +776,7 @@ bool normalize_output_tile_for_copy(const ncnn::Mat& source, ncnn::Mat& normaliz
     }
 
     ncnn::Option opt;
-    opt.num_threads = 1;
+    opt.num_threads = clamp_execution_value(postprocessThreads, 1, 64);
 
     ncnn::Mat current = source;
     ncnn::Mat fp32;
@@ -1009,7 +1015,12 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             }
 
             ncnn::Mat copySource;
-            if (!normalize_output_tile_for_copy(work.downloaded, copySource, performance.tileCopyMs)) {
+            if (!normalize_output_tile_for_copy(
+                    work.downloaded,
+                    executionProfile.postprocessThreads,
+                    copySource,
+                    performance.tileCopyMs
+                )) {
                 log_tile_output_mismatch(
                     params,
                     true,
@@ -1237,7 +1248,12 @@ NcnnStageRunResult run_ncnn_stage(
                     return useVulkan ? SuperResNativeCode::VulkanFailed : SuperResNativeCode::Unsupported;
                 }
                 performance.tileExtractMs += elapsed_ms(extractStart);
-                if (!normalize_output_tile_for_copy(result, copySource, performance.tileCopyMs)) {
+                if (!normalize_output_tile_for_copy(
+                        result,
+                        executionProfile.postprocessThreads,
+                        copySource,
+                        performance.tileCopyMs
+                    )) {
                     log_tile_output_mismatch(
                         params,
                         useVulkan,
@@ -1300,7 +1316,12 @@ NcnnStageRunResult run_ncnn_stage(
                     performance.tileExtractMs += elapsed_ms(extractStart);
 
                     ncnn::Mat normalizedPass;
-                    if (!normalize_output_tile_for_copy(passResult, normalizedPass, performance.tileCopyMs)) {
+                    if (!normalize_output_tile_for_copy(
+                            passResult,
+                            executionProfile.postprocessThreads,
+                            normalizedPass,
+                            performance.tileCopyMs
+                        )) {
                         log_tile_output_mismatch(
                             params,
                             useVulkan,
@@ -1476,6 +1497,7 @@ SuperResNativeCode run_ncnn_image_to_extreme_target(
     const SuperResRgbImage& image,
     RgbOutputTarget& output
 ) {
+    const auto totalStart = std::chrono::steady_clock::now();
     static const bool executionProfileChecksPass = run_execution_profile_runtime_checks();
     static const bool pixelIoChecksPass = run_pixel_io_runtime_checks();
     static const bool rgbImageChecksPass = run_superres_rgb_image_runtime_checks();
@@ -1556,7 +1578,7 @@ SuperResNativeCode run_ncnn_image_to_extreme_target(
             ? SuperResNativeCode::OutOfMemory
             : SuperResNativeCode::InvalidParams;
     }
-    return run_ncnn_stage(
+    const NcnnStageRunResult stageResult = run_ncnn_stage(
         params,
         onProgress,
         runtimeControl,
@@ -1568,7 +1590,27 @@ SuperResNativeCode run_ncnn_image_to_extreme_target(
         geometry,
         output,
         performance
-    ).code;
+    );
+    if (stageResult.code != SuperResNativeCode::Ok) {
+        return stageResult.code;
+    }
+    performance.preprocessMs = performance.tileInputMs;
+    if (!stageResult.useExplicitVulkanPath) {
+        performance.inferenceMs = performance.tileExtractMs;
+    }
+    performance.postprocessMs = performance.tileCopyMs;
+    performance.totalMs = elapsed_ms(totalStart);
+    performance.hasValue = true;
+    emit(
+        onProgress,
+        SuperResNativeStage::ProcessingTile,
+        stageResult.totalTiles,
+        stageResult.totalTiles,
+        0.95f,
+        "Extreme tile inference complete",
+        performance
+    );
+    return SuperResNativeCode::Ok;
 }
 
 SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
@@ -1896,7 +1938,7 @@ SuperResNativeCode run_ncnn_image(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d threads=%d blocktimeMs=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
         params.taskId.c_str(),
         modelKey.c_str(),
         modelKey.c_str(),
@@ -1909,6 +1951,7 @@ SuperResNativeCode run_ncnn_image(
         performance.requestedMaxPipelineDepth,
         executionProfile.cpuThreads,
         executionProfile.openmpBlocktimeMs,
+        executionProfile.postprocessThreads,
         executionProfile.commandBatchSize,
         executionProfile.modelCacheCapacity,
         performance.cacheHit ? 1 : 0,

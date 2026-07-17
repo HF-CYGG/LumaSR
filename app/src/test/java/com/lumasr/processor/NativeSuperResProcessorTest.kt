@@ -120,6 +120,7 @@ class NativeSuperResProcessorTest {
         assertEquals(InferencePrecision.FP32.ordinal, bridge.lastRequest?.inferencePrecision)
         assertEquals(0, bridge.lastRequest?.cpuThreads)
         assertEquals(20, bridge.lastRequest?.openmpBlocktimeMs)
+        assertEquals(1, bridge.lastRequest?.postprocessThreads)
         assertEquals(1, bridge.lastRequest?.commandBatchSize)
         assertEquals(1, bridge.lastRequest?.modelCacheCapacity)
         assertEquals(listOf(UpscaleStage.PREPARING, UpscaleStage.LOADING_MODEL, UpscaleStage.DONE), stages)
@@ -808,6 +809,7 @@ class NativeSuperResProcessorTest {
                 inferencePrecision = InferencePrecision.FP16,
                 cpuThreads = 6,
                 openmpBlocktimeMs = 35,
+                postprocessThreads = 4,
                 commandBatchSize = 4,
                 modelCacheCapacity = 2
             )
@@ -824,6 +826,7 @@ class NativeSuperResProcessorTest {
         assertEquals(InferencePrecision.FP16.ordinal, bridge.lastRequest?.inferencePrecision)
         assertEquals(6, bridge.lastRequest?.cpuThreads)
         assertEquals(35, bridge.lastRequest?.openmpBlocktimeMs)
+        assertEquals(4, bridge.lastRequest?.postprocessThreads)
         assertEquals(4, bridge.lastRequest?.commandBatchSize)
         assertEquals(2, bridge.lastRequest?.modelCacheCapacity)
     }
@@ -850,6 +853,7 @@ class NativeSuperResProcessorTest {
                 inferencePrecision = InferencePrecision.FP16,
                 cpuThreads = 5,
                 openmpBlocktimeMs = 45,
+                postprocessThreads = 3,
                 commandBatchSize = 3,
                 modelCacheCapacity = 2
             ),
@@ -870,6 +874,7 @@ class NativeSuperResProcessorTest {
         assertEquals(InferencePrecision.FP16.ordinal, bridge.lastBitmapRegionRequest?.inferencePrecision)
         assertEquals(5, bridge.lastBitmapRegionRequest?.cpuThreads)
         assertEquals(45, bridge.lastBitmapRegionRequest?.openmpBlocktimeMs)
+        assertEquals(3, bridge.lastBitmapRegionRequest?.postprocessThreads)
         assertEquals(3, bridge.lastBitmapRegionRequest?.commandBatchSize)
         assertEquals(2, bridge.lastBitmapRegionRequest?.modelCacheCapacity)
     }

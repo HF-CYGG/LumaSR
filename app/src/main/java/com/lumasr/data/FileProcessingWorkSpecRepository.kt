@@ -187,6 +187,7 @@ private object ProcessingWorkSpecJson {
         put("inferencePrecision", params.inferencePrecision.name)
         put("cpuThreads", params.cpuThreads)
         put("openmpBlocktimeMs", params.openmpBlocktimeMs)
+        put("postprocessThreads", params.postprocessThreads)
         put("commandBatchSize", params.commandBatchSize)
         put("modelCacheCapacity", params.modelCacheCapacity)
     }
@@ -221,6 +222,7 @@ private object ProcessingWorkSpecJson {
         inferencePrecision = InferencePrecision.valueOf(record.requiredString("inferencePrecision")),
         cpuThreads = record.requiredInt("cpuThreads"),
         openmpBlocktimeMs = record.requiredInt("openmpBlocktimeMs"),
+        postprocessThreads = record.optionalInt("postprocessThreads") ?: 1,
         commandBatchSize = record.requiredInt("commandBatchSize"),
         modelCacheCapacity = record.requiredInt("modelCacheCapacity")
     )
@@ -244,5 +246,13 @@ private object ProcessingWorkSpecJson {
         return value.jsonPrimitive
             .also { check(!it.isString) { "$key must be a JSON number or null" } }
             .long
+    }
+
+    private fun JsonObject.optionalInt(key: String): Int? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(!it.isString) { "$key must be a JSON number or null" } }
+            .int
     }
 }

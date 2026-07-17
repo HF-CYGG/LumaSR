@@ -37,7 +37,9 @@ data class InferenceExecutionProfile(
     val commandBatchSize: Int,
     val gpuHeadroomPercent: Int,
     val modelCacheCapacity: Int,
-    val tta: Boolean
+    val tta: Boolean,
+    val openmpBlocktimeMs: Int = 20,
+    val postprocessThreads: Int = 1
 )
 
 data class Fp16QualityMetrics(

@@ -25,6 +25,7 @@ struct SuperResExecutionProfileRequest {
     SuperResInferencePrecision precision = SuperResInferencePrecision::Fp32;
     int cpuThreads = 0;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
 };
@@ -34,6 +35,7 @@ struct SuperResExecutionProfile {
     SuperResInferencePrecision effectivePrecision = SuperResInferencePrecision::Fp32;
     int cpuThreads = 1;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
     SuperResNativeFallbackReason fallbackReason = SuperResNativeFallbackReason::None;
@@ -88,6 +90,7 @@ constexpr SuperResExecutionProfile sanitize_execution_profile(
         effectivePrecision,
         sanitize_cpu_threads(request.cpuThreads, useVulkan, bigCoreCount, physicalCoreCount),
         clamp_execution_value(request.openmpBlocktimeMs, 0, 100),
+        clamp_execution_value(request.postprocessThreads, 1, 64),
         clamp_execution_value(request.commandBatchSize, 1, 8),
         clamp_execution_value(request.modelCacheCapacity, 1, 2),
         fallbackReason

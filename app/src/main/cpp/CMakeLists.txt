@@ -32,6 +32,7 @@ if(NOT ANDROID)
         superres_rgb_output_target_checks.cpp
         superres_rgb_transport_checks.cpp
         superres_pipeline_internal_checks.cpp
+        superres_execution_profile_checks.cpp
         superres_ncnn_stage_contract_checks.cpp
         superres_host_checks.cpp
         tests/stb_image_host.cpp

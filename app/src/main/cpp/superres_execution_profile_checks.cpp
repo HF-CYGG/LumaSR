@@ -9,6 +9,7 @@ constexpr SuperResExecutionProfileRequest kOptimizedRequest{
     SuperResInferencePrecision::Fp16,
     8,
     130,
+    99,
     12,
     7
 };
@@ -21,6 +22,7 @@ constexpr SuperResExecutionProfile kSanitizedCpuProfile = sanitize_execution_pro
 );
 static_assert(kSanitizedCpuProfile.cpuThreads == 4);
 static_assert(kSanitizedCpuProfile.openmpBlocktimeMs == 100);
+static_assert(kSanitizedCpuProfile.postprocessThreads == 64);
 static_assert(kSanitizedCpuProfile.commandBatchSize == 8);
 static_assert(kSanitizedCpuProfile.modelCacheCapacity == 2);
 static_assert(kSanitizedCpuProfile.effectivePrecision == SuperResInferencePrecision::Fp32);

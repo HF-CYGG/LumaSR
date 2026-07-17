@@ -73,6 +73,8 @@ object InferenceExecutionProfileMapper {
         nativeBackend = profile.backend,
         inferencePrecision = profile.precision,
         cpuThreads = profile.cpuThreads,
+        openmpBlocktimeMs = profile.openmpBlocktimeMs,
+        postprocessThreads = profile.postprocessThreads,
         commandBatchSize = profile.commandBatchSize,
         modelCacheCapacity = profile.modelCacheCapacity
     )
@@ -82,6 +84,8 @@ object InferenceExecutionProfileMapper {
         accelerationMode = params.accelerationMode,
         precision = params.inferencePrecision,
         cpuThreads = params.cpuThreads.coerceAtLeast(1),
+        openmpBlocktimeMs = params.openmpBlocktimeMs.coerceIn(0, 100),
+        postprocessThreads = params.postprocessThreads.coerceIn(1, 64),
         tileSize = UpscaleParamsFactory.sanitizeTileSize(params.tileSize),
         commandBatchSize = params.commandBatchSize.coerceIn(1, 8),
         gpuHeadroomPercent = UpscaleParamsFactory.sanitizeGpuHeadroomPercent(
@@ -227,6 +231,9 @@ class InferenceExecutionProfileResolver(
             currentSafeTileSize = params.tileSize,
             nowEpochMs = nowEpochMs,
             calibratedVulkanProfile = calibratedVulkanProfile
+        ).copy(
+            openmpBlocktimeMs = params.openmpBlocktimeMs,
+            postprocessThreads = params.postprocessThreads
         )
         return InferenceExecutionProfileMapper.apply(params, profile)
     }
