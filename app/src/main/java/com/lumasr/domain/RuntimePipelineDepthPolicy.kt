@@ -120,6 +120,7 @@ enum class RuntimePipelineDepthReason {
     ACCELERATION_NOT_EXPLICIT_VULKAN,
     TTA_NOT_ELIGIBLE,
     THERMAL_NOT_ELIGIBLE,
+    DEVICE_BENCHMARK_NOT_APPROVED,
     LOW_RAM_DEVICE,
     RESOURCE_UNKNOWN,
     ESTIMATE_OVERFLOW,
@@ -135,7 +136,8 @@ data class RuntimePipelineDepthDecision(
 )
 
 class RuntimePipelineDepthPolicy(
-    private val estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
+    private val estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator,
+    private val depthTwoApproved: (UpscaleParams) -> Boolean = { false }
 ) {
     fun decide(
         params: UpscaleParams,
@@ -173,6 +175,12 @@ class RuntimePipelineDepthPolicy(
         if (estimate.twoSlotBytes > percentBudget(availableRamBytes, AVAILABLE_RAM_PERCENT)) {
             return depthOne(
                 RuntimePipelineDepthReason.AVAILABLE_RAM_BUDGET_EXCEEDED,
+                estimate.twoSlotBytes
+            )
+        }
+        if (!runCatching { depthTwoApproved(params) }.getOrDefault(false)) {
+            return depthOne(
+                RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED,
                 estimate.twoSlotBytes
             )
         }

@@ -7,6 +7,26 @@ import org.junit.Test
 
 class RuntimePipelineDepthPolicyTest {
     @Test
+    fun depthTwoRemainsDisabledUntilDeviceBenchmarkApprovalIsProvided() {
+        val resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
+        val estimator = RuntimePipelineSlotEstimator { syntheticEstimate(1L) }
+
+        val defaultDecision = RuntimePipelineDepthPolicy(estimator)
+            .decide(params(), ThermalLevel.NORMAL, resources)
+        val approvedDecision = RuntimePipelineDepthPolicy(
+            estimator = estimator,
+            depthTwoApproved = { true }
+        ).decide(params(), ThermalLevel.NORMAL, resources)
+
+        assertEquals(1, defaultDecision.maxPipelineDepth)
+        assertEquals(
+            RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED,
+            defaultDecision.reason
+        )
+        assertEquals(2, approvedDecision.maxPipelineDepth)
+    }
+
+    @Test
     fun estimatorAccountsForEveryDeclaredSlotBufferWithFp16AndTwoSlots() {
         val estimate = CheckedRuntimePipelineSlotEstimator.estimate(params())!!
         val inputEdge = 512L + 64L
@@ -68,7 +88,7 @@ class RuntimePipelineDepthPolicyTest {
         val batchOne = params().copy(commandBatchSize = 1)
         val batchEight = params().copy(commandBatchSize = 8)
         val resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
-        val policy = RuntimePipelineDepthPolicy()
+        val policy = approvedPolicy()
 
         assertEquals(2, policy.decide(batchOne, ThermalLevel.NORMAL, resources).maxPipelineDepth)
         val rejected = policy.decide(batchEight, ThermalLevel.NORMAL, resources)
@@ -88,7 +108,7 @@ class RuntimePipelineDepthPolicyTest {
     @Test
     fun allowsDepthTwoAtInclusiveGpuRamAndHardLimitBoundaries() {
         val estimate = CheckedRuntimePipelineSlotEstimator.estimate(params())!!
-        val policy = RuntimePipelineDepthPolicy()
+        val policy = approvedPolicy()
         val gpuHeap = minimumResourceForPercentBudget(estimate.twoSlotBytes, 25)
         val availableRam = minimumResourceForPercentBudget(estimate.twoSlotBytes, 15)
 
@@ -113,7 +133,7 @@ class RuntimePipelineDepthPolicyTest {
         val estimate = CheckedRuntimePipelineSlotEstimator.estimate(params())!!
         val gpuHeap = minimumResourceForPercentBudget(estimate.twoSlotBytes, 25)
         val availableRam = minimumResourceForPercentBudget(estimate.twoSlotBytes, 15)
-        val policy = RuntimePipelineDepthPolicy()
+        val policy = approvedPolicy()
 
         val gpuRejected = policy.decide(
             params(),
@@ -144,11 +164,11 @@ class RuntimePipelineDepthPolicyTest {
 
         assertEquals(
             2,
-            RuntimePipelineDepthPolicy(atLimitEstimator)
+            approvedPolicy(atLimitEstimator)
                 .decide(params(), ThermalLevel.NORMAL, resources)
                 .maxPipelineDepth
         )
-        val rejected = RuntimePipelineDepthPolicy(overLimitEstimator)
+        val rejected = approvedPolicy(overLimitEstimator)
             .decide(params(), ThermalLevel.NORMAL, resources)
         assertEquals(1, rejected.maxPipelineDepth)
         assertEquals(RuntimePipelineDepthReason.HARD_LIMIT_EXCEEDED, rejected.reason)
@@ -157,7 +177,7 @@ class RuntimePipelineDepthPolicyTest {
     @Test
     fun onlyOptimizedExplicitVulkanNormalOrLightAndNonLowRamCanUseDepthTwo() {
         val resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
-        val policy = RuntimePipelineDepthPolicy(RuntimePipelineSlotEstimator { syntheticEstimate(1L) })
+        val policy = approvedPolicy(RuntimePipelineSlotEstimator { syntheticEstimate(1L) })
 
         val cases = listOf(
             params().copy(nativeBackend = NativeBackend.LEGACY_SAFE) to RuntimePipelineDepthReason.BACKEND_NOT_OPTIMIZED,
@@ -182,7 +202,7 @@ class RuntimePipelineDepthPolicyTest {
 
     @Test
     fun unknownResourcesAndEstimatorOverflowFailClosed() {
-        val policy = RuntimePipelineDepthPolicy(RuntimePipelineSlotEstimator { syntheticEstimate(1L) })
+        val policy = approvedPolicy(RuntimePipelineSlotEstimator { syntheticEstimate(1L) })
         val unknownCases = listOf(
             null,
             RuntimePipelineResources(null, 1024L, false),
@@ -196,7 +216,7 @@ class RuntimePipelineDepthPolicyTest {
             assertEquals(RuntimePipelineDepthReason.RESOURCE_UNKNOWN, decision.reason)
         }
 
-        val overflow = RuntimePipelineDepthPolicy(RuntimePipelineSlotEstimator { null })
+        val overflow = approvedPolicy(RuntimePipelineSlotEstimator { null })
             .decide(
                 params(),
                 ThermalLevel.NORMAL,
@@ -213,6 +233,10 @@ class RuntimePipelineDepthPolicyTest {
         }
         return candidate
     }
+
+    private fun approvedPolicy(
+        estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
+    ) = RuntimePipelineDepthPolicy(estimator = estimator, depthTwoApproved = { true })
 
     private fun syntheticEstimate(twoSlotBytes: Long) = RuntimePipelineSlotEstimate(
         inputRgbBytes = 0L,

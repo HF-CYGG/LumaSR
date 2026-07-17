@@ -416,7 +416,7 @@ class SuperResProcessingTaskRunnerTest {
     )
 
     private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy(
-        RuntimePipelineSlotEstimator {
+        estimator = RuntimePipelineSlotEstimator {
             RuntimePipelineSlotEstimate(
                 inputRgbBytes = 0L,
                 preprocessFloatBytes = 0L,
@@ -428,7 +428,8 @@ class SuperResProcessingTaskRunnerTest {
                 perSlotBytes = 1L,
                 twoSlotBytes = 2L
             )
-        }
+        },
+        depthTwoApproved = { true }
     )
 
     private fun params(id: String): UpscaleParams {
