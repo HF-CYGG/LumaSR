@@ -30,6 +30,9 @@ fun interface RuntimePipelineSlotEstimator {
 object CheckedRuntimePipelineSlotEstimator : RuntimePipelineSlotEstimator {
     override fun estimate(params: UpscaleParams): RuntimePipelineSlotEstimate? {
         if (params.tileSize <= 0 || params.scale <= 0) return null
+        val commandBatchSize = params.commandBatchSize
+            .coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE)
+            .toLong()
         val inputEdge = checkedAdd(params.tileSize.toLong(), MAX_TILE_PADDING_PER_EDGE) ?: return null
         val inputPixels = checkedMultiply(inputEdge, inputEdge) ?: return null
         val outputPixels = checkedMultiply(inputPixels, params.scale.toLong())
@@ -42,14 +45,25 @@ object CheckedRuntimePipelineSlotEstimator : RuntimePipelineSlotEstimator {
             InferencePrecision.FP32 -> FP32_BYTES
         }
 
-        val inputRgbBytes = inputElements
-        val preprocessFloatBytes = checkedMultiply(inputElements, FP32_BYTES) ?: return null
-        val vkInputBytes = checkedMultiply(inputElements, vulkanElementBytes) ?: return null
-        val vkOutputBytes = checkedMultiply(outputElements, vulkanElementBytes) ?: return null
-        val downloadFloatBytes = checkedMultiply(outputElements, FP32_BYTES) ?: return null
-        val outputRgbBytes = outputElements
+        // One pipeline slot owns a complete Vulkan command batch, not a single tile.
+        val inputRgbBytes = checkedMultiply(inputElements, commandBatchSize) ?: return null
+        val preprocessFloatBytes = checkedMultiply(inputElements, FP32_BYTES)
+            ?.let { checkedMultiply(it, commandBatchSize) }
+            ?: return null
+        val vkInputBytes = checkedMultiply(inputElements, vulkanElementBytes)
+            ?.let { checkedMultiply(it, commandBatchSize) }
+            ?: return null
+        val vkOutputBytes = checkedMultiply(outputElements, vulkanElementBytes)
+            ?.let { checkedMultiply(it, commandBatchSize) }
+            ?: return null
+        val downloadFloatBytes = checkedMultiply(outputElements, FP32_BYTES)
+            ?.let { checkedMultiply(it, commandBatchSize) }
+            ?: return null
+        val outputRgbBytes = checkedMultiply(outputElements, commandBatchSize) ?: return null
         // Output normalization/unpacking can require a separate canonical FP32 surface.
-        val scratchBytes = checkedMultiply(outputElements, FP32_BYTES) ?: return null
+        val scratchBytes = checkedMultiply(outputElements, FP32_BYTES)
+            ?.let { checkedMultiply(it, commandBatchSize) }
+            ?: return null
         val perSlotBytes = checkedSum(
             inputRgbBytes,
             preprocessFloatBytes,
@@ -96,6 +110,8 @@ object CheckedRuntimePipelineSlotEstimator : RuntimePipelineSlotEstimator {
     const val FP16_BYTES = 2L
     const val FP32_BYTES = 4L
     const val SLOT_COUNT = 2L
+    const val MIN_COMMAND_BATCH_SIZE = 1
+    const val MAX_COMMAND_BATCH_SIZE = 8
 }
 
 enum class RuntimePipelineDepthReason {

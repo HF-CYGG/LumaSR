@@ -15,8 +15,11 @@ import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.RuntimeInferenceControl
 import com.lumasr.domain.RuntimeInferenceControlProvider
+import com.lumasr.domain.RuntimePipelineDepthPolicy
 import com.lumasr.domain.RuntimePipelineResources
 import com.lumasr.domain.RuntimePipelineResourceProvider
+import com.lumasr.domain.RuntimePipelineSlotEstimate
+import com.lumasr.domain.RuntimePipelineSlotEstimator
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.ThermalLevel
@@ -139,7 +142,8 @@ class SuperResProcessingTaskRunnerTest {
             processor = processor,
             thermalLevelProvider = { thermalLevels.removeFirst() },
             runtimeResourceProvider = RuntimePipelineResourceProvider { resources.removeFirst() },
-            executionProfileResolver = passthroughResolver()
+            executionProfileResolver = passthroughResolver(),
+            runtimePipelineDepthPolicy = alwaysEligibleDepthPolicy()
         )
 
         val result = runner.run(task("depth-dynamic"), spec("depth-dynamic")) {}
@@ -158,7 +162,8 @@ class SuperResProcessingTaskRunnerTest {
             runtimeResourceProvider = RuntimePipelineResourceProvider {
                 if (++samples == 1) abundantResources() else error("resource probe unavailable")
             },
-            executionProfileResolver = passthroughResolver()
+            executionProfileResolver = passthroughResolver(),
+            runtimePipelineDepthPolicy = alwaysEligibleDepthPolicy()
         )
 
         val result = runner.run(task("resource-last-valid"), spec("resource-last-valid")) {}
@@ -183,7 +188,8 @@ class SuperResProcessingTaskRunnerTest {
                     else -> error("resource probe unavailable")
                 }
             },
-            executionProfileResolver = passthroughResolver()
+            executionProfileResolver = passthroughResolver(),
+            runtimePipelineDepthPolicy = alwaysEligibleDepthPolicy()
         )
 
         val result = runner.run(task("resource-complete-last-valid"), spec("resource-complete-last-valid")) {}
@@ -407,6 +413,22 @@ class SuperResProcessingTaskRunnerTest {
         availableRamBytes = 1L,
         gpuHeapBudgetBytes = 1L,
         isLowRamDevice = false
+    )
+
+    private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy(
+        RuntimePipelineSlotEstimator {
+            RuntimePipelineSlotEstimate(
+                inputRgbBytes = 0L,
+                preprocessFloatBytes = 0L,
+                vkInputBytes = 0L,
+                vkOutputBytes = 0L,
+                downloadFloatBytes = 0L,
+                outputRgbBytes = 0L,
+                scratchBytes = 0L,
+                perSlotBytes = 1L,
+                twoSlotBytes = 2L
+            )
+        }
     )
 
     private fun params(id: String): UpscaleParams {

@@ -36,6 +36,49 @@ class RuntimePipelineDepthPolicyTest {
     }
 
     @Test
+    fun estimatorTreatsOneSlotAsOneClampedCommandBatch() {
+        val batchOne = CheckedRuntimePipelineSlotEstimator.estimate(
+            params().copy(commandBatchSize = 1)
+        )!!
+        val batchEight = CheckedRuntimePipelineSlotEstimator.estimate(
+            params().copy(commandBatchSize = 8)
+        )!!
+
+        assertEquals(batchOne.inputRgbBytes * 8L, batchEight.inputRgbBytes)
+        assertEquals(batchOne.preprocessFloatBytes * 8L, batchEight.preprocessFloatBytes)
+        assertEquals(batchOne.vkInputBytes * 8L, batchEight.vkInputBytes)
+        assertEquals(batchOne.vkOutputBytes * 8L, batchEight.vkOutputBytes)
+        assertEquals(batchOne.downloadFloatBytes * 8L, batchEight.downloadFloatBytes)
+        assertEquals(batchOne.outputRgbBytes * 8L, batchEight.outputRgbBytes)
+        assertEquals(batchOne.scratchBytes * 8L, batchEight.scratchBytes)
+        assertEquals(batchOne.perSlotBytes * 8L, batchEight.perSlotBytes)
+        assertEquals(batchOne.twoSlotBytes * 8L, batchEight.twoSlotBytes)
+        assertEquals(
+            batchOne,
+            CheckedRuntimePipelineSlotEstimator.estimate(params().copy(commandBatchSize = 0))
+        )
+        assertEquals(
+            batchEight,
+            CheckedRuntimePipelineSlotEstimator.estimate(params().copy(commandBatchSize = 99))
+        )
+    }
+
+    @Test
+    fun commandBatchMemoryCannotUseDepthTwoWhenTwoBatchSlotsExceedHardLimit() {
+        val batchOne = params().copy(commandBatchSize = 1)
+        val batchEight = params().copy(commandBatchSize = 8)
+        val resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
+        val policy = RuntimePipelineDepthPolicy()
+
+        assertEquals(2, policy.decide(batchOne, ThermalLevel.NORMAL, resources).maxPipelineDepth)
+        val rejected = policy.decide(batchEight, ThermalLevel.NORMAL, resources)
+
+        assertEquals(1, rejected.maxPipelineDepth)
+        assertEquals(RuntimePipelineDepthReason.HARD_LIMIT_EXCEEDED, rejected.reason)
+        assertTrue(rejected.twoSlotBytes!! > RuntimePipelineDepthPolicy.MAX_TWO_SLOT_BYTES)
+    }
+
+    @Test
     fun estimatorFailsClosedOnInvalidOrOverflowingDimensions() {
         assertNull(CheckedRuntimePipelineSlotEstimator.estimate(params().copy(tileSize = Int.MAX_VALUE)))
         assertNull(CheckedRuntimePipelineSlotEstimator.estimate(params().copy(scale = Int.MAX_VALUE)))
