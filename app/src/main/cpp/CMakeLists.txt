@@ -5,19 +5,39 @@ project(localsr)
 if(NOT ANDROID)
     include(CTest)
     find_package(Threads REQUIRED)
+    if(NOT DEFINED SUPERRES_STB_INCLUDE_DIR)
+        set(SUPERRES_STB_INCLUDE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.deps/sources/waifu2x-ncnn-vulkan/src"
+        )
+    endif()
+    if(NOT EXISTS "${SUPERRES_STB_INCLUDE_DIR}/stb_image.h")
+        message(FATAL_ERROR
+            "stb_image.h not found for host checks. Set SUPERRES_STB_INCLUDE_DIR."
+        )
+    endif()
     add_executable(superres_rgb_image_checks_host
         superres_atomic_publish.cpp
         superres_output_finalizer.cpp
         superres_process_internal.cpp
         superres_rgb_image.cpp
+        superres_rgb_output_target.cpp
+        superres_rgb_output_target_writer.cpp
+        superres_png_writer.cpp
         superres_stbi_decode.cpp
         superres_task_registry.cpp
         superres_rgb_image_checks.cpp
+        superres_rgb_output_target_checks.cpp
         superres_host_checks.cpp
+        tests/stb_image_host.cpp
         tests/superres_rgb_image_checks_main.cpp
+        tests/zlib_stub.cpp
     )
     target_compile_features(superres_rgb_image_checks_host PRIVATE cxx_std_17)
-    target_include_directories(superres_rgb_image_checks_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(superres_rgb_image_checks_host PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${SUPERRES_STB_INCLUDE_DIR}
+    )
     target_link_libraries(superres_rgb_image_checks_host PRIVATE Threads::Threads)
     if(MSVC)
         target_compile_options(superres_rgb_image_checks_host PRIVATE /W4 /WX)
@@ -38,6 +58,9 @@ add_library(localsr SHARED
     superres_process_internal.cpp
     superres_rgb_image.cpp
     superres_rgb_image_checks.cpp
+    superres_rgb_output_target.cpp
+    superres_rgb_output_target_writer.cpp
+    superres_rgb_output_target_checks.cpp
     superres_stbi_decode.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp

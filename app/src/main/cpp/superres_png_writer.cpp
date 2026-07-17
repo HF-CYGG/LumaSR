@@ -8,12 +8,26 @@
 #include <limits>
 #include <vector>
 
-#include <unistd.h>
 #include <zlib.h>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
 constexpr size_t kCompressedChunkBytes = 256u * 1024u;
+
+FILE* open_png_file(const std::string& path) {
+#if defined(_WIN32)
+    FILE* file = nullptr;
+    return ::fopen_s(&file, path.c_str(), "wb") == 0 ? file : nullptr;
+#else
+    return std::fopen(path.c_str(), "wb");
+#endif
+}
 
 bool write_all(FILE* file, const void* data, size_t size) {
     return size == 0 || (file != nullptr && std::fwrite(data, 1, size, file) == size);
@@ -148,7 +162,7 @@ StreamingPngStatus StreamingPngWriter::open(
     impl_->rowBytes = rowBytes;
     impl_->writtenRows = 0;
     std::remove(impl_->temporaryPath.c_str());
-    impl_->file = std::fopen(impl_->temporaryPath.c_str(), "wb");
+    impl_->file = open_png_file(impl_->temporaryPath);
     if (impl_->file == nullptr) {
         abort();
         return StreamingPngStatus::IoError;
@@ -221,7 +235,12 @@ StreamingPngStatus StreamingPngWriter::finish_temporary() {
     if (status == StreamingPngStatus::Ok && std::fflush(impl_->file) != 0) {
         status = StreamingPngStatus::IoError;
     }
+#if defined(_WIN32)
+    if (status == StreamingPngStatus::Ok &&
+        ::_commit(::_fileno(impl_->file)) != 0) {
+#else
     if (status == StreamingPngStatus::Ok && ::fsync(::fileno(impl_->file)) != 0) {
+#endif
         status = StreamingPngStatus::IoError;
     }
     if (std::fclose(impl_->file) != 0 && status == StreamingPngStatus::Ok) {
