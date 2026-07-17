@@ -62,7 +62,8 @@ class SuperResProcessingTaskRunner(
         val currentParams = executionProfileResolver.resolve(
             modelId = workSpec.modelId,
             params = workSpec.toUpscaleParams(),
-            nowEpochMs = clock.nowEpochMs()
+            nowEpochMs = clock.nowEpochMs(),
+            outputPixels = workSpec.outputPixels
         )
         val thermalState = AtomicReference(
             AdaptiveInferencePolicy.adjustForThermalAtTileBoundary(

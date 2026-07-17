@@ -120,6 +120,60 @@ class InferenceExecutionProfileResolverTest {
     }
 
     @Test
+    fun resolvesSmallStandardAndLargeVulkanProfilesFromOutputPixels() = runBlocking {
+        val base = params()
+        val resolver = resolver(
+            repository = FakeBenchmarkRepository(
+                benchmark(identity(base), profiles = resolutionProfiles())
+            )
+        )
+
+        val small = resolver.resolve("model-a", base, 1_500L, outputPixels = 7_999_999L)
+        val standardAtLowerBound = resolver.resolve(
+            "model-a",
+            base,
+            1_500L,
+            outputPixels = 8_000_000L
+        )
+        val standardAtUpperBound = resolver.resolve(
+            "model-a",
+            base,
+            1_500L,
+            outputPixels = 24_000_000L
+        )
+        val large = resolver.resolve("model-a", base, 1_500L, outputPixels = 24_000_001L)
+        val missingPixels = resolver.resolve("model-a", base, 1_500L, outputPixels = null)
+
+        assertEquals(768 to 8, small.tileSize to small.commandBatchSize)
+        assertEquals(256 to 4, standardAtLowerBound.tileSize to standardAtLowerBound.commandBatchSize)
+        assertEquals(256 to 4, standardAtUpperBound.tileSize to standardAtUpperBound.commandBatchSize)
+        assertEquals(128 to 2, large.tileSize to large.commandBatchSize)
+        assertEquals(256 to 4, missingPixels.tileSize to missingPixels.commandBatchSize)
+    }
+
+    @Test
+    fun missingTierOrInvalidOutputPixelsFallsBackToLegacyRecommendedFields() = runBlocking {
+        val base = params()
+        val benchmark = benchmark(
+            identity = identity(base),
+            batchSize = 8,
+            profiles = listOf(CalibratedVulkanProfile(ResolutionTier.SMALL, 768, 2))
+        )
+        val resolver = resolver(FakeBenchmarkRepository(benchmark))
+
+        val missingTier = resolver.resolve(
+            "model-a",
+            base,
+            1_500L,
+            outputPixels = 24_000_001L
+        )
+        val invalidPixels = resolver.resolve("model-a", base, 1_500L, outputPixels = -1L)
+
+        assertEquals(512 to 8, missingTier.tileSize to missingTier.commandBatchSize)
+        assertEquals(512 to 8, invalidPixels.tileSize to invalidPixels.commandBatchSize)
+    }
+
+    @Test
     fun missingStaleLowRamUnsupportedAndExplicitCpuStayOnLegacyFp32() = runBlocking {
         val base = params()
         val currentIdentity = identity(base)
@@ -230,13 +284,21 @@ class InferenceExecutionProfileResolverTest {
     private fun benchmark(
         identity: BenchmarkIdentity,
         batchSize: Int = 4,
-        validUntil: Long = 2_000L
+        validUntil: Long = 2_000L,
+        profiles: List<CalibratedVulkanProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
         recommendedCommandBatchSize = batchSize,
         measuredAtEpochMs = 1_000L,
-        validUntilEpochMs = validUntil
+        validUntilEpochMs = validUntil,
+        vulkanProfiles = profiles
+    )
+
+    private fun resolutionProfiles() = listOf(
+        CalibratedVulkanProfile(ResolutionTier.SMALL, tileSize = 768, commandBatchSize = 8),
+        CalibratedVulkanProfile(ResolutionTier.STANDARD, tileSize = 256, commandBatchSize = 4),
+        CalibratedVulkanProfile(ResolutionTier.LARGE, tileSize = 128, commandBatchSize = 2)
     )
 
     private fun device() = DeviceCapabilityProfile(

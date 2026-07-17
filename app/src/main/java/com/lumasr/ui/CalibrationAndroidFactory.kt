@@ -3,9 +3,11 @@ package com.lumasr.ui
 import android.content.Context
 import android.os.Build
 import com.lumasr.BuildConfig
+import com.lumasr.data.AndroidThermalSignalSource
 import com.lumasr.data.DeviceCapabilityRepository
 import com.lumasr.data.FileInferenceBenchmarkRepository
 import com.lumasr.data.ModelManifestRepository
+import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.InferenceExecutionProfileResolver
 import com.lumasr.domain.InferenceCalibrationRunner
 import com.lumasr.domain.LazyProcessingExecutionProfileResolver
@@ -49,6 +51,7 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     val repository = FileInferenceBenchmarkRepository(directory)
     val device = DeviceCapabilityRepository(appContext).loadProfile()
     val nativeProcessor = NativeSuperResProcessor()
+    val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
     val probe = NativeBitmapCalibrationProbe(
         processor = nativeProcessor,
         cancelNative = nativeProcessor::cancel,
@@ -56,7 +59,11 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     )
     val runner = InferenceCalibrationRunner(
         probe = probe,
-        repository = repository
+        repository = repository,
+        thermalLevelProvider = thermalSampler::sampleLevel,
+        availableHeapBytesProvider = {
+            InferenceCalibrationRunner.currentAvailableHeapBytes()
+        }
     )
     return OnDeviceCalibrationCoordinator(
         repository = repository,

@@ -93,7 +93,18 @@ object InferenceExecutionProfileMapper {
 }
 
 fun interface ProcessingExecutionProfileResolver {
-    suspend fun resolve(modelId: String, params: UpscaleParams, nowEpochMs: Long): UpscaleParams
+    suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long
+    ): UpscaleParams
+
+    suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
+    ): UpscaleParams = resolve(modelId, params, nowEpochMs)
 }
 
 class LazyProcessingExecutionProfileResolver(
@@ -110,6 +121,21 @@ class LazyProcessingExecutionProfileResolver(
     ): UpscaleParams = withContext(ioDispatcher) {
         try {
             resolver().resolve(modelId, params, nowEpochMs)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            failClosed(params)
+        }
+    }
+
+    override suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
+    ): UpscaleParams = withContext(ioDispatcher) {
+        try {
+            resolver().resolve(modelId, params, nowEpochMs, outputPixels)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -146,6 +172,13 @@ class InferenceExecutionProfileResolver(
         modelId: String,
         params: UpscaleParams,
         nowEpochMs: Long
+    ): UpscaleParams = resolve(modelId, params, nowEpochMs, outputPixels = null)
+
+    override suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
     ): UpscaleParams {
         require(nowEpochMs >= 0L) { "Profile resolution time must be non-negative" }
         if (params.pipelinePasses.isNotEmpty()) {
@@ -170,15 +203,21 @@ class InferenceExecutionProfileResolver(
             )
         }.getOrNull() ?: return selectAndApply(params, benchmark = null)
         val benchmark = repository.findValid(identity, nowEpochMs)
-        return selectAndApply(params, benchmark, identity, nowEpochMs)
+        return selectAndApply(params, benchmark, identity, nowEpochMs, outputPixels)
     }
 
     private fun selectAndApply(
         params: UpscaleParams,
         benchmark: InferenceBenchmarkResult?,
         identity: BenchmarkIdentity? = null,
-        nowEpochMs: Long = 0L
+        nowEpochMs: Long = 0L,
+        outputPixels: Long? = null
     ): UpscaleParams {
+        val calibratedVulkanProfile = runCatching {
+            ResolutionTier.fromOutputPixels(outputPixels)
+        }.getOrNull()?.let { tier ->
+            benchmark?.vulkanProfiles?.singleOrNull { it.resolutionTier == tier }
+        }
         val profile = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device,
             accelerationMode = params.accelerationMode,
@@ -186,7 +225,8 @@ class InferenceExecutionProfileResolver(
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = params.tileSize,
-            nowEpochMs = nowEpochMs
+            nowEpochMs = nowEpochMs,
+            calibratedVulkanProfile = calibratedVulkanProfile
         )
         return InferenceExecutionProfileMapper.apply(params, profile)
     }

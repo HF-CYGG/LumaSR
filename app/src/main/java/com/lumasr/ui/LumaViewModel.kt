@@ -402,7 +402,8 @@ class LumaViewModel(
                     val params = executionProfileResolver.resolve(
                         modelId = model.id,
                         params = unresolvedParams,
-                        nowEpochMs = System.currentTimeMillis()
+                        nowEpochMs = System.currentTimeMillis(),
+                        outputPixels = profile.outputPixelsFor(budgetDecision.scale)
                     )
                     val createdAt = baseCreatedAt + index
                     val task = ProcessingTask(

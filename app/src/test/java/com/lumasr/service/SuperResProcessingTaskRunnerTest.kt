@@ -198,21 +198,37 @@ class SuperResProcessingTaskRunnerTest {
     fun resolvesPersistedProfileAgainAtExecutionBoundary() = runBlocking {
         val processor = RecordingProcessor()
         val resolutionTimes = mutableListOf<Long>()
+        val resolutionOutputPixels = mutableListOf<Long?>()
         val runner = SuperResProcessingTaskRunner(
             processor = processor,
-            executionProfileResolver = ProcessingExecutionProfileResolver { _, params, nowEpochMs ->
-                resolutionTimes += nowEpochMs
-                params.copy(
-                    nativeBackend = NativeBackend.LEGACY_SAFE,
-                    inferencePrecision = InferencePrecision.FP32,
-                    commandBatchSize = 1,
-                    modelCacheCapacity = 1
-                )
+            executionProfileResolver = object : ProcessingExecutionProfileResolver {
+                override suspend fun resolve(
+                    modelId: String,
+                    params: UpscaleParams,
+                    nowEpochMs: Long
+                ): UpscaleParams = params
+
+                override suspend fun resolve(
+                    modelId: String,
+                    params: UpscaleParams,
+                    nowEpochMs: Long,
+                    outputPixels: Long?
+                ): UpscaleParams {
+                    resolutionTimes += nowEpochMs
+                    resolutionOutputPixels += outputPixels
+                    return params.copy(
+                        nativeBackend = NativeBackend.LEGACY_SAFE,
+                        inferencePrecision = InferencePrecision.FP32,
+                        commandBatchSize = 1,
+                        modelCacheCapacity = 1
+                    )
+                }
             },
             clock = ProcessingClock { 9_000L }
         )
 
         val persisted = spec("stale").copy(
+            outputPixels = 12_000_000L,
             params = params("stale").copy(
                 nativeBackend = NativeBackend.OPTIMIZED,
                 inferencePrecision = InferencePrecision.FP16,
@@ -224,6 +240,7 @@ class SuperResProcessingTaskRunnerTest {
         assertEquals(ProcessingRunResult.Completed, runner.run(task("stale"), persisted) {})
 
         assertEquals(listOf(9_000L), resolutionTimes)
+        assertEquals(listOf(12_000_000L), resolutionOutputPixels)
         val executed = processor.requests.single()
         assertEquals(NativeBackend.LEGACY_SAFE, executed.nativeBackend)
         assertEquals(InferencePrecision.FP32, executed.inferencePrecision)

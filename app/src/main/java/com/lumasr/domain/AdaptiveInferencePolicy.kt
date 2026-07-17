@@ -191,7 +191,8 @@ object AdaptiveInferencePolicy {
         benchmarkResult: InferenceBenchmarkResult?,
         currentBenchmarkIdentity: BenchmarkIdentity?,
         currentSafeTileSize: Int,
-        nowEpochMs: Long
+        nowEpochMs: Long,
+        calibratedVulkanProfile: CalibratedVulkanProfile? = null
     ): InferenceExecutionProfile {
         val safeTileSize = UpscaleParamsFactory.sanitizeTileSize(currentSafeTileSize)
         val isCapabilityUnknown = device.physicalCoreCount <= 0 || device.memoryBucketMb <= 0
@@ -224,10 +225,11 @@ object AdaptiveInferencePolicy {
                     accelerationMode = accelerationMode,
                     precision = InferencePrecision.FP16,
                     cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
-                    tileSize = safeTileSize,
-                    commandBatchSize = benchmarkResult
-                        ?.recommendedCommandBatchSize
-                        ?.coerceIn(1, MAX_COMMAND_BATCH_SIZE)
+                    tileSize = calibratedVulkanProfile?.tileSize ?: safeTileSize,
+                    commandBatchSize = calibratedVulkanProfile?.commandBatchSize
+                        ?: benchmarkResult
+                            ?.recommendedCommandBatchSize
+                            ?.coerceIn(1, MAX_COMMAND_BATCH_SIZE)
                         ?: 1,
                     gpuHeadroomPercent = 8,
                     modelCacheCapacity = 2,
