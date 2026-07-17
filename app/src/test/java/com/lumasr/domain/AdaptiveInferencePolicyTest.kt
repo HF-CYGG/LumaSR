@@ -553,7 +553,7 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
-    fun ttaKeepsSelectionButForcesSafeTileAndSingleCommandBatch() {
+    fun ordinaryBenchmarkForcesTtaOntoSafeTileAndSingleCommandBatch() {
         val identity = benchmarkIdentity()
         val selected = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -565,8 +565,8 @@ class AdaptiveInferencePolicyTest {
             nowEpochMs = NOW_EPOCH_MS
         )
 
-        assertEquals(NativeBackend.OPTIMIZED, selected.backend)
-        assertEquals(InferencePrecision.FP16, selected.precision)
+        assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+        assertEquals(InferencePrecision.FP32, selected.precision)
         assertTrue(selected.tta)
         assertEquals(256, selected.tileSize)
         assertEquals(1, selected.commandBatchSize)
@@ -665,6 +665,32 @@ class AdaptiveInferencePolicyTest {
             assertEquals(NativeBackend.OPTIMIZED, selected.backend)
             assertEquals(expected, selected.commandBatchSize)
         }
+    }
+
+    @Test
+    fun tenPercentSpeedGateRoundsUpRequiredImprovementForNonDivisibleDurations() {
+        assertTrue(AdaptiveInferencePolicy.isAtLeastTenPercentFaster(101L, 90L))
+        assertFalse(AdaptiveInferencePolicy.isAtLeastTenPercentFaster(101L, 91L))
+    }
+
+    @Test
+    fun tenPercentSpeedGateDoesNotOverflowNearLongMaximum() {
+        val safeDurationNanos = Long.MAX_VALUE
+        val requiredImprovement = safeDurationNanos / 10L + 1L
+        val optimizedBoundaryNanos = safeDurationNanos - requiredImprovement
+
+        assertTrue(
+            AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos,
+                optimizedBoundaryNanos
+            )
+        )
+        assertFalse(
+            AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos,
+                optimizedBoundaryNanos + 1L
+            )
+        )
     }
 
     private fun executionProfile(

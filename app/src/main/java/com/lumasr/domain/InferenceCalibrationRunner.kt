@@ -32,7 +32,8 @@ data class InferenceCalibrationRequest(
     val identity: BenchmarkIdentity,
     val device: DeviceCapabilityProfile,
     val baseParams: UpscaleParams,
-    val measuredAtEpochMs: Long
+    val measuredAtEpochMs: Long,
+    val supportsTta: Boolean = false
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Calibration time must be non-negative" }
@@ -196,6 +197,17 @@ class InferenceCalibrationRunner(
             }
         }
 
+        val ttaProfiles = if (request.supportsTta) {
+            when (val result = calibrateTta(request, taskId)) {
+                is TtaCandidateProbeResult.Ready -> listOfNotNull(result.profile)
+                is TtaCandidateProbeResult.Failed -> {
+                    return CalibrationPreparation.Failed(result.reason)
+                }
+            }
+        } else {
+            emptyList()
+        }
+
         ensureCalibrationThermallySafe()
         val standard = selectedByTier.getValue(ResolutionTier.STANDARD)
         val benchmark = InferenceBenchmarkResult(
@@ -219,9 +231,73 @@ class InferenceCalibrationRunner(
                     openmpBlocktimeMs = selected.openmpBlocktimeMs,
                     postprocessThreads = selected.postprocessThreads
                 )
-            }
+            },
+            ttaProfiles = ttaProfiles
         )
         return CalibrationPreparation.Ready(benchmark)
+    }
+
+    private suspend fun calibrateTta(
+        request: InferenceCalibrationRequest,
+        taskId: String
+    ): TtaCandidateProbeResult {
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!hasSufficientHeapFor(ResolutionTier.STANDARD)) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val inputEdge = calibrationInputEdge(ResolutionTier.STANDARD, request.baseParams.scale)
+        val pattern = calibrationPatternFactory(inputEdge, inputEdge, TTA_PATTERN_SEED)
+        val safeParams = request.baseParams.copy(
+            taskId = taskId,
+            tileSize = AdaptiveInferencePolicy.ttaExecutionTileSize(request.baseParams.tileSize),
+            accelerationMode = AccelerationMode.VULKAN,
+            nativeBackend = NativeBackend.LEGACY_SAFE,
+            inferencePrecision = InferencePrecision.FP32,
+            commandBatchSize = 1,
+            modelCacheCapacity = 1,
+            tta = true,
+            pipelinePasses = emptyList()
+        )
+        val safeOutput = probe.run(pattern, safeParams)
+            ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!safeOutput.hasExpectedShape(pattern, safeParams.scale) ||
+            safeOutput.durationNanos <= 0L
+        ) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        if (!hasSufficientHeapFor(ResolutionTier.STANDARD)) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val optimizedParams = safeParams.copy(
+            nativeBackend = NativeBackend.OPTIMIZED,
+            inferencePrecision = InferencePrecision.FP16,
+            commandBatchSize = CalibratedTtaProfile.OPTIMIZED_TTA_PASS_BATCH_SIZE,
+            modelCacheCapacity = 2
+        )
+        val optimizedOutput = probe.run(pattern, optimizedParams)
+            ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!optimizedOutput.hasSameShape(safeOutput) || optimizedOutput.durationNanos <= 0L) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val quality = RgbQualityEvaluator.evaluate(safeOutput.image, optimizedOutput.image)
+            ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        val profile = CalibratedTtaProfile(
+            scale = safeParams.scale,
+            noise = safeParams.noise,
+            tileSize = safeParams.tileSize,
+            passBatchSize = optimizedParams.commandBatchSize,
+            quality = quality,
+            safeDurationNanos = safeOutput.durationNanos,
+            optimizedDurationNanos = optimizedOutput.durationNanos
+        )
+        return TtaCandidateProbeResult.Ready(
+            profile.takeIf { AdaptiveInferencePolicy.isTtaProfileEligible(request.device, it) }
+        )
     }
 
     private suspend fun calibrateCpuTier(
@@ -639,6 +715,7 @@ class InferenceCalibrationRunner(
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
         private const val PATTERN_SEED = 0x4c756d615352L
         private const val CPU_PATTERN_SEED = 0x4350554c756d61L
+        private const val TTA_PATTERN_SEED = 0x5454414c756d61L
         private const val MAX_UPGRADE_DURATION_RATIO = 0.95
         private const val DEFAULT_CPU_THREADS = 4
         private const val MEBIBYTE = 1_024L * 1_024L
@@ -703,6 +780,12 @@ class InferenceCalibrationRunner(
         data class Ready(val candidate: MeasuredCpuCandidate) : CpuCandidateProbeResult
 
         data class Failed(val reason: CalibrationFailureReason) : CpuCandidateProbeResult
+    }
+
+    private sealed interface TtaCandidateProbeResult {
+        data class Ready(val profile: CalibratedTtaProfile?) : TtaCandidateProbeResult
+
+        data class Failed(val reason: CalibrationFailureReason) : TtaCandidateProbeResult
     }
 
     private data class MeasuredVulkanCandidate(

@@ -3,6 +3,7 @@ package com.lumasr.data
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
@@ -191,6 +192,22 @@ class FileInferenceBenchmarkRepository(
         require(result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES) {
             "Benchmark command batch size is unsupported"
         }
+        result.ttaProfiles.forEach { profile ->
+            validateQuality(profile.quality, "TTA")
+        }
+    }
+
+    private fun validateQuality(quality: Fp16QualityMetrics, label: String) {
+        require(quality.ssim.isFinite() && quality.ssim in -1.0..1.0) {
+            "$label SSIM must be finite and in [-1, 1]"
+        }
+        require(
+            (quality.psnrDb.isFinite() && quality.psnrDb >= 0.0) ||
+                quality.psnrDb == Double.POSITIVE_INFINITY
+        ) { "$label PSNR must be non-negative or positive infinity" }
+        require(quality.p99ChannelError in 0..255) {
+            "$label p99 channel error must be in [0, 255]"
+        }
     }
 
     private fun ensureDirectory() {
@@ -289,7 +306,8 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 3
+    private const val SCHEMA_VERSION = 4
+    private const val LEGACY_SCHEMA_VERSION = 3
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -298,12 +316,13 @@ private object BenchmarkResultJson {
         put("results", buildJsonArray { results.forEach { add(encodeResult(it)) } })
     }.toString()
 
-    fun decodeRecords(value: String): List<JsonElement> {
+    fun decodeRecords(value: String): List<Pair<Int, JsonElement>> {
         val root = json.parseToJsonElement(value).jsonObject
-        check(root.requiredInt("schemaVersion") == SCHEMA_VERSION) {
+        val schemaVersion = root.requiredInt("schemaVersion")
+        check(schemaVersion == SCHEMA_VERSION || schemaVersion == LEGACY_SCHEMA_VERSION) {
             "Unsupported benchmark schema"
         }
-        return root.requiredArray("results")
+        return root.requiredArray("results").map { record -> schemaVersion to record }
     }
 
     private fun encodeResult(result: InferenceBenchmarkResult): JsonObject = buildJsonObject {
@@ -335,6 +354,9 @@ private object BenchmarkResultJson {
         put("cpuProfiles", buildJsonArray {
             result.cpuProfiles.forEach { add(encodeCpuProfile(it)) }
         })
+        put("ttaProfiles", buildJsonArray {
+            result.ttaProfiles.forEach { add(encodeTtaProfile(it)) }
+        })
         put("measuredAtEpochMs", result.measuredAtEpochMs)
         put("validUntilEpochMs", result.validUntilEpochMs)
     }
@@ -353,7 +375,30 @@ private object BenchmarkResultJson {
         put("postprocessThreads", profile.postprocessThreads)
     }
 
-    fun decodeResult(element: JsonElement): InferenceBenchmarkResult {
+    private fun encodeTtaProfile(profile: CalibratedTtaProfile): JsonObject = buildJsonObject {
+        put("scale", profile.scale)
+        put("noise", profile.noise)
+        put("tileSize", profile.tileSize)
+        put("passBatchSize", profile.passBatchSize)
+        put("quality", buildJsonObject {
+            put("ssim", profile.quality.ssim)
+            put(
+                "psnrDb",
+                if (profile.quality.psnrDb == Double.POSITIVE_INFINITY) {
+                    JsonPrimitive(POSITIVE_INFINITY)
+                } else {
+                    JsonPrimitive(profile.quality.psnrDb)
+                }
+            )
+            put("p99ChannelError", profile.quality.p99ChannelError)
+        })
+        put("safeDurationNanos", profile.safeDurationNanos)
+        put("optimizedDurationNanos", profile.optimizedDurationNanos)
+    }
+
+    fun decodeResult(encodedRecord: Pair<Int, JsonElement>): InferenceBenchmarkResult {
+        val schemaVersion = encodedRecord.first
+        val element = encodedRecord.second
         val record = element.jsonObject
         val identity = record.getValue("identity").jsonObject
         val quality = record.getValue("quality").jsonObject
@@ -379,6 +424,11 @@ private object BenchmarkResultJson {
             cpuProfiles = record.requiredArray("cpuProfiles").map {
                 decodeCpuProfile(it.jsonObject)
             },
+            ttaProfiles = if (schemaVersion == LEGACY_SCHEMA_VERSION) {
+                emptyList()
+            } else {
+                record.requiredArray("ttaProfiles").map { decodeTtaProfile(it.jsonObject) }
+            },
             measuredAtEpochMs = record.requiredLong("measuredAtEpochMs"),
             validUntilEpochMs = record.requiredLong("validUntilEpochMs")
         )
@@ -399,6 +449,23 @@ private object BenchmarkResultJson {
             openmpBlocktimeMs = record.requiredInt("openmpBlocktimeMs"),
             postprocessThreads = record.requiredInt("postprocessThreads")
         )
+
+    private fun decodeTtaProfile(record: JsonObject): CalibratedTtaProfile {
+        val quality = record.getValue("quality").jsonObject
+        return CalibratedTtaProfile(
+            scale = record.requiredInt("scale"),
+            noise = record.requiredInt("noise"),
+            tileSize = record.requiredInt("tileSize"),
+            passBatchSize = record.requiredInt("passBatchSize"),
+            quality = Fp16QualityMetrics(
+                ssim = quality.requiredDouble("ssim"),
+                psnrDb = quality.requiredPsnr("psnrDb"),
+                p99ChannelError = quality.requiredInt("p99ChannelError")
+            ),
+            safeDurationNanos = record.requiredLong("safeDurationNanos"),
+            optimizedDurationNanos = record.requiredLong("optimizedDurationNanos")
+        )
+    }
 
     private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive
         .also { check(it.isString) { "$key must be a JSON string" } }

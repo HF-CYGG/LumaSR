@@ -3,6 +3,7 @@ package com.lumasr.data
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
@@ -87,7 +88,7 @@ class FileInferenceBenchmarkRepositoryTest {
     }
 
     @Test
-    fun roundTripsResolutionAwareVulkanAndCpuProfiles() = runBlocking {
+    fun roundTripsResolutionAwareVulkanCpuAndTtaProfiles() = runBlocking {
         val root = temporaryFolder.newFolder("resolution-profile-round-trip")
         val repository = FileInferenceBenchmarkRepository(root)
         val expected = result(
@@ -119,13 +120,85 @@ class FileInferenceBenchmarkRepositoryTest {
                     openmpBlocktimeMs = 60,
                     postprocessThreads = 2
                 )
+            ),
+            ttaProfiles = listOf(
+                CalibratedTtaProfile(
+                    scale = 2,
+                    noise = 0,
+                    tileSize = 128,
+                    passBatchSize = 2,
+                    quality = passingQuality(),
+                    safeDurationNanos = 1_000L,
+                    optimizedDurationNanos = 900L
+                )
             )
         )
 
         repository.save(expected)
 
         assertEquals(listOf(expected), repository.list())
-        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":3"))
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":4"))
+    }
+
+    @Test
+    fun schemaV3RecordsRemainValidWithEmptyTtaEvidence() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v3-compatible")
+        File(root, "inference-benchmarks.json").writeText(
+            encodedV3Aggregate(encodedV3Result(profileHash = "legacy-v3"))
+        )
+
+        val records = FileInferenceBenchmarkRepository(root).list()
+
+        assertEquals(1, records.size)
+        assertTrue(records.single().ttaProfiles.isEmpty())
+    }
+
+    @Test
+    fun schemaV3DropsNonObjectItemWithoutQuarantiningValidRecord() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v3-mixed-non-object")
+        val record = File(root, "inference-benchmarks.json")
+        record.writeText(
+            encodedV3Aggregate(
+                encodedV3Result(profileHash = "valid-profile"),
+                "7"
+            )
+        )
+
+        val records = FileInferenceBenchmarkRepository(root).list()
+
+        assertEquals(listOf(resolutionAwareResult("valid-profile")), records)
+        assertTrue(records.single().ttaProfiles.isEmpty())
+        assertTrue(record.exists())
+        assertTrue(record.readText().contains("\"schemaVersion\":4"))
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
+    fun rejectsCorruptTtaProfileInSchemaV4() = runBlocking {
+        val root = temporaryFolder.newFolder("corrupt-tta-v4")
+        val record = File(root, "inference-benchmarks.json")
+        val repository = FileInferenceBenchmarkRepository(root)
+        repository.save(
+            result(
+                identity = identity(),
+                ttaProfiles = listOf(
+                    CalibratedTtaProfile(
+                        scale = 2,
+                        noise = 0,
+                        tileSize = 128,
+                        passBatchSize = 2,
+                        quality = passingQuality(),
+                        safeDurationNanos = 1_000L,
+                        optimizedDurationNanos = 900L
+                    )
+                )
+            )
+        )
+        record.writeText(record.readText().replace("\"passBatchSize\":2", "\"passBatchSize\":4"))
+
+        assertEquals(emptyList<InferenceBenchmarkResult>(), repository.list())
+        assertFalse(record.exists())
+        assertTrue(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
     @Test
@@ -514,13 +587,15 @@ class FileInferenceBenchmarkRepositoryTest {
         measuredAt: Long = 1_000L,
         validUntil: Long = 2_000L,
         vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
-        cpuProfiles: List<CalibratedCpuProfile> = emptyList()
+        cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
+        ttaProfiles: List<CalibratedTtaProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = quality,
         recommendedCommandBatchSize = batchSize,
         vulkanProfiles = vulkanProfiles,
         cpuProfiles = cpuProfiles,
+        ttaProfiles = ttaProfiles,
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil
     )

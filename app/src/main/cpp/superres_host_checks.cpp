@@ -6,6 +6,7 @@
 #include "superres_pipeline_internal_checks.h"
 #include "superres_rgb_output_target_checks.h"
 #include "superres_rgb_transport_checks.h"
+#include "superres_tta_micro_batch_checks.h"
 
 #include "superres_jni_safety.h"
 #include "superres_output_finalizer.h"
@@ -616,6 +617,7 @@ bool run_superres_host_runtime_checks() {
            run_superres_pipeline_internal_runtime_checks() &&
            run_rgb_output_target_runtime_checks() &&
            run_superres_rgb_transport_runtime_checks() &&
+           run_superres_tta_micro_batch_runtime_checks() &&
            jni_boundaries_and_utf_release_check() &&
            jni_pending_exception_boundary_check() &&
            jni_out_of_memory_classification_failure_check() && utf_pending_exception_check() &&

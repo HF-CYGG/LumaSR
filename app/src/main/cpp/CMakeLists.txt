@@ -36,6 +36,7 @@ if(NOT ANDROID)
         superres_ncnn_stage_contract_checks.cpp
         superres_ordered_pipeline.cpp
         superres_ordered_pipeline_checks.cpp
+        superres_tta_micro_batch_checks.cpp
         superres_host_checks.cpp
         tests/stb_image_host.cpp
         tests/superres_rgb_image_checks_main.cpp
@@ -89,6 +90,7 @@ add_library(localsr SHARED
     superres_ncnn_stage_contract_checks.cpp
     superres_ordered_pipeline.cpp
     superres_ordered_pipeline_checks.cpp
+    superres_tta_micro_batch_checks.cpp
     superres_tile_geometry_checks.cpp
     superres_pixel_io_checks.cpp
     superres_png_writer.cpp

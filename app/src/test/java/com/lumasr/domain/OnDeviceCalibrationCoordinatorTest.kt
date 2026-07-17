@@ -37,6 +37,7 @@ class OnDeviceCalibrationCoordinatorTest {
         assertEquals(File("build/models/waifu").absolutePath, request.baseParams.modelDir)
         assertEquals(AccelerationMode.VULKAN, request.baseParams.accelerationMode)
         assertFalse(request.baseParams.tta)
+        assertTrue(request.supportsTta)
     }
 
     @Test

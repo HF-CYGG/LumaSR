@@ -152,7 +152,11 @@ class LazyProcessingExecutionProfileResolver(
     }
 
     private fun failClosed(params: UpscaleParams): UpscaleParams = params.copy(
-        tileSize = UpscaleParamsFactory.sanitizeTileSize(params.tileSize),
+        tileSize = if (params.tta) {
+            AdaptiveInferencePolicy.ttaExecutionTileSize(params.tileSize)
+        } else {
+            UpscaleParamsFactory.sanitizeTileSize(params.tileSize)
+        },
         gpuHeadroomPercent = UpscaleParamsFactory.sanitizeGpuHeadroomPercent(
             params.gpuHeadroomPercent
         ),
@@ -223,6 +227,13 @@ class InferenceExecutionProfileResolver(
         val calibratedVulkanProfile = resolutionTier?.let { tier ->
             benchmark?.vulkanProfiles?.singleOrNull { it.resolutionTier == tier }
         }
+        val calibratedTtaProfile = benchmark?.ttaProfiles?.singleOrNull { profile ->
+            profile.matches(
+                scale = params.scale,
+                noise = params.noise,
+                tileSize = AdaptiveInferencePolicy.ttaExecutionTileSize(params.tileSize)
+            )
+        }
         val calibratedCpuProfile = resolutionTier?.let { tier ->
             benchmark?.cpuProfiles?.singleOrNull { it.resolutionTier == tier }
         }?.takeIf {
@@ -239,10 +250,11 @@ class InferenceExecutionProfileResolver(
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = params.tileSize,
             nowEpochMs = nowEpochMs,
-            calibratedVulkanProfile = calibratedVulkanProfile
+            calibratedVulkanProfile = calibratedVulkanProfile,
+            calibratedTtaProfile = calibratedTtaProfile
         )
         val profile = selectedProfile.copy(
-            tileSize = if (params.accelerationMode == AccelerationMode.CPU) {
+            tileSize = if (!params.tta && params.accelerationMode == AccelerationMode.CPU) {
                 calibratedCpuProfile?.tileSize ?: selectedProfile.tileSize
             } else {
                 selectedProfile.tileSize

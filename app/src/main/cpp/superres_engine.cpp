@@ -18,6 +18,7 @@
 #include "superres_task_registry.h"
 #include "superres_task_registry_checks.h"
 #include "superres_tile_geometry.h"
+#include "superres_tta_micro_batch.h"
 
 #include <android/log.h>
 #include <algorithm>
@@ -145,6 +146,47 @@ struct OptimizedVulkanTileWork {
     ncnn::VkMat uploaded;
     ncnn::VkMat inferred;
     ncnn::Mat downloaded;
+};
+
+struct OptimizedVulkanTtaPassWork {
+    size_t pass;
+    ncnn::Mat transformedInput;
+    ncnn::VkMat uploaded;
+    ncnn::VkMat inferred;
+    ncnn::Mat downloaded;
+};
+
+class OptimizedVulkanTtaContext {
+public:
+    explicit OptimizedVulkanTtaContext(ncnn::Net& net)
+        : device_(net.vulkan_device()),
+          allocators_(device_),
+          executionOption_(allocators_.attach_to(net.opt)) {}
+
+    bool valid() const {
+        return device_ != nullptr && allocators_.valid();
+    }
+
+    const ncnn::VulkanDevice* device() const {
+        return device_;
+    }
+
+    InvocationVulkanAllocators& allocators() {
+        return allocators_;
+    }
+
+    const ncnn::Option& execution_option() const {
+        return executionOption_;
+    }
+
+    std::chrono::steady_clock::duration uploadDuration{};
+    std::chrono::steady_clock::duration inferenceDuration{};
+    std::chrono::steady_clock::duration downloadDuration{};
+
+private:
+    const ncnn::VulkanDevice* device_;
+    InvocationVulkanAllocators allocators_;
+    ncnn::Option executionOption_;
 };
 
 struct OptimizedVulkanPipelineSlot {
@@ -1680,6 +1722,242 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     return static_cast<SuperResNativeCode>(result);
 }
 
+SuperResNativeCode run_optimized_vulkan_tta_tile(
+    const SuperResNativeParams& params,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    const ModelFiles& files,
+    ncnn::Net& net,
+    const SuperResExecutionProfile& executionProfile,
+    OptimizedVulkanTtaContext& context,
+    const ncnn::Mat& input,
+    int tileX,
+    int tileY,
+    int tileW,
+    int tileH,
+    const TileInputRegion& region,
+    ncnn::Mat& copySource,
+    SuperResNativePerformance& performance
+) {
+    if (!context.valid() || input.empty()) {
+        return SuperResNativeCode::VulkanFailed;
+    }
+
+    performance.effectivePipelineDepth = 1;
+    performance.peakOccupiedPipelineSlots = 1;
+    performance.peakPipelineSlotBytes = 0;
+    performance.producerWaitMs = 0;
+    performance.consumerWaitMs = 0;
+    performance.pipelineOverlapMs = 0;
+
+    bool stopLatched = false;
+    SuperResNativeCode failureCode = SuperResNativeCode::VulkanFailed;
+    auto checkBoundary = [&]() {
+        if (stopLatched) {
+            return SuperResTtaMicroBatchStatus::Cancelled;
+        }
+        const SuperResRuntimeInferenceControl control = read_runtime_control(
+            runtimeControl,
+            executionProfile.commandBatchSize
+        );
+        performance.requestedMaxPipelineDepth = control.maxPipelineDepth;
+        stopLatched = control.shouldPause || is_cancelled(params.taskId);
+        if (stopLatched) {
+            return SuperResTtaMicroBatchStatus::Cancelled;
+        }
+        return control.commandBatchSize < 2
+            ? SuperResTtaMicroBatchStatus::Failed
+            : SuperResTtaMicroBatchStatus::Ok;
+    };
+    auto failedOrCancelled = [&]() {
+        return checkBoundary() == SuperResTtaMicroBatchStatus::Cancelled
+            ? SuperResTtaMicroBatchStatus::Cancelled
+            : SuperResTtaMicroBatchStatus::Failed;
+    };
+
+    D4FloatFusion fusion;
+    std::vector<OptimizedVulkanTtaPassWork> currentWorks;
+    std::vector<std::unique_ptr<ncnn::Extractor>> currentExtractors;
+    size_t currentFirstPass = 0u;
+
+    try {
+        const SuperResTtaMicroBatchRunResult runResult = run_superres_tta_micro_batches(
+            checkBoundary,
+            [&](const SuperResTtaPassGroup& group) {
+                currentFirstPass = group.firstPass;
+                currentWorks.clear();
+                currentExtractors.clear();
+                currentWorks.reserve(group.passCount);
+                currentExtractors.reserve(group.passCount);
+                ncnn::VkCompute command(context.device());
+
+                for (size_t offset = 0u; offset < group.passCount; ++offset) {
+                    const size_t pass = group.firstPass + offset;
+                    ncnn::Mat transformedInput;
+                    if (pass >= kD4Transforms.size() ||
+                        !d4_transform_ncnn_mat(
+                            input,
+                            kD4Transforms[pass],
+                            transformedInput
+                        )) {
+                        failureCode = SuperResNativeCode::TileOutputMismatch;
+                        return failedOrCancelled();
+                    }
+
+                    currentWorks.push_back(OptimizedVulkanTtaPassWork{
+                        pass,
+                        transformedInput,
+                        ncnn::VkMat{},
+                        ncnn::VkMat{},
+                        ncnn::Mat{}
+                    });
+                    OptimizedVulkanTtaPassWork& work = currentWorks.back();
+
+                    const auto uploadStart = std::chrono::steady_clock::now();
+                    command.record_upload(
+                        work.transformedInput,
+                        work.uploaded,
+                        context.execution_option()
+                    );
+                    context.uploadDuration += std::chrono::steady_clock::now() - uploadStart;
+                    if (work.uploaded.empty()) {
+                        failureCode = SuperResNativeCode::VulkanFailed;
+                        return failedOrCancelled();
+                    }
+
+                    auto extractor = std::make_unique<ncnn::Extractor>(net.create_extractor());
+                    extractor->set_blob_vkallocator(context.allocators().blob());
+                    extractor->set_workspace_vkallocator(context.allocators().workspace());
+                    extractor->set_staging_vkallocator(context.allocators().staging());
+                    const auto inferenceStart = std::chrono::steady_clock::now();
+                    const bool inferenceFailed =
+                        extractor->input(files.inputBlob, work.uploaded) != 0 ||
+                        extractor->extract(files.outputBlob, work.inferred, command) != 0;
+                    context.inferenceDuration +=
+                        std::chrono::steady_clock::now() - inferenceStart;
+                    if (inferenceFailed || work.inferred.empty()) {
+                        failureCode = SuperResNativeCode::VulkanFailed;
+                        return failedOrCancelled();
+                    }
+                    currentExtractors.push_back(std::move(extractor));
+
+                    const auto downloadStart = std::chrono::steady_clock::now();
+                    command.record_download(
+                        work.inferred,
+                        work.downloaded,
+                        context.execution_option()
+                    );
+                    context.downloadDuration +=
+                        std::chrono::steady_clock::now() - downloadStart;
+                }
+
+                const auto submitStart = std::chrono::steady_clock::now();
+                const int submitResult = command.submit_and_wait();
+                context.inferenceDuration += std::chrono::steady_clock::now() - submitStart;
+                if (submitResult != 0) {
+                    failureCode = SuperResNativeCode::VulkanFailed;
+                    return failedOrCancelled();
+                }
+                return SuperResTtaMicroBatchStatus::Ok;
+            },
+            [&](size_t pass) {
+                if (pass < currentFirstPass ||
+                    pass - currentFirstPass >= currentWorks.size()) {
+                    failureCode = SuperResNativeCode::TileOutputMismatch;
+                    return SuperResTtaMicroBatchStatus::Failed;
+                }
+                OptimizedVulkanTtaPassWork& work = currentWorks[pass - currentFirstPass];
+                if (work.pass != pass || work.downloaded.empty()) {
+                    failureCode = work.downloaded.empty()
+                        ? SuperResNativeCode::VulkanFailed
+                        : SuperResNativeCode::TileOutputMismatch;
+                    return SuperResTtaMicroBatchStatus::Failed;
+                }
+
+                ncnn::Mat normalizedPass;
+                if (!normalize_output_tile_for_copy(
+                        work.downloaded,
+                        executionProfile.postprocessThreads,
+                        normalizedPass,
+                        performance.tileCopyMs
+                    )) {
+                    log_tile_output_mismatch(
+                        params,
+                        true,
+                        "optimized-tta-normalize",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        work.downloaded,
+                        normalizedPass
+                    );
+                    failureCode = SuperResNativeCode::TileOutputMismatch;
+                    return SuperResTtaMicroBatchStatus::Failed;
+                }
+                if (!d4_add_ncnn_to_fusion(
+                        normalizedPass,
+                        kD4Transforms[pass],
+                        fusion
+                    )) {
+                    log_tile_output_mismatch(
+                        params,
+                        true,
+                        "optimized-tta-inverse-shape",
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        region,
+                        work.downloaded,
+                        normalizedPass
+                    );
+                    failureCode = SuperResNativeCode::TileOutputMismatch;
+                    return SuperResTtaMicroBatchStatus::Failed;
+                }
+                return SuperResTtaMicroBatchStatus::Ok;
+            }
+        );
+
+        if (runResult.status == SuperResTtaMicroBatchStatus::Cancelled) {
+            return SuperResNativeCode::Cancelled;
+        }
+        if (runResult.status != SuperResTtaMicroBatchStatus::Ok) {
+            return failureCode;
+        }
+        if (!d4_finish_ncnn_fusion(fusion, copySource)) {
+            log_tile_output_mismatch(
+                params,
+                true,
+                "optimized-tta-fusion",
+                tileX,
+                tileY,
+                tileW,
+                tileH,
+                region,
+                ncnn::Mat{},
+                copySource
+            );
+            return SuperResNativeCode::TileOutputMismatch;
+        }
+        const SuperResTtaMicroBatchStatus finalBoundary = checkBoundary();
+        if (finalBoundary == SuperResTtaMicroBatchStatus::Cancelled) {
+            return SuperResNativeCode::Cancelled;
+        }
+        return finalBoundary == SuperResTtaMicroBatchStatus::Failed
+            ? failureCode
+            : SuperResNativeCode::Ok;
+    } catch (const std::bad_alloc&) {
+        return checkBoundary() == SuperResTtaMicroBatchStatus::Cancelled
+            ? SuperResNativeCode::Cancelled
+            : SuperResNativeCode::OutOfMemory;
+    } catch (...) {
+        return checkBoundary() == SuperResTtaMicroBatchStatus::Cancelled
+            ? SuperResNativeCode::Cancelled
+            : SuperResNativeCode::Unsupported;
+    }
+}
+
 struct NcnnStageRunResult {
     SuperResNativeCode code;
     int totalTiles;
@@ -1702,6 +1980,7 @@ NcnnStageRunResult run_ncnn_stage(
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl,
     bool useVulkan,
+    bool transactionalOutput,
     const SuperResRgbImage& image,
     const ModelFiles& files,
     ncnn::Net& net,
@@ -1735,10 +2014,18 @@ NcnnStageRunResult run_ncnn_stage(
 
     int completed = 0;
     long long coveredPixels = 0;
-    const bool useExplicitVulkanPath =
+    const bool useOptimizedVulkanTiles =
         should_use_optimized_vulkan_path(executionProfile.effectiveBackend, useVulkan) &&
         !params.tta;
-    if (useExplicitVulkanPath) {
+    const bool useOptimizedVulkanTta = should_run_optimized_vulkan_tta(
+        params,
+        executionProfile,
+        useVulkan,
+        transactionalOutput
+    );
+    const bool useExplicitVulkanPath = useOptimizedVulkanTiles || useOptimizedVulkanTta;
+    std::unique_ptr<OptimizedVulkanTtaContext> optimizedTtaContext;
+    if (useOptimizedVulkanTiles) {
         const SuperResNativeCode optimizedCode = run_optimized_vulkan_tiles(
             params,
             onProgress,
@@ -1766,6 +2053,12 @@ NcnnStageRunResult run_ncnn_stage(
         }
         performance.tileExtractMs = performance.inferenceMs;
     } else {
+    if (useOptimizedVulkanTta) {
+        optimizedTtaContext = std::make_unique<OptimizedVulkanTtaContext>(net);
+        if (!optimizedTtaContext->valid()) {
+            return SuperResNativeCode::VulkanFailed;
+        }
+    }
     for (int ty = 0; ty < tilesY; ++ty) {
         for (int tx = 0; tx < tilesX; ++tx) {
             const SuperResRuntimeInferenceControl control = read_runtime_control(
@@ -1833,6 +2126,26 @@ NcnnStageRunResult run_ncnn_stage(
                         copySource
                     );
                     return SuperResNativeCode::TileOutputMismatch;
+                }
+            } else if (useOptimizedVulkanTta) {
+                const SuperResNativeCode optimizedTtaCode = run_optimized_vulkan_tta_tile(
+                    params,
+                    runtimeControl,
+                    files,
+                    net,
+                    executionProfile,
+                    *optimizedTtaContext,
+                    input,
+                    tileX,
+                    tileY,
+                    tileW,
+                    tileH,
+                    region,
+                    copySource,
+                    performance
+                );
+                if (optimizedTtaCode != SuperResNativeCode::Ok) {
+                    return optimizedTtaCode;
                 }
             } else {
                 // Fusion stays in canonical float space; crop/copy and the RealCUGAN x4 residual run only after all passes succeed.
@@ -2023,6 +2336,19 @@ NcnnStageRunResult run_ncnn_stage(
     }
     }
 
+    if (optimizedTtaContext) {
+        performance.uploadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            optimizedTtaContext->uploadDuration
+        ).count();
+        performance.inferenceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            optimizedTtaContext->inferenceDuration
+        ).count();
+        performance.downloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            optimizedTtaContext->downloadDuration
+        ).count();
+        performance.tileExtractMs = performance.inferenceMs;
+    }
+
     // The last tile can complete while cancellation is being delivered. Consume it before
     // spending time finalizing the temporary PNG, then arbitrate once more at publication.
     if (is_cancelled(params.taskId)) {
@@ -2055,7 +2381,7 @@ NcnnStageRunResult run_ncnn_stage(
     };
 }
 
-SuperResNativeCode run_ncnn_image_to_extreme_target(
+SuperResNativeCode run_ncnn_image_to_extreme_target_attempt(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl,
@@ -2149,6 +2475,7 @@ SuperResNativeCode run_ncnn_image_to_extreme_target(
         onProgress,
         runtimeControl,
         useVulkan,
+        false,
         image,
         files,
         *loadedNet.net,
@@ -2179,7 +2506,39 @@ SuperResNativeCode run_ncnn_image_to_extreme_target(
     return SuperResNativeCode::Ok;
 }
 
-SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
+SuperResNativeCode run_ncnn_image_to_extreme_target(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    bool useVulkan,
+    const SuperResRgbImage& image,
+    RgbOutputTarget& output
+) {
+    return run_superres_tta_attempts(
+        params,
+        useVulkan,
+        false,
+        [&](const SuperResNativeParams& attemptParams) {
+            return run_ncnn_image_to_extreme_target_attempt(
+                attemptParams,
+                onProgress,
+                runtimeControl,
+                useVulkan,
+                image,
+                output
+            );
+        },
+        [](SuperResNativeCode code) { return code; },
+        [&]() {
+            return read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause ||
+                is_cancelled(params.taskId);
+        },
+        []() { return SuperResNativeCode::Cancelled; },
+        [](SuperResNativeCode) {}
+    );
+}
+
+SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory_attempt(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl,
@@ -2282,6 +2641,7 @@ SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
         onProgress,
         runtimeControl,
         useVulkan,
+        true,
         image,
         files,
         *net,
@@ -2300,7 +2660,44 @@ SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
     return {SuperResNativeCode::Ok, std::move(next)};
 }
 
-SuperResNativeCode run_ncnn_image(
+SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    bool useVulkan,
+    const SuperResRgbImage& image
+) {
+    return run_superres_tta_attempts(
+        params,
+        useVulkan,
+        true,
+        [&](const SuperResNativeParams& attemptParams) {
+            return run_ncnn_image_to_memory_attempt(
+                attemptParams,
+                onProgress,
+                runtimeControl,
+                useVulkan,
+                image
+            );
+        },
+        [](const SuperResRgbPipelineStageAttempt& result) { return result.code; },
+        [&]() {
+            return read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause ||
+                is_cancelled(params.taskId);
+        },
+        []() { return SuperResRgbPipelineStageAttempt{SuperResNativeCode::Cancelled, {}}; },
+        [](SuperResNativeCode code) {
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                kLogTag,
+                "Optimized TTA memory attempt failed code=%d; retrying complete safe TTA",
+                static_cast<int>(code)
+            );
+        }
+    );
+}
+
+SuperResNativeCode run_ncnn_image_attempt(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl,
@@ -2452,6 +2849,7 @@ SuperResNativeCode run_ncnn_image(
         onProgress,
         runtimeControl,
         useVulkan,
+        true,
         image,
         files,
         *net,
@@ -2585,6 +2983,45 @@ SuperResNativeCode run_ncnn_image(
     );
 
     return SuperResNativeCode::Ok;
+}
+
+SuperResNativeCode run_ncnn_image(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    bool useVulkan,
+    const SuperResRgbImage& image,
+    long long decodeMs
+) {
+    return run_superres_tta_attempts(
+        params,
+        useVulkan,
+        true,
+        [&](const SuperResNativeParams& attemptParams) {
+            return run_ncnn_image_attempt(
+                attemptParams,
+                onProgress,
+                runtimeControl,
+                useVulkan,
+                image,
+                decodeMs
+            );
+        },
+        [](SuperResNativeCode code) { return code; },
+        [&]() {
+            return read_runtime_control(runtimeControl, params.commandBatchSize).shouldPause ||
+                is_cancelled(params.taskId);
+        },
+        []() { return SuperResNativeCode::Cancelled; },
+        [](SuperResNativeCode code) {
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                kLogTag,
+                "Optimized TTA attempt failed code=%d; retrying complete safe TTA",
+                static_cast<int>(code)
+            );
+        }
+    );
 }
 
 bool write_all(FILE* file, const void* data, size_t size) {

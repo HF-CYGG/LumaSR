@@ -103,7 +103,8 @@ data class InferenceBenchmarkResult(
     val measuredAtEpochMs: Long,
     val validUntilEpochMs: Long,
     val vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
-    val cpuProfiles: List<CalibratedCpuProfile> = emptyList()
+    val cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
+    val ttaProfiles: List<CalibratedTtaProfile> = emptyList()
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Benchmark measurement time must be non-negative" }
@@ -116,6 +117,12 @@ data class InferenceBenchmarkResult(
         require(cpuProfiles.map(CalibratedCpuProfile::resolutionTier).distinct().size == cpuProfiles.size) {
             "Calibrated CPU resolution tiers must be unique"
         }
+        require(
+            ttaProfiles
+                .map { Triple(it.scale, it.noise, it.tileSize) }
+                .distinct()
+                .size == ttaProfiles.size
+        ) { "Calibrated TTA keys must be unique" }
     }
 }
 
@@ -157,6 +164,34 @@ object AdaptiveInferencePolicy {
         current: BenchmarkIdentity
     ): Boolean = cached == current
 
+    fun isTtaProfileEligible(
+        device: DeviceCapabilityProfile,
+        profile: CalibratedTtaProfile
+    ): Boolean = isQualityMetricsWellFormed(profile.quality) &&
+        isFp16Eligible(device, profile.quality) &&
+        profile.passBatchSize == CalibratedTtaProfile.OPTIMIZED_TTA_PASS_BATCH_SIZE &&
+        isAtLeastTenPercentFaster(
+            safeDurationNanos = profile.safeDurationNanos,
+            optimizedDurationNanos = profile.optimizedDurationNanos
+        )
+
+    internal fun isAtLeastTenPercentFaster(
+        safeDurationNanos: Long,
+        optimizedDurationNanos: Long
+    ): Boolean {
+        if (safeDurationNanos <= 0L || optimizedDurationNanos <= 0L) return false
+        val requiredImprovement = safeDurationNanos / 10L +
+            if (safeDurationNanos % 10L == 0L) 0L else 1L
+        return optimizedDurationNanos <= safeDurationNanos - requiredImprovement
+    }
+
+    private fun isQualityMetricsWellFormed(quality: Fp16QualityMetrics): Boolean =
+        quality.ssim.isFinite() &&
+            quality.ssim in -1.0..1.0 &&
+            ((quality.psnrDb.isFinite() && quality.psnrDb >= 0.0) ||
+                quality.psnrDb == Double.POSITIVE_INFINITY) &&
+            quality.p99ChannelError in 0..255
+
     fun chooseCpuThreads(
         device: DeviceCapabilityProfile,
         requestedThreads: Int
@@ -194,9 +229,21 @@ object AdaptiveInferencePolicy {
         currentBenchmarkIdentity: BenchmarkIdentity?,
         currentSafeTileSize: Int,
         nowEpochMs: Long,
-        calibratedVulkanProfile: CalibratedVulkanProfile? = null
+        calibratedVulkanProfile: CalibratedVulkanProfile? = null,
+        calibratedTtaProfile: CalibratedTtaProfile? = null
     ): InferenceExecutionProfile {
         val safeTileSize = UpscaleParamsFactory.sanitizeTileSize(currentSafeTileSize)
+        if (ttaEnabled) {
+            return selectTtaExecutionProfile(
+                device = device,
+                accelerationMode = accelerationMode,
+                benchmarkResult = benchmarkResult,
+                currentBenchmarkIdentity = currentBenchmarkIdentity,
+                safeTileSize = safeTileSize,
+                nowEpochMs = nowEpochMs,
+                calibratedTtaProfile = calibratedTtaProfile
+            )
+        }
         val isCapabilityUnknown = device.physicalCoreCount <= 0 || device.memoryBucketMb <= 0
         val baseProfile = if (device.isLowRamDevice || isCapabilityUnknown) {
             conservativeFallback(device, safeTileSize).let { fallback ->
@@ -256,7 +303,58 @@ object AdaptiveInferencePolicy {
             }
         }
 
-        return if (ttaEnabled) withTtaEnabled(baseProfile) else baseProfile
+        return baseProfile
+    }
+
+    private fun selectTtaExecutionProfile(
+        device: DeviceCapabilityProfile,
+        accelerationMode: AccelerationMode,
+        benchmarkResult: InferenceBenchmarkResult?,
+        currentBenchmarkIdentity: BenchmarkIdentity?,
+        safeTileSize: Int,
+        nowEpochMs: Long,
+        calibratedTtaProfile: CalibratedTtaProfile?
+    ): InferenceExecutionProfile {
+        val safeProfile = withTtaEnabled(
+            InferenceExecutionProfile(
+                backend = NativeBackend.LEGACY_SAFE,
+                accelerationMode = when {
+                    accelerationMode == AccelerationMode.CPU -> AccelerationMode.CPU
+                    device.supportsVulkan -> accelerationMode
+                    else -> AccelerationMode.AUTO
+                },
+                precision = InferencePrecision.FP32,
+                cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
+                tileSize = safeTileSize,
+                commandBatchSize = 1,
+                gpuHeadroomPercent = 8,
+                modelCacheCapacity = 1,
+                tta = false
+            )
+        )
+        val benchmarkIsValid = benchmarkResult != null &&
+            currentBenchmarkIdentity != null &&
+            isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity) &&
+            nowEpochMs in benchmarkResult.measuredAtEpochMs..benchmarkResult.validUntilEpochMs
+        val canUseOptimizedTta = accelerationMode != AccelerationMode.CPU &&
+            device.supportsVulkan &&
+            !device.isLowRamDevice &&
+            device.memoryBucketMb > 0 &&
+            device.physicalCoreCount > 0 &&
+            device.gpuRoughScore?.let { it >= MIN_OPTIMIZED_GPU_ROUGH_SCORE } == true &&
+            benchmarkIsValid &&
+            calibratedTtaProfile?.let { isTtaProfileEligible(device, it) } == true
+        return if (canUseOptimizedTta) {
+            safeProfile.copy(
+                backend = NativeBackend.OPTIMIZED,
+                precision = InferencePrecision.FP16,
+                tileSize = requireNotNull(calibratedTtaProfile).tileSize,
+                commandBatchSize = calibratedTtaProfile.passBatchSize,
+                modelCacheCapacity = 2
+            )
+        } else {
+            safeProfile
+        }
     }
 
     // ncnn documents scores above 75 as high-end and below 10 as low-end.
@@ -307,15 +405,19 @@ object AdaptiveInferencePolicy {
     }
 
     fun withTtaEnabled(profile: InferenceExecutionProfile): InferenceExecutionProfile {
-        val reducedTileSize = UpscaleParamsFactory.supportedTileSizes
-            .filter { it < profile.tileSize }
-            .maxOrNull()
-            ?: profile.tileSize
         return profile.copy(
-            tileSize = reducedTileSize,
+            tileSize = ttaExecutionTileSize(profile.tileSize),
             commandBatchSize = 1,
             gpuHeadroomPercent = profile.gpuHeadroomPercent.coerceAtLeast(10),
             tta = true
         )
+    }
+
+    fun ttaExecutionTileSize(requestedTileSize: Int): Int {
+        val sanitized = UpscaleParamsFactory.sanitizeTileSize(requestedTileSize)
+        return UpscaleParamsFactory.supportedTileSizes
+            .filter { it < sanitized }
+            .maxOrNull()
+            ?: sanitized
     }
 }

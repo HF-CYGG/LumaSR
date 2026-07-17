@@ -76,21 +76,71 @@ class InferenceExecutionProfileResolverTest {
     @Test
     fun lazyResolverFailsClosedToLegacyForProbeOrRepositoryExceptions() = runBlocking {
         val pipeline = params().copy(
-            pipelinePasses = listOf(params().copy(scale = 1), params())
+            tta = true,
+            pipelinePasses = listOf(
+                params().copy(scale = 1, tileSize = 256, tta = true),
+                params().copy(tileSize = 64, tta = true)
+            )
         )
+        val resolvers = listOf(
+            LazyProcessingExecutionProfileResolver(
+                resolverFactory = { throw IllegalStateException("capability probe failed") },
+                ioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            LazyProcessingExecutionProfileResolver(
+                resolverFactory = {
+                    ProcessingExecutionProfileResolver { _, _, _ ->
+                        throw IllegalStateException("resolver failed")
+                    }
+                },
+                ioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            )
+        )
+
+        resolvers.forEach { lazy ->
+            val resolved = lazy.resolve("model-a", pipeline, 1_500L)
+
+            assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+            assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+            assertEquals(256, resolved.tileSize)
+            assertEquals(1, resolved.commandBatchSize)
+            assertEquals(1, resolved.modelCacheCapacity)
+            assertEquals(listOf(128, 64), resolved.pipelinePasses.map(UpscaleParams::tileSize))
+            assertTrue(resolved.pipelinePasses.all { it.nativeBackend == NativeBackend.LEGACY_SAFE })
+            assertTrue(resolved.pipelinePasses.all { it.inferencePrecision == InferencePrecision.FP32 })
+        }
+    }
+
+    @Test
+    fun lazyResolverAppliesTtaTileFallbackWhenRepositoryThrows() = runBlocking {
+        val base = params().copy(tta = true)
+        val repository = object : InferenceBenchmarkRepository {
+            override suspend fun save(result: InferenceBenchmarkResult) = Unit
+
+            override suspend fun publish(
+                result: InferenceBenchmarkResult,
+                gate: BenchmarkPublicationGate
+            ): Boolean = false
+
+            override suspend fun list(): List<InferenceBenchmarkResult> = emptyList()
+
+            override suspend fun findValid(
+                identity: BenchmarkIdentity,
+                nowEpochMs: Long
+            ): InferenceBenchmarkResult? = throw IllegalStateException("repository failed")
+        }
         val lazy = LazyProcessingExecutionProfileResolver(
-            resolverFactory = { throw IllegalStateException("capability probe failed") },
+            resolverFactory = { resolver(repository) },
             ioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
         )
 
-        val resolved = lazy.resolve("model-a", pipeline, 1_500L)
+        val resolved = lazy.resolve("model-a", base, 1_500L)
 
         assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
         assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+        assertEquals(256, resolved.tileSize)
         assertEquals(1, resolved.commandBatchSize)
         assertEquals(1, resolved.modelCacheCapacity)
-        assertTrue(resolved.pipelinePasses.all { it.nativeBackend == NativeBackend.LEGACY_SAFE })
-        assertTrue(resolved.pipelinePasses.all { it.inferencePrecision == InferencePrecision.FP32 })
     }
 
     @Test
@@ -340,7 +390,7 @@ class InferenceExecutionProfileResolverTest {
     }
 
     @Test
-    fun ttaKeepsCalibratedBackendButTightensAllPersistedFields() = runBlocking {
+    fun ordinaryBenchmarkCannotUnlockOptimizedTta() = runBlocking {
         val base = params().copy(tta = true)
         val resolver = resolver(
             repository = FakeBenchmarkRepository(benchmark(identity(base), batchSize = 8))
@@ -348,12 +398,126 @@ class InferenceExecutionProfileResolverTest {
 
         val resolved = resolver.resolve("model-a", base, nowEpochMs = 1_500L)
 
-        assertEquals(NativeBackend.OPTIMIZED, resolved.nativeBackend)
-        assertEquals(InferencePrecision.FP16, resolved.inferencePrecision)
+        assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+        assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
         assertTrue(resolved.tta)
         assertEquals(256, resolved.tileSize)
         assertEquals(1, resolved.commandBatchSize)
         assertTrue(resolved.gpuHeadroomPercent >= 10)
+    }
+
+    @Test
+    fun exactQualifiedTtaProfileUnlocksOptimizedFp16BatchTwo() = runBlocking {
+        val base = params().copy(tta = true)
+        val resolver = resolver(
+            repository = FakeBenchmarkRepository(
+                benchmark(identity(base), ttaProfiles = listOf(ttaProfile(base)))
+            )
+        )
+
+        val resolved = resolver.resolve("model-a", base, nowEpochMs = 1_500L)
+
+        assertEquals(NativeBackend.OPTIMIZED, resolved.nativeBackend)
+        assertEquals(InferencePrecision.FP16, resolved.inferencePrecision)
+        assertTrue(resolved.tta)
+        assertEquals(ttaExecutionTile(base.tileSize), resolved.tileSize)
+        assertEquals(2, resolved.commandBatchSize)
+        assertEquals(2, resolved.modelCacheCapacity)
+    }
+
+    @Test
+    fun missingStaleOrMismatchedTtaEvidenceFailsClosed() = runBlocking {
+        val base = params().copy(tta = true)
+        val exact = ttaProfile(base)
+        val benchmarks = listOf(
+            benchmark(identity(base)),
+            benchmark(identity(base), validUntil = 1_499L, ttaProfiles = listOf(exact)),
+            benchmark(identity(base), ttaProfiles = listOf(exact.copy(scale = base.scale + 1))),
+            benchmark(identity(base), ttaProfiles = listOf(exact.copy(noise = base.noise + 1))),
+            benchmark(identity(base), ttaProfiles = listOf(exact.copy(tileSize = base.tileSize)))
+        )
+
+        benchmarks.forEach { benchmark ->
+            val resolved = resolver(FakeBenchmarkRepository(benchmark)).resolve(
+                "model-a",
+                base,
+                nowEpochMs = 1_500L
+            )
+            assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+            assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+            assertEquals(1, resolved.commandBatchSize)
+            assertEquals(1, resolved.modelCacheCapacity)
+            assertTrue(resolved.tta)
+        }
+    }
+
+    @Test
+    fun ttaQualityAndTenPercentSpeedGatesUseInclusiveBoundaries() = runBlocking {
+        val base = params().copy(tta = true)
+        val exactBoundary = ttaProfile(base).copy(
+            quality = Fp16QualityMetrics(ssim = 0.995, psnrDb = 40.0, p99ChannelError = 3),
+            safeDurationNanos = 1_000L,
+            optimizedDurationNanos = 900L
+        )
+        val passing = resolver(
+            FakeBenchmarkRepository(
+                benchmark(identity(base), ttaProfiles = listOf(exactBoundary))
+            )
+        ).resolve("model-a", base, nowEpochMs = 1_500L)
+        assertEquals(NativeBackend.OPTIMIZED, passing.nativeBackend)
+        assertEquals(2, passing.commandBatchSize)
+
+        listOf(
+            exactBoundary.copy(quality = exactBoundary.quality.copy(ssim = 0.9949)),
+            exactBoundary.copy(quality = exactBoundary.quality.copy(ssim = 1.001)),
+            exactBoundary.copy(quality = exactBoundary.quality.copy(psnrDb = 39.99)),
+            exactBoundary.copy(quality = exactBoundary.quality.copy(p99ChannelError = 4)),
+            exactBoundary.copy(quality = exactBoundary.quality.copy(p99ChannelError = -1)),
+            exactBoundary.copy(optimizedDurationNanos = 901L)
+        ).forEach { rejected ->
+            val resolved = resolver(
+                FakeBenchmarkRepository(
+                    benchmark(identity(base), ttaProfiles = listOf(rejected))
+                )
+            ).resolve("model-a", base, nowEpochMs = 1_500L)
+            assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+            assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+            assertEquals(1, resolved.commandBatchSize)
+        }
+    }
+
+    @Test
+    fun ordinaryCpuProfileCannotOverrideSafeTtaTile() = runBlocking {
+        val base = params().copy(
+            tta = true,
+            accelerationMode = AccelerationMode.CPU
+        )
+        val benchmark = benchmark(
+            identity(base),
+            cpuProfiles = listOf(
+                CalibratedCpuProfile(
+                    ResolutionTier.STANDARD,
+                    tileSize = 768,
+                    cpuThreads = 2,
+                    openmpBlocktimeMs = 0,
+                    postprocessThreads = 1
+                )
+            )
+        )
+
+        val resolved = resolver(FakeBenchmarkRepository(benchmark)).resolve(
+            "model-a",
+            base,
+            nowEpochMs = 1_500L
+        )
+
+        assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+        assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+        assertEquals(256, resolved.tileSize)
+        assertEquals(1, resolved.commandBatchSize)
+        assertEquals(2, resolved.cpuThreads)
+        assertEquals(0, resolved.openmpBlocktimeMs)
+        assertEquals(1, resolved.postprocessThreads)
     }
 
     @Test
@@ -419,7 +583,8 @@ class InferenceExecutionProfileResolverTest {
         batchSize: Int = 4,
         validUntil: Long = 2_000L,
         profiles: List<CalibratedVulkanProfile> = emptyList(),
-        cpuProfiles: List<CalibratedCpuProfile> = emptyList()
+        cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
+        ttaProfiles: List<CalibratedTtaProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
@@ -427,8 +592,27 @@ class InferenceExecutionProfileResolverTest {
         measuredAtEpochMs = 1_000L,
         validUntilEpochMs = validUntil,
         vulkanProfiles = profiles,
-        cpuProfiles = cpuProfiles
+        cpuProfiles = cpuProfiles,
+        ttaProfiles = ttaProfiles
     )
+
+    private fun ttaProfile(params: UpscaleParams) = CalibratedTtaProfile(
+        scale = params.scale,
+        noise = params.noise,
+        tileSize = ttaExecutionTile(params.tileSize),
+        passBatchSize = 2,
+        quality = Fp16QualityMetrics(0.999, 48.0, 1),
+        safeDurationNanos = 1_000L,
+        optimizedDurationNanos = 900L
+    )
+
+    private fun ttaExecutionTile(requestedTileSize: Int): Int {
+        val sanitized = UpscaleParamsFactory.sanitizeTileSize(requestedTileSize)
+        return UpscaleParamsFactory.supportedTileSizes
+            .filter { it < sanitized }
+            .maxOrNull()
+            ?: sanitized
+    }
 
     private fun resolutionProfiles() = listOf(
         CalibratedVulkanProfile(ResolutionTier.SMALL, tileSize = 768, commandBatchSize = 8),

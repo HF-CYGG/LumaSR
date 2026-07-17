@@ -1413,11 +1413,263 @@ class InferenceCalibrationRunnerTest {
         assertTrue(repository.saved.isEmpty())
     }
 
-    private fun request(outputScale: Int) = InferenceCalibrationRequest(
+    @Test
+    fun ttaCalibrationUsesDedicatedSafeAndOptimizedDoubleProbe() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val requests = mutableListOf<UpscaleParams>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    requests += params
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        when {
+                            params.tta && params.nativeBackend == NativeBackend.LEGACY_SAFE -> 1_000L
+                            params.tta -> 900L
+                            else -> successfulDuration(params)
+                        }
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository
+        )
+
+        val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val ttaRequests = requests.filter(UpscaleParams::tta)
+        assertEquals(2, ttaRequests.size)
+        assertEquals(NativeBackend.LEGACY_SAFE, ttaRequests[0].nativeBackend)
+        assertEquals(InferencePrecision.FP32, ttaRequests[0].inferencePrecision)
+        assertEquals(1, ttaRequests[0].commandBatchSize)
+        assertEquals(64, ttaRequests[0].tileSize)
+        assertEquals(NativeBackend.OPTIMIZED, ttaRequests[1].nativeBackend)
+        assertEquals(InferencePrecision.FP16, ttaRequests[1].inferencePrecision)
+        assertEquals(2, ttaRequests[1].commandBatchSize)
+        assertEquals(64, ttaRequests[1].tileSize)
+        val profile = repository.saved.single().ttaProfiles.single()
+        assertEquals(1, profile.scale)
+        assertEquals(0, profile.noise)
+        assertEquals(64, profile.tileSize)
+        assertEquals(2, profile.passBatchSize)
+        assertEquals(1_000L, profile.safeDurationNanos)
+        assertEquals(900L, profile.optimizedDurationNanos)
+    }
+
+    @Test
+    fun ttaCalibrationDoesNotPersistEvidenceOutsideQualityOrSpeedGate() = runBlocking {
+        listOf(false, true).forEach { corruptQuality ->
+            val repository = RecordingBenchmarkRepository()
+            val runner = testRunner(
+                probe = object : InferenceCalibrationProbe {
+                    override suspend fun run(
+                        input: RgbImage,
+                        params: UpscaleParams
+                    ): CalibrationProbeOutput {
+                        val optimizedTta = params.tta &&
+                            params.nativeBackend == NativeBackend.OPTIMIZED
+                        val bytes = if (optimizedTta && corruptQuality) {
+                            ByteArray(input.byteCount) { 255.toByte() }
+                        } else {
+                            input.copyBytes()
+                        }
+                        return CalibrationProbeOutput(
+                            RgbImage(input.width, input.height, bytes),
+                            when {
+                                params.tta && params.nativeBackend == NativeBackend.LEGACY_SAFE -> 1_000L
+                                optimizedTta && !corruptQuality -> 901L
+                                optimizedTta -> 900L
+                                else -> successfulDuration(params)
+                            }
+                        )
+                    }
+
+                    override fun cancel(taskId: String) = Unit
+                },
+                repository = repository
+            )
+
+            val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+            assertTrue(result is CalibrationRunResult.Completed)
+            assertTrue(repository.saved.single().ttaProfiles.isEmpty())
+        }
+    }
+
+    @Test
+    fun ttaProbeFailurePublishesNoPartialBenchmark() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput? {
+                    if (params.tta && params.nativeBackend == NativeBackend.OPTIMIZED) return null
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        if (params.tta) 1_000L else successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository
+        )
+
+        val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED),
+            result
+        )
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun moderateThermalDuringTtaPublishesNoPartialBenchmark() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        var thermalLevel = ThermalLevel.NORMAL
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.tta) thermalLevel = ThermalLevel.MODERATE
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        if (params.tta) 1_000L else successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            thermalLevelProvider = { thermalLevel }
+        )
+
+        val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+        assertTrue(result is CalibrationRunResult.Failed)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun heapDropBeforeTtaPublishesNoPartialBenchmark() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val probeCount = AtomicInteger()
+        val runner = testRunner(
+            probe = successfulProbe(probeCount = probeCount),
+            repository = repository,
+            availableHeapBytesProvider = {
+                if (probeCount.get() >= SUCCESSFUL_ALL_TIERS_PROBE_COUNT) {
+                    InferenceCalibrationRunner.requiredAvailableHeapBytes(ResolutionTier.STANDARD) - 1L
+                } else {
+                    Long.MAX_VALUE
+                }
+            }
+        )
+
+        val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+            result
+        )
+        assertEquals(SUCCESSFUL_ALL_TIERS_PROBE_COUNT, probeCount.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun timeoutDuringTtaCancelsNativeAndPublishesNothing() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val ttaStarted = CompletableDeferred<Unit>()
+        val cancelled = mutableListOf<String>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.tta) {
+                        ttaStarted.complete(Unit)
+                        delay(5_000L)
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelled += taskId
+                }
+            },
+            repository = repository,
+            timeoutMs = 500L
+        )
+
+        val result = runner.run(request(outputScale = 1, supportsTta = true))
+
+        assertTrue(ttaStarted.isCompleted)
+        assertTrue(result is CalibrationRunResult.TimedOut)
+        awaitNativeCancel(cancelled)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun callerCancellationDuringTtaCancelsNativeAndPublishesNothing() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val optimizedTtaStarted = CompletableDeferred<Unit>()
+        val cancelled = mutableListOf<String>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.tta && params.nativeBackend == NativeBackend.OPTIMIZED) {
+                        optimizedTtaStarted.complete(Unit)
+                        delay(5_000L)
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        if (params.tta) 1_000L else successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelled += taskId
+                }
+            },
+            repository = repository
+        )
+        val job = async { runner.run(request(outputScale = 1, supportsTta = true)) }
+        optimizedTtaStarted.await()
+
+        job.cancel()
+        val failure = runCatching { job.await() }.exceptionOrNull()
+
+        assertTrue(failure is CancellationException)
+        awaitNativeCancel(cancelled)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    private fun request(
+        outputScale: Int,
+        supportsTta: Boolean = false
+    ) = InferenceCalibrationRequest(
         identity = identity(),
         device = device(),
         baseParams = params(scale = outputScale),
-        measuredAtEpochMs = 1_000L
+        measuredAtEpochMs = 1_000L,
+        supportsTta = supportsTta
     )
 
     private fun identity() = BenchmarkIdentity(

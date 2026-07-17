@@ -52,7 +52,8 @@ class OnDeviceCalibrationCoordinator(
             identity = identity(model),
             device = device,
             baseParams = calibrationParams(model, resolvedModelDir),
-            measuredAtEpochMs = measuredAt
+            measuredAtEpochMs = measuredAt,
+            supportsTta = model.supportsTta
         )
         return executor.execute(request)
     }

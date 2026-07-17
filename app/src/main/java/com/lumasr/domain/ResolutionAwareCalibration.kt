@@ -66,3 +66,32 @@ data class CalibratedCpuProfile(
         const val MAX_CALIBRATED_THREAD_COUNT = 64
     }
 }
+
+data class CalibratedTtaProfile(
+    val scale: Int,
+    val noise: Int,
+    val tileSize: Int,
+    val passBatchSize: Int,
+    val quality: Fp16QualityMetrics,
+    val safeDurationNanos: Long,
+    val optimizedDurationNanos: Long
+) {
+    init {
+        require(scale > 0) { "Calibrated TTA scale must be positive" }
+        require(tileSize in UpscaleParamsFactory.supportedTileSizes) {
+            "Calibrated TTA tile size is unsupported"
+        }
+        require(passBatchSize == OPTIMIZED_TTA_PASS_BATCH_SIZE) {
+            "Calibrated TTA pass batch size must be $OPTIMIZED_TTA_PASS_BATCH_SIZE"
+        }
+        require(safeDurationNanos > 0L) { "Safe TTA duration must be positive" }
+        require(optimizedDurationNanos > 0L) { "Optimized TTA duration must be positive" }
+    }
+
+    fun matches(scale: Int, noise: Int, tileSize: Int): Boolean =
+        this.scale == scale && this.noise == noise && this.tileSize == tileSize
+
+    companion object {
+        const val OPTIMIZED_TTA_PASS_BATCH_SIZE = 2
+    }
+}
