@@ -108,6 +108,12 @@ struct SuperResNativePerformance {
     int effectivePrecision = 0;
     int fallbackReason = -1;
     int requestedMaxPipelineDepth = 1;
+    int effectivePipelineDepth = 1;
+    int peakOccupiedPipelineSlots = 0;
+    long long producerWaitMs = 0;
+    long long consumerWaitMs = 0;
+    long long pipelineOverlapMs = 0;
+    long long peakPipelineSlotBytes = 0;
 };
 
 using SuperResProgressCallback = std::function<void(

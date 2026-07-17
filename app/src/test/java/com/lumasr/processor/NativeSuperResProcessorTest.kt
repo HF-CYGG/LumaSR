@@ -198,7 +198,13 @@ class NativeSuperResProcessorTest {
             effectiveBackend = NativeBackend.OPTIMIZED,
             effectivePrecision = InferencePrecision.FP16,
             fallbackReason = NativeFallbackReason.FP16_UNSUPPORTED,
-            requestedMaxPipelineDepth = 2
+            requestedMaxPipelineDepth = 2,
+            effectivePipelineDepth = 2,
+            peakOccupiedSlots = 2,
+            peakSlotBytes = 12_345,
+            producerWaitMs = 7,
+            consumerWaitMs = 8,
+            overlapMs = 9
         )
         val bridge = FakeNativeBridge(
             code = NativeProcessCode.OK,
@@ -238,6 +244,12 @@ class NativeSuperResProcessorTest {
         assertEquals(InferencePrecision.FP16, progressSnapshots.single().effectivePrecision)
         assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, progressSnapshots.single().fallbackReason)
         assertEquals(2, progressSnapshots.single().requestedMaxPipelineDepth)
+        assertEquals(2, progressSnapshots.single().effectivePipelineDepth)
+        assertEquals(2, progressSnapshots.single().peakOccupiedSlots)
+        assertEquals(12_345, progressSnapshots.single().peakSlotBytes)
+        assertEquals(7, progressSnapshots.single().producerWaitMs)
+        assertEquals(8, progressSnapshots.single().consumerWaitMs)
+        assertEquals(9, progressSnapshots.single().overlapMs)
     }
 
     @Test
@@ -274,7 +286,13 @@ class NativeSuperResProcessorTest {
             effectiveBackendOrdinal = NativeBackend.OPTIMIZED.ordinal,
             effectivePrecisionOrdinal = InferencePrecision.FP32.ordinal,
             fallbackReasonOrdinal = NativeFallbackReason.FP16_UNSUPPORTED.ordinal,
-            requestedMaxPipelineDepth = 2
+            requestedMaxPipelineDepth = 2,
+            effectivePipelineDepth = 2,
+            peakOccupiedSlots = 2,
+            peakSlotBytes = 12_345,
+            producerWaitMs = 7,
+            consumerWaitMs = 8,
+            overlapMs = 9
         )
 
         val snapshot = events.single().performanceSnapshot!!
@@ -288,6 +306,12 @@ class NativeSuperResProcessorTest {
         assertEquals(InferencePrecision.FP32, snapshot.effectivePrecision)
         assertEquals(NativeFallbackReason.FP16_UNSUPPORTED, snapshot.fallbackReason)
         assertEquals(2, snapshot.requestedMaxPipelineDepth)
+        assertEquals(2, snapshot.effectivePipelineDepth)
+        assertEquals(2, snapshot.peakOccupiedSlots)
+        assertEquals(12_345, snapshot.peakSlotBytes)
+        assertEquals(7, snapshot.producerWaitMs)
+        assertEquals(8, snapshot.consumerWaitMs)
+        assertEquals(9, snapshot.overlapMs)
     }
 
     @Test

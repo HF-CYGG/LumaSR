@@ -53,7 +53,7 @@ void emit_progress(
         method = env->GetMethodID(
             sink_class,
             "onProgress",
-            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIIII)V"
+            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIIIIIIJJJJ)V"
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {
@@ -102,7 +102,13 @@ void emit_progress(
             static_cast<jint>(performance.effectiveBackend),
             static_cast<jint>(performance.effectivePrecision),
             static_cast<jint>(performance.fallbackReason),
-            static_cast<jint>(performance.requestedMaxPipelineDepth)
+            static_cast<jint>(performance.requestedMaxPipelineDepth),
+            static_cast<jint>(performance.effectivePipelineDepth),
+            static_cast<jint>(performance.peakOccupiedPipelineSlots),
+            static_cast<jlong>(performance.peakPipelineSlotBytes),
+            static_cast<jlong>(performance.producerWaitMs),
+            static_cast<jlong>(performance.consumerWaitMs),
+            static_cast<jlong>(performance.pipelineOverlapMs)
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {

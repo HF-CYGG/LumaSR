@@ -11,6 +11,7 @@
 #include "superres_rgb_image_checks.h"
 #include "superres_rgb_output_target.h"
 #include "superres_ncnn_stage_contract.h"
+#include "superres_ordered_pipeline.h"
 #include "superres_stbi_decode.h"
 #include "superres_png_writer_checks.h"
 #include "superres_atomic_publish_checks.h"
@@ -144,6 +145,35 @@ struct OptimizedVulkanTileWork {
     ncnn::VkMat uploaded;
     ncnn::VkMat inferred;
     ncnn::Mat downloaded;
+};
+
+struct OptimizedVulkanPipelineSlot {
+    explicit OptimizedVulkanPipelineSlot(const ncnn::VulkanDevice* device)
+        : allocators(std::make_unique<InvocationVulkanAllocators>(device)) {}
+
+    std::unique_ptr<InvocationVulkanAllocators> allocators;
+    std::vector<OptimizedVulkanTileWork> batch;
+    std::vector<std::unique_ptr<ncnn::Extractor>> extractors;
+    SuperResRuntimeInferenceControl control;
+    std::chrono::steady_clock::time_point batchStart;
+    std::chrono::steady_clock::duration uploadDuration{};
+    std::chrono::steady_clock::duration inferenceDuration{};
+    std::chrono::steady_clock::duration downloadDuration{};
+    long long tileInputMs = 0;
+    long long tileCopyMs = 0;
+    int copiedTiles = 0;
+    size_t peakBytes = 0;
+
+    void clear_payload() {
+        batch.clear();
+        extractors.clear();
+        uploadDuration = {};
+        inferenceDuration = {};
+        downloadDuration = {};
+        tileInputMs = 0;
+        tileCopyMs = 0;
+        copiedTiles = 0;
+    }
 };
 
 NetCacheEntry net_cache;
@@ -857,7 +887,7 @@ void log_tile_output_mismatch(
     );
 }
 
-SuperResNativeCode run_optimized_vulkan_tiles(
+SuperResNativeCode run_optimized_vulkan_tiles_serial(
     const SuperResNativeParams& params,
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl,
@@ -877,7 +907,8 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     RgbOutputTarget& output,
     long long& coveredPixels,
     int& completed,
-    SuperResNativePerformance& performance
+    SuperResNativePerformance& performance,
+    const SuperResRuntimeInferenceControl& initialControl
 ) {
     const ncnn::VulkanDevice* device = net.vulkan_device();
     InvocationVulkanAllocators allocators(device);
@@ -890,12 +921,19 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     std::chrono::steady_clock::duration inferenceDuration{};
     std::chrono::steady_clock::duration downloadDuration{};
     int firstTile = 0;
+    bool useInitialControl = true;
+    performance.effectivePipelineDepth = 1;
+    performance.peakOccupiedPipelineSlots = 0;
+    performance.peakPipelineSlotBytes = 0;
+    performance.producerWaitMs = 0;
+    performance.consumerWaitMs = 0;
+    performance.pipelineOverlapMs = 0;
 
     while (firstTile < totalTiles) {
-        const SuperResRuntimeInferenceControl control = read_runtime_control(
-            runtimeControl,
-            executionProfile.commandBatchSize
-        );
+        const SuperResRuntimeInferenceControl control = useInitialControl
+            ? initialControl
+            : read_runtime_control(runtimeControl, executionProfile.commandBatchSize);
+        useInitialControl = false;
         performance.requestedMaxPipelineDepth = control.maxPipelineDepth;
         if (control.shouldPause) {
             return SuperResNativeCode::Cancelled;
@@ -927,9 +965,25 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             const int tileW = std::min(tileSize, image.width() - tileX);
             const int tileH = std::min(tileSize, image.height() - tileY);
             const TileInputRegion region = params.engineType == kEngineWaifu2x
-                ? make_waifu2x_tile_region(params, image.width(), image.height(), tileX, tileY, tileW, tileH)
+                ? make_waifu2x_tile_region(
+                    params,
+                    image.width(),
+                    image.height(),
+                    tileX,
+                    tileY,
+                    tileW,
+                    tileH
+                )
                 : params.engineType == kEngineRealCugan
-                    ? make_realcugan_tile_region(params, image.width(), image.height(), tileX, tileY, tileW, tileH)
+                    ? make_realcugan_tile_region(
+                        params,
+                        image.width(),
+                        image.height(),
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH
+                    )
                     : make_overlapped_tile_region(
                         image.width(),
                         image.height(),
@@ -980,10 +1034,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
                 extractor->input(files.inputBlob, work.uploaded) != 0 ||
                 extractor->extract(files.outputBlob, work.inferred, command) != 0;
             inferenceDuration += std::chrono::steady_clock::now() - inferenceStart;
-            if (inferenceFailed) {
-                return SuperResNativeCode::VulkanFailed;
-            }
-            if (work.inferred.empty()) {
+            if (inferenceFailed || work.inferred.empty()) {
                 return SuperResNativeCode::VulkanFailed;
             }
             extractors.push_back(std::move(extractor));
@@ -1081,7 +1132,7 @@ SuperResNativeCode run_optimized_vulkan_tiles(
             }
             record_tile_copy_duration(performance, copyStart, output, encodingBefore);
 
-            completed += 1;
+            ++completed;
             const float progress = 0.12f + 0.78f * (static_cast<float>(completed) / totalTiles);
             emit(
                 onProgress,
@@ -1112,6 +1163,521 @@ SuperResNativeCode run_optimized_vulkan_tiles(
     performance.inferenceMs = std::chrono::duration_cast<std::chrono::milliseconds>(inferenceDuration).count();
     performance.downloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(downloadDuration).count();
     return SuperResNativeCode::Ok;
+}
+
+SuperResVulkanPipelineAttemptResult run_optimized_vulkan_tiles_ordered(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    const SuperResRgbImage& image,
+    const ModelFiles& files,
+    ncnn::Net& net,
+    const SuperResExecutionProfile& executionProfile,
+    int tileSize,
+    int tileOverlap,
+    int tilesX,
+    int tilesY,
+    int bufferW,
+    int bufferH,
+    int outputW,
+    int outputH,
+    bool useCroppedOutput,
+    RgbOutputTarget& output,
+    long long& coveredPixels,
+    int& completed,
+    SuperResNativePerformance& performance,
+    const SuperResRuntimeInferenceControl& initialControl
+) {
+    const ncnn::VulkanDevice* device = net.vulkan_device();
+    std::vector<std::unique_ptr<OptimizedVulkanPipelineSlot>> slots;
+    try {
+        slots.push_back(std::make_unique<OptimizedVulkanPipelineSlot>(device));
+        if (!slots.front()->allocators->valid()) {
+            return SuperResVulkanPipelineAttemptResult{
+                static_cast<int>(SuperResNativeCode::VulkanFailed),
+                true,
+                false
+            };
+        }
+        auto secondSlot = std::make_unique<OptimizedVulkanPipelineSlot>(device);
+        if (!secondSlot->allocators->valid()) {
+            return SuperResVulkanPipelineAttemptResult{
+                static_cast<int>(SuperResNativeCode::VulkanFailed),
+                true,
+                false
+            };
+        }
+        slots.push_back(std::move(secondSlot));
+    } catch (...) {
+        return SuperResVulkanPipelineAttemptResult{
+            static_cast<int>(SuperResNativeCode::VulkanFailed),
+            true,
+            false
+        };
+    }
+
+    const int totalTiles = tilesX * tilesY;
+    std::chrono::steady_clock::duration uploadDuration{};
+    std::chrono::steady_clock::duration inferenceDuration{};
+    std::chrono::steady_clock::duration downloadDuration{};
+    int firstTile = 0;
+    SuperResRuntimeInferenceControl nextControl = initialControl;
+    bool useInitialControl = true;
+    bool outputWritten = false;
+
+    SuperResOrderedPipelineOperations operations;
+    // Dynamic command batches mean the exact batch count is unknown. totalTiles is the strict
+    // upper bound (batch size one); Finished ends production once every tile has been recorded.
+    operations.itemCount = totalTiles;
+    operations.maximumDepth = 2;
+    operations.pollProducerControl = [&](int) {
+        if (useInitialControl) {
+            useInitialControl = false;
+        } else {
+            nextControl = read_runtime_control(
+                runtimeControl,
+                executionProfile.commandBatchSize
+            );
+        }
+        performance.requestedMaxPipelineDepth = nextControl.maxPipelineDepth;
+        const bool cancellationRequested = nextControl.shouldPause ||
+            is_cancelled(params.taskId);
+        return SuperResOrderedPipelineProducerControl{
+            nextControl.maxPipelineDepth,
+            cancellationRequested,
+            static_cast<int>(SuperResNativeCode::Cancelled)
+        };
+    };
+    operations.produce = [&](int slotIndex,
+                             int,
+                             const SuperResOrderedPipelineCancellationToken& token) {
+        if (firstTile >= totalTiles) {
+            return SuperResOrderedPipelineStepResult::finished();
+        }
+        if (token.stop_requested()) {
+            return SuperResOrderedPipelineStepResult::cancelled(
+                static_cast<int>(SuperResNativeCode::Cancelled)
+            );
+        }
+
+        OptimizedVulkanPipelineSlot& slot = *slots[static_cast<size_t>(slotIndex)];
+        slot.clear_payload();
+        slot.control = nextControl;
+        const SuperResCommandBatchPlan plan = plan_command_batch(
+            totalTiles,
+            slot.control.commandBatchSize,
+            firstTile,
+            false
+        );
+        if (!plan.shouldRecord) {
+            return SuperResOrderedPipelineStepResult::finished();
+        }
+
+        slot.batchStart = std::chrono::steady_clock::now();
+        slot.batch.reserve(static_cast<size_t>(plan.tileCount));
+        slot.extractors.reserve(static_cast<size_t>(plan.tileCount));
+        const ncnn::Option executionOption = slot.allocators->attach_to(net.opt);
+        ncnn::VkCompute command(device);
+
+        for (int offset = 0; offset < plan.tileCount; ++offset) {
+            const int tileIndex = plan.firstTile + offset;
+            const int tx = tileIndex % tilesX;
+            const int ty = tileIndex / tilesX;
+            const int tileX = tx * tileSize;
+            const int tileY = ty * tileSize;
+            const int tileW = std::min(tileSize, image.width() - tileX);
+            const int tileH = std::min(tileSize, image.height() - tileY);
+            const TileInputRegion region = params.engineType == kEngineWaifu2x
+                ? make_waifu2x_tile_region(params, image.width(), image.height(), tileX, tileY, tileW, tileH)
+                : params.engineType == kEngineRealCugan
+                    ? make_realcugan_tile_region(params, image.width(), image.height(), tileX, tileY, tileW, tileH)
+                    : make_overlapped_tile_region(
+                        image.width(),
+                        image.height(),
+                        tileX,
+                        tileY,
+                        tileW,
+                        tileH,
+                        tileSize,
+                        tileOverlap,
+                        params.scale
+                    );
+
+            const auto inputStart = std::chrono::steady_clock::now();
+            ncnn::Mat input = make_input_tile(
+                image,
+                region.inputX,
+                region.inputY,
+                region.inputW,
+                region.inputH
+            );
+            slot.tileInputMs += elapsed_ms(inputStart);
+            slot.batch.push_back(OptimizedVulkanTileWork{
+                tileX,
+                tileY,
+                tileW,
+                tileH,
+                region,
+                input,
+                ncnn::VkMat{},
+                ncnn::VkMat{},
+                ncnn::Mat{}
+            });
+            OptimizedVulkanTileWork& work = slot.batch.back();
+
+            const auto uploadStart = std::chrono::steady_clock::now();
+            command.record_upload(work.input, work.uploaded, executionOption);
+            slot.uploadDuration += std::chrono::steady_clock::now() - uploadStart;
+            if (work.uploaded.empty()) {
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::VulkanFailed)
+                );
+            }
+
+            auto extractor = std::make_unique<ncnn::Extractor>(net.create_extractor());
+            extractor->set_blob_vkallocator(slot.allocators->blob());
+            extractor->set_workspace_vkallocator(slot.allocators->workspace());
+            extractor->set_staging_vkallocator(slot.allocators->staging());
+            const auto inferenceStart = std::chrono::steady_clock::now();
+            const bool inferenceFailed =
+                extractor->input(files.inputBlob, work.uploaded) != 0 ||
+                extractor->extract(files.outputBlob, work.inferred, command) != 0;
+            slot.inferenceDuration += std::chrono::steady_clock::now() - inferenceStart;
+            if (inferenceFailed) {
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::VulkanFailed)
+                );
+            }
+            if (work.inferred.empty()) {
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::VulkanFailed)
+                );
+            }
+            slot.extractors.push_back(std::move(extractor));
+
+            const auto downloadStart = std::chrono::steady_clock::now();
+            command.record_download(work.inferred, work.downloaded, executionOption);
+            slot.downloadDuration += std::chrono::steady_clock::now() - downloadStart;
+        }
+
+        // ncnn exposes one synchronization result for the complete command buffer; keep it in inference time.
+        const auto submitStart = std::chrono::steady_clock::now();
+        const int submitResult = command.submit_and_wait();
+        slot.inferenceDuration += std::chrono::steady_clock::now() - submitStart;
+        if (submitResult != 0) {
+            return SuperResOrderedPipelineStepResult::failed(
+                static_cast<int>(SuperResNativeCode::VulkanFailed)
+            );
+        }
+
+        if (is_cancelled(params.taskId)) {
+            return SuperResOrderedPipelineStepResult::cancelled(
+                static_cast<int>(SuperResNativeCode::Cancelled)
+            );
+        }
+
+        size_t currentSlotBytes = 0;
+        const auto addMatrixBytes = [&currentSlotBytes](const auto& matrix) {
+            if (matrix.empty() || matrix.elemsize == 0) {
+                return;
+            }
+            const size_t elements = matrix.total();
+            const size_t bytes = elements > std::numeric_limits<size_t>::max() / matrix.elemsize
+                ? std::numeric_limits<size_t>::max()
+                : elements * matrix.elemsize;
+            currentSlotBytes = bytes > std::numeric_limits<size_t>::max() - currentSlotBytes
+                ? std::numeric_limits<size_t>::max()
+                : currentSlotBytes + bytes;
+        };
+        for (const OptimizedVulkanTileWork& work : slot.batch) {
+            addMatrixBytes(work.input);
+            addMatrixBytes(work.uploaded);
+            addMatrixBytes(work.inferred);
+            addMatrixBytes(work.downloaded);
+        }
+        slot.peakBytes = std::max(slot.peakBytes, currentSlotBytes);
+        firstTile += plan.tileCount;
+        return SuperResOrderedPipelineStepResult::ok();
+    };
+    operations.onProduced = [&](int slotIndex, int) {
+        OptimizedVulkanPipelineSlot& slot = *slots[static_cast<size_t>(slotIndex)];
+        performance.tileInputMs += slot.tileInputMs;
+        uploadDuration += slot.uploadDuration;
+        inferenceDuration += slot.inferenceDuration;
+        downloadDuration += slot.downloadDuration;
+        sleep_for_gpu_headroom(
+            resolve_runtime_headroom_percent(
+                params.gpuHeadroomPercent,
+                slot.control.thermalHeadroomPercent,
+                true
+            ),
+            std::chrono::steady_clock::now() - slot.batchStart
+        );
+    };
+    operations.consume = [&](int slotIndex,
+                             int,
+                             const SuperResOrderedPipelineCancellationToken& token) {
+        OptimizedVulkanPipelineSlot& slot = *slots[static_cast<size_t>(slotIndex)];
+        for (size_t index = 0; index < slot.batch.size(); ++index) {
+            if (token.stop_requested()) {
+                return SuperResOrderedPipelineStepResult::cancelled(
+                    static_cast<int>(SuperResNativeCode::Cancelled)
+                );
+            }
+            OptimizedVulkanTileWork& work = slot.batch[index];
+            if (work.downloaded.empty()) {
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::VulkanFailed)
+                );
+            }
+
+            ncnn::Mat copySource;
+            if (!normalize_output_tile_for_copy(
+                    work.downloaded,
+                    executionProfile.postprocessThreads,
+                    copySource,
+                    slot.tileCopyMs
+                )) {
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-normalize",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::TileOutputMismatch)
+                );
+            }
+
+            const auto copyStart = std::chrono::steady_clock::now();
+            const auto encodingBefore = output.encoding_duration();
+            outputWritten = true;
+            if (!copy_output_tile(
+                    copySource,
+                    output,
+                    coveredPixels,
+                    params.engineType == kEngineRealCugan && params.scale == 4 ? &image : nullptr,
+                    bufferW,
+                    bufferH,
+                    outputW,
+                    outputH,
+                    work.region.cropX,
+                    work.region.cropY,
+                    work.region.dstX,
+                    work.region.dstY,
+                    work.region.copyW,
+                    work.region.copyH,
+                    useCroppedOutput,
+                    params.outputCropLeft,
+                    params.outputCropTop,
+                    params.outputCropWidth,
+                    params.outputCropHeight,
+                    params.engineType == kEngineWaifu2x || params.engineType == kEngineRealCugan,
+                    params.engineType == kEngineRealCugan && params.scale == 4
+                )) {
+                const auto elapsed = std::chrono::steady_clock::now() - copyStart;
+                const auto encoding = output.encoding_duration() - encodingBefore;
+                const auto copyOnly = elapsed > encoding
+                    ? elapsed - encoding
+                    : std::chrono::steady_clock::duration{};
+                slot.tileCopyMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+                    copyOnly
+                ).count();
+                if (output.failure_code() != SuperResNativeCode::Ok) {
+                    return SuperResOrderedPipelineStepResult::failed(
+                        static_cast<int>(output.failure_code())
+                    );
+                }
+                log_tile_output_mismatch(
+                    params,
+                    true,
+                    "optimized-vulkan-copy",
+                    work.tileX,
+                    work.tileY,
+                    work.tileW,
+                    work.tileH,
+                    work.region,
+                    work.downloaded,
+                    copySource
+                );
+                return SuperResOrderedPipelineStepResult::failed(
+                    static_cast<int>(SuperResNativeCode::TileOutputMismatch)
+                );
+            }
+            const auto elapsed = std::chrono::steady_clock::now() - copyStart;
+            const auto encoding = output.encoding_duration() - encodingBefore;
+            const auto copyOnly = elapsed > encoding
+                ? elapsed - encoding
+                : std::chrono::steady_clock::duration{};
+            slot.tileCopyMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+                copyOnly
+            ).count();
+            ++slot.copiedTiles;
+        }
+        return SuperResOrderedPipelineStepResult::ok();
+    };
+    operations.onConsumed = [&](int slotIndex, int) {
+        OptimizedVulkanPipelineSlot& slot = *slots[static_cast<size_t>(slotIndex)];
+        performance.tileCopyMs += slot.tileCopyMs;
+        for (int index = 0; index < slot.copiedTiles; ++index) {
+            ++completed;
+            const float progress = 0.12f + 0.78f * (static_cast<float>(completed) / totalTiles);
+            emit(
+                onProgress,
+                SuperResNativeStage::ProcessingTile,
+                completed,
+                totalTiles,
+                progress,
+                "Processing tile " + std::to_string(completed) + "/" + std::to_string(totalTiles)
+            );
+        }
+        slot.clear_payload();
+    };
+
+    const SuperResOrderedPipelineRunResult pipeline = run_superres_ordered_pipeline(operations);
+
+    // Convert once after all batches so sub-millisecond record calls accumulate instead of truncating per tile.
+    performance.uploadMs = std::chrono::duration_cast<std::chrono::milliseconds>(uploadDuration).count();
+    performance.inferenceMs = std::chrono::duration_cast<std::chrono::milliseconds>(inferenceDuration).count();
+    performance.downloadMs = std::chrono::duration_cast<std::chrono::milliseconds>(downloadDuration).count();
+    performance.effectivePipelineDepth = pipeline.telemetry.effectiveDepth;
+    performance.peakOccupiedPipelineSlots = pipeline.telemetry.peakOccupiedSlots;
+    performance.producerWaitMs = pipeline.telemetry.producerWaitMs;
+    performance.consumerWaitMs = pipeline.telemetry.consumerWaitMs;
+    performance.pipelineOverlapMs = pipeline.telemetry.overlapMs;
+    size_t peakSlotBytes = 0;
+    for (const auto& slot : slots) {
+        peakSlotBytes = std::max(peakSlotBytes, slot->peakBytes);
+    }
+    performance.peakPipelineSlotBytes = static_cast<long long>(std::min<size_t>(
+        peakSlotBytes,
+        static_cast<size_t>(std::numeric_limits<long long>::max())
+    ));
+
+    if (pipeline.step.kind == SuperResOrderedPipelineStepKind::Ok) {
+        const SuperResNativeCode code = firstTile == totalTiles && completed == totalTiles
+            ? SuperResNativeCode::Ok
+            : SuperResNativeCode::VulkanFailed;
+        return SuperResVulkanPipelineAttemptResult{
+            static_cast<int>(code),
+            false,
+            outputWritten
+        };
+    }
+    if (pipeline.step.kind == SuperResOrderedPipelineStepKind::Cancelled) {
+        return SuperResVulkanPipelineAttemptResult{
+            static_cast<int>(SuperResNativeCode::Cancelled),
+            false,
+            outputWritten
+        };
+    }
+    if (pipeline.step.kind == SuperResOrderedPipelineStepKind::InitializationFailed) {
+        return SuperResVulkanPipelineAttemptResult{
+            static_cast<int>(SuperResNativeCode::VulkanFailed),
+            true,
+            outputWritten
+        };
+    }
+    const int failureCode = pipeline.step.errorCode;
+    if (failureCode >= static_cast<int>(SuperResNativeCode::InputMissing) &&
+        failureCode <= static_cast<int>(SuperResNativeCode::PipelineFallbackRequired)) {
+        return SuperResVulkanPipelineAttemptResult{failureCode, false, outputWritten};
+    }
+    return SuperResVulkanPipelineAttemptResult{
+        static_cast<int>(SuperResNativeCode::VulkanFailed),
+        false,
+        outputWritten
+    };
+}
+
+SuperResNativeCode run_optimized_vulkan_tiles(
+    const SuperResNativeParams& params,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl,
+    const SuperResRgbImage& image,
+    const ModelFiles& files,
+    ncnn::Net& net,
+    const SuperResExecutionProfile& executionProfile,
+    int tileSize,
+    int tileOverlap,
+    int tilesX,
+    int tilesY,
+    int bufferW,
+    int bufferH,
+    int outputW,
+    int outputH,
+    bool useCroppedOutput,
+    RgbOutputTarget& output,
+    long long& coveredPixels,
+    int& completed,
+    SuperResNativePerformance& performance
+) {
+    const SuperResRuntimeInferenceControl initialControl = read_runtime_control(
+        runtimeControl,
+        executionProfile.commandBatchSize
+    );
+    performance.requestedMaxPipelineDepth = initialControl.maxPipelineDepth;
+
+    const int result = dispatch_superres_vulkan_pipeline(
+        initialControl.maxPipelineDepth,
+        [&]() {
+            return static_cast<int>(run_optimized_vulkan_tiles_serial(
+                params,
+                onProgress,
+                runtimeControl,
+                image,
+                files,
+                net,
+                executionProfile,
+                tileSize,
+                tileOverlap,
+                tilesX,
+                tilesY,
+                bufferW,
+                bufferH,
+                outputW,
+                outputH,
+                useCroppedOutput,
+                output,
+                coveredPixels,
+                completed,
+                performance,
+                initialControl
+            ));
+        },
+        [&]() {
+            return run_optimized_vulkan_tiles_ordered(
+                params,
+                onProgress,
+                runtimeControl,
+                image,
+                files,
+                net,
+                executionProfile,
+                tileSize,
+                tileOverlap,
+                tilesX,
+                tilesY,
+                bufferW,
+                bufferH,
+                outputW,
+                outputH,
+                useCroppedOutput,
+                output,
+                coveredPixels,
+                completed,
+                performance,
+                initialControl
+            );
+        }
+    );
+    return static_cast<SuperResNativeCode>(result);
 }
 
 struct NcnnStageRunResult {
@@ -1938,7 +2504,7 @@ SuperResNativeCode run_ncnn_image(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=pre_publish_safe finalPublishPending=1",
         params.taskId.c_str(),
         modelKey.c_str(),
         modelKey.c_str(),
@@ -1949,6 +2515,12 @@ SuperResNativeCode run_ncnn_image(
         performance.effectivePrecision,
         performance.fallbackReason,
         performance.requestedMaxPipelineDepth,
+        performance.effectivePipelineDepth,
+        performance.peakOccupiedPipelineSlots,
+        performance.peakPipelineSlotBytes,
+        performance.producerWaitMs,
+        performance.consumerWaitMs,
+        performance.pipelineOverlapMs,
         executionProfile.cpuThreads,
         executionProfile.openmpBlocktimeMs,
         executionProfile.postprocessThreads,

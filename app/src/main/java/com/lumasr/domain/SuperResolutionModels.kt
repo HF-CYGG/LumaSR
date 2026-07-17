@@ -148,7 +148,13 @@ data class NativePerformanceSnapshot(
     val effectiveBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
     val effectivePrecision: InferencePrecision = InferencePrecision.FP32,
     val fallbackReason: NativeFallbackReason? = null,
-    val requestedMaxPipelineDepth: Int = 1
+    val requestedMaxPipelineDepth: Int = 1,
+    val effectivePipelineDepth: Int = 1,
+    val peakOccupiedSlots: Int = 0,
+    val peakSlotBytes: Long = 0,
+    val producerWaitMs: Long = 0,
+    val consumerWaitMs: Long = 0,
+    val overlapMs: Long = 0
 )
 
 enum class NativeFallbackReason {

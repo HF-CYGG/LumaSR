@@ -592,7 +592,13 @@ class NativeProgressSink(
         effectiveBackendOrdinal: Int,
         effectivePrecisionOrdinal: Int,
         fallbackReasonOrdinal: Int,
-        requestedMaxPipelineDepth: Int
+        requestedMaxPipelineDepth: Int,
+        effectivePipelineDepth: Int,
+        peakOccupiedSlots: Int,
+        peakSlotBytes: Long,
+        producerWaitMs: Long,
+        consumerWaitMs: Long,
+        overlapMs: Long
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -632,7 +638,13 @@ class NativeProgressSink(
                             InferencePrecision.FP32
                         },
                         fallbackReason = NativeFallbackReason.entries.getOrNull(fallbackReasonOrdinal),
-                        requestedMaxPipelineDepth = requestedMaxPipelineDepth.coerceIn(1, 2)
+                        requestedMaxPipelineDepth = requestedMaxPipelineDepth.coerceIn(1, 2),
+                        effectivePipelineDepth = effectivePipelineDepth.coerceIn(1, 2),
+                        peakOccupiedSlots = peakOccupiedSlots.coerceIn(0, 2),
+                        peakSlotBytes = peakSlotBytes.coerceAtLeast(0),
+                        producerWaitMs = producerWaitMs.coerceAtLeast(0),
+                        consumerWaitMs = consumerWaitMs.coerceAtLeast(0),
+                        overlapMs = overlapMs.coerceAtLeast(0)
                     )
                 } else {
                     null
@@ -1161,7 +1173,11 @@ class NativeSuperResProcessor(
                     "inferenceMs=${snapshot.inferenceMs} downloadMs=${snapshot.downloadMs} " +
                     "postprocessMs=${snapshot.postprocessMs} encodeMs=${snapshot.encodeMs} " +
                     "backend=${snapshot.effectiveBackend} precision=${snapshot.effectivePrecision} " +
-                    "fallback=${snapshot.fallbackReason} requestedPipelineDepth=${snapshot.requestedMaxPipelineDepth}"
+                    "fallback=${snapshot.fallbackReason} requestedPipelineDepth=${snapshot.requestedMaxPipelineDepth} " +
+                    "pipelineDepth=${snapshot.effectivePipelineDepth} " +
+                    "peakOccupiedSlots=${snapshot.peakOccupiedSlots} peakSlotBytes=${snapshot.peakSlotBytes} " +
+                    "producerWaitMs=${snapshot.producerWaitMs} consumerWaitMs=${snapshot.consumerWaitMs} " +
+                    "overlapMs=${snapshot.overlapMs}"
             )
         }
     }

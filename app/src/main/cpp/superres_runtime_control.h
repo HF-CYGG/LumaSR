@@ -4,7 +4,7 @@ struct SuperResRuntimeInferenceControl {
     int commandBatchSize = 1;
     int thermalHeadroomPercent = 0;
     bool shouldPause = false;
-    // Telemetry-only for Wave2; command submission remains intentionally serial.
+    // A value of two is the sole opt-in signal for the ordered Vulkan producer/consumer path.
     int maxPipelineDepth = 1;
 };
 
