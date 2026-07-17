@@ -135,10 +135,14 @@ data class RuntimePipelineDepthDecision(
     val twoSlotBytes: Long? = null
 )
 
-class RuntimePipelineDepthPolicy(
+class RuntimePipelineDepthPolicy private constructor(
     private val estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator,
     private val depthTwoApproved: (UpscaleParams) -> Boolean = { false }
 ) {
+    constructor(
+        estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
+    ) : this(estimator, { false })
+
     fun decide(
         params: UpscaleParams,
         thermalLevel: ThermalLevel,
@@ -200,6 +204,12 @@ class RuntimePipelineDepthPolicy(
         const val MAX_TWO_SLOT_BYTES = 128L * 1024L * 1024L
         const val GPU_HEAP_PERCENT = 25
         const val AVAILABLE_RAM_PERCENT = 15
+
+        // Test-only seam. Production enablement must be wired to persisted device benchmark evidence.
+        internal fun approvedForTesting(
+            estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator,
+            depthTwoApproved: (UpscaleParams) -> Boolean
+        ) = RuntimePipelineDepthPolicy(estimator, depthTwoApproved)
 
         internal fun percentBudget(resourceBytes: Long, percent: Int): Long {
             if (resourceBytes <= 0L || percent <= 0) return 0L

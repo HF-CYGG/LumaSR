@@ -13,7 +13,7 @@ class RuntimePipelineDepthPolicyTest {
 
         val defaultDecision = RuntimePipelineDepthPolicy(estimator)
             .decide(params(), ThermalLevel.NORMAL, resources)
-        val approvedDecision = RuntimePipelineDepthPolicy(
+        val approvedDecision = RuntimePipelineDepthPolicy.approvedForTesting(
             estimator = estimator,
             depthTwoApproved = { true }
         ).decide(params(), ThermalLevel.NORMAL, resources)
@@ -24,6 +24,21 @@ class RuntimePipelineDepthPolicyTest {
             defaultDecision.reason
         )
         assertEquals(2, approvedDecision.maxPipelineDepth)
+    }
+
+    @Test
+    fun benchmarkApprovalFailureKeepsDepthTwoDisabled() {
+        val decision = RuntimePipelineDepthPolicy.approvedForTesting(
+            estimator = RuntimePipelineSlotEstimator { syntheticEstimate(1L) },
+            depthTwoApproved = { error("benchmark evidence unavailable") }
+        ).decide(
+            params = params(),
+            thermalLevel = ThermalLevel.NORMAL,
+            resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
+        )
+
+        assertEquals(1, decision.maxPipelineDepth)
+        assertEquals(RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED, decision.reason)
     }
 
     @Test
@@ -236,7 +251,10 @@ class RuntimePipelineDepthPolicyTest {
 
     private fun approvedPolicy(
         estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
-    ) = RuntimePipelineDepthPolicy(estimator = estimator, depthTwoApproved = { true })
+    ) = RuntimePipelineDepthPolicy.approvedForTesting(
+        estimator = estimator,
+        depthTwoApproved = { true }
+    )
 
     private fun syntheticEstimate(twoSlotBytes: Long) = RuntimePipelineSlotEstimate(
         inputRgbBytes = 0L,

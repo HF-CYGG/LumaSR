@@ -213,6 +213,24 @@ class SuperResProcessingTaskRunnerTest {
     }
 
     @Test
+    fun defaultRuntimeDepthPolicyRejectsDepthTwoWithAbundantResources() = runBlocking {
+        val processor = RecordingProcessor()
+        val runner = SuperResProcessingTaskRunner(
+            processor = processor,
+            thermalLevelProvider = { ThermalLevel.NORMAL },
+            runtimeResourceProvider = RuntimePipelineResourceProvider { abundantResources() },
+            executionProfileResolver = passthroughResolver()
+        )
+
+        assertEquals(
+            ProcessingRunResult.Completed,
+            runner.run(task("depth-default-gate"), spec("depth-default-gate")) {}
+        )
+
+        assertEquals(1, processor.controls.single().maxPipelineDepth)
+    }
+
+    @Test
     fun criticalThermalFailsRetryablyWithoutStartingNativeWork() = runBlocking {
         val processor = RecordingProcessor()
         val runner = SuperResProcessingTaskRunner(
@@ -415,7 +433,7 @@ class SuperResProcessingTaskRunnerTest {
         isLowRamDevice = false
     )
 
-    private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy(
+    private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy.approvedForTesting(
         estimator = RuntimePipelineSlotEstimator {
             RuntimePipelineSlotEstimate(
                 inputRgbBytes = 0L,
