@@ -136,7 +136,13 @@ class InferenceExecutionProfileResolverTest {
     fun mapsEveryQualifiedExecutionFieldIntoPersistableParams() = runBlocking {
         val base = params()
         val identity = identity(base)
-        val repository = FakeBenchmarkRepository(benchmark(identity, batchSize = 8))
+        val repository = FakeBenchmarkRepository(
+            benchmark(
+                identity,
+                batchSize = 8,
+                cpuProfiles = cpuResolutionProfiles()
+            )
+        )
         val resolver = resolver(repository = repository)
 
         val resolved = resolver.resolve("model-a", base, nowEpochMs = 1_500L)
@@ -182,6 +188,100 @@ class InferenceExecutionProfileResolverTest {
         assertEquals(256 to 4, standardAtUpperBound.tileSize to standardAtUpperBound.commandBatchSize)
         assertEquals(128 to 2, large.tileSize to large.commandBatchSize)
         assertEquals(256 to 4, missingPixels.tileSize to missingPixels.commandBatchSize)
+    }
+
+    @Test
+    fun explicitCpuAppliesEveryTieredCpuExecutionControl() = runBlocking {
+        val base = params().copy(
+            accelerationMode = AccelerationMode.CPU,
+            cpuThreads = 3,
+            openmpBlocktimeMs = 33,
+            postprocessThreads = 3
+        )
+        val resolver = resolver(
+            repository = FakeBenchmarkRepository(
+                benchmark(identity(base), cpuProfiles = cpuResolutionProfiles())
+            )
+        )
+
+        val small = resolver.resolve("model-a", base, 1_500L, outputPixels = 7_999_999L)
+        val standard = resolver.resolve("model-a", base, 1_500L, outputPixels = 8_000_000L)
+        val large = resolver.resolve("model-a", base, 1_500L, outputPixels = 24_000_001L)
+
+        assertEquals(listOf(768, 256, 128), listOf(small.tileSize, standard.tileSize, large.tileSize))
+        assertEquals(listOf(2, 4, 6), listOf(small.cpuThreads, standard.cpuThreads, large.cpuThreads))
+        assertEquals(
+            listOf(0, 20, 50),
+            listOf(small.openmpBlocktimeMs, standard.openmpBlocktimeMs, large.openmpBlocktimeMs)
+        )
+        assertEquals(
+            listOf(1, 2, 4),
+            listOf(small.postprocessThreads, standard.postprocessThreads, large.postprocessThreads)
+        )
+        listOf(small, standard, large).forEach { resolved ->
+            assertEquals(AccelerationMode.CPU, resolved.accelerationMode)
+            assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+            assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
+        }
+    }
+
+    @Test
+    fun vulkanAndAutoCarryCpuFallbackControlsWithoutReplacingVulkanTile() = runBlocking {
+        val base = params().copy(
+            cpuThreads = 3,
+            openmpBlocktimeMs = 33,
+            postprocessThreads = 3
+        )
+        val benchmark = benchmark(
+            identity = identity(base),
+            profiles = resolutionProfiles(),
+            cpuProfiles = cpuResolutionProfiles()
+        )
+        val resolver = resolver(FakeBenchmarkRepository(benchmark))
+
+        val vulkan = resolver.resolve("model-a", base, 1_500L, outputPixels = 7_999_999L)
+        val auto = resolver.resolve(
+            "model-a",
+            base.copy(accelerationMode = AccelerationMode.AUTO),
+            1_500L,
+            outputPixels = 7_999_999L
+        )
+
+        listOf(vulkan, auto).forEach { resolved ->
+            assertEquals(768, resolved.tileSize)
+            assertEquals(8, resolved.commandBatchSize)
+            assertEquals(2, resolved.cpuThreads)
+            assertEquals(0, resolved.openmpBlocktimeMs)
+            assertEquals(1, resolved.postprocessThreads)
+        }
+    }
+
+    @Test
+    fun missingCpuTierPreservesOriginalFallbackControls() = runBlocking {
+        val base = params().copy(
+            accelerationMode = AccelerationMode.CPU,
+            cpuThreads = 3,
+            openmpBlocktimeMs = 33,
+            postprocessThreads = 3
+        )
+        val benchmark = benchmark(
+            identity = identity(base),
+            cpuProfiles = listOf(cpuResolutionProfiles().first())
+        )
+
+        val resolved = resolver(FakeBenchmarkRepository(benchmark)).resolve(
+            "model-a",
+            base,
+            1_500L,
+            outputPixels = 24_000_001L
+        )
+
+        assertEquals(base.tileSize, resolved.tileSize)
+        assertEquals(base.cpuThreads, resolved.cpuThreads)
+        assertEquals(base.openmpBlocktimeMs, resolved.openmpBlocktimeMs)
+        assertEquals(base.postprocessThreads, resolved.postprocessThreads)
+        assertEquals(NativeBackend.LEGACY_SAFE, resolved.nativeBackend)
+        assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
     }
 
     @Test
@@ -318,20 +418,28 @@ class InferenceExecutionProfileResolverTest {
         identity: BenchmarkIdentity,
         batchSize: Int = 4,
         validUntil: Long = 2_000L,
-        profiles: List<CalibratedVulkanProfile> = emptyList()
+        profiles: List<CalibratedVulkanProfile> = emptyList(),
+        cpuProfiles: List<CalibratedCpuProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
         recommendedCommandBatchSize = batchSize,
         measuredAtEpochMs = 1_000L,
         validUntilEpochMs = validUntil,
-        vulkanProfiles = profiles
+        vulkanProfiles = profiles,
+        cpuProfiles = cpuProfiles
     )
 
     private fun resolutionProfiles() = listOf(
         CalibratedVulkanProfile(ResolutionTier.SMALL, tileSize = 768, commandBatchSize = 8),
         CalibratedVulkanProfile(ResolutionTier.STANDARD, tileSize = 256, commandBatchSize = 4),
         CalibratedVulkanProfile(ResolutionTier.LARGE, tileSize = 128, commandBatchSize = 2)
+    )
+
+    private fun cpuResolutionProfiles() = listOf(
+        CalibratedCpuProfile(ResolutionTier.SMALL, 768, 2, 0, 1),
+        CalibratedCpuProfile(ResolutionTier.STANDARD, 256, 4, 20, 2),
+        CalibratedCpuProfile(ResolutionTier.LARGE, 128, 6, 50, 4)
     )
 
     private fun device() = DeviceCapabilityProfile(

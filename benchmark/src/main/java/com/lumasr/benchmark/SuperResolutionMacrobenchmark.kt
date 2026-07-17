@@ -679,7 +679,7 @@ class SuperResolutionMacrobenchmark {
         const val PICKER_TIMEOUT_MS = 30_000L
         const val NATIVE_LOG_TIMEOUT_MS = 5_000L
         const val NATIVE_LOG_SETTLE_MS = 250L
-        const val CALIBRATION_TIMEOUT_MS = 70_000L
+        const val CALIBRATION_TIMEOUT_MS = 6L * 60L * 1_000L
         const val FIRST_RUN_PROMPT_TIMEOUT_MS = 3_000L
         val NATIVE_FIELD_PATTERN = Regex("([A-Za-z][A-Za-z0-9]*)=([^\\s]+)")
         val NATIVE_OUTPUT_FIELDS = listOf(

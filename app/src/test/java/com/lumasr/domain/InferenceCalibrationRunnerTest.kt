@@ -20,6 +20,417 @@ import org.junit.Test
 
 class InferenceCalibrationRunnerTest {
     @Test
+    fun defaultCalibrationBoundsCpuThreadGridAndReservesAtomicRunBudget() {
+        assertEquals(listOf(1, 2, 4), CpuCalibrationCandidates().cpuThreads)
+        assertEquals(5L * 60L * 1_000L, InferenceCalibrationRunner.DEFAULT_TIMEOUT_MS)
+    }
+
+    @Test
+    fun defaultCalibrationPublishesCpuProfilesForEveryResolutionTier() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    val duration = if (params.accelerationMode == AccelerationMode.CPU) {
+                        var cpuDuration = 1_200L
+                        if (params.tileSize == 64) cpuDuration -= 100L
+                        if (params.cpuThreads == 2) cpuDuration -= 100L
+                        if (params.openmpBlocktimeMs == 0) cpuDuration -= 100L
+                        if (params.postprocessThreads == 2) cpuDuration -= 100L
+                        cpuDuration
+                    } else {
+                        successfulDuration(params)
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        duration
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            workloadOutputEdges = ResolutionTier.entries.associateWith { 128 },
+            availableHeapBytesProvider = { Long.MAX_VALUE }
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(
+            listOf(ResolutionTier.SMALL, ResolutionTier.STANDARD, ResolutionTier.LARGE),
+            repository.saved.single().cpuProfiles.map(CalibratedCpuProfile::resolutionTier)
+        )
+        repository.saved.single().cpuProfiles.forEach { profile ->
+            assertEquals(64, profile.tileSize)
+            assertEquals(2, profile.cpuThreads)
+            assertEquals(0, profile.openmpBlocktimeMs)
+            assertEquals(2, profile.postprocessThreads)
+        }
+    }
+
+    @Test
+    fun cpuCalibrationSearchesTileThreadsBlocktimeAndPostprocessInOrder() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuRequests = mutableListOf<UpscaleParams>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.accelerationMode == AccelerationMode.CPU) cpuRequests += params
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            cpuCalibrationCandidates = CpuCalibrationCandidates(
+                tileSizes = listOf(64, 128),
+                cpuThreads = listOf(1, 2),
+                openmpBlocktimeMs = listOf(0, 20),
+                postprocessThreads = listOf(1, 2),
+                includeDeviceTopologyThreads = false
+            )
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val firstTier = cpuRequests.take(6)
+        assertEquals(6, firstTier.size)
+        assertEquals(128 to 4, firstTier[0].tileSize to firstTier[0].cpuThreads)
+        assertEquals(64, firstTier[1].tileSize)
+        assertEquals(listOf(1, 2), firstTier.subList(2, 4).map(UpscaleParams::cpuThreads))
+        assertEquals(0, firstTier[4].openmpBlocktimeMs)
+        assertEquals(2, firstTier[5].postprocessThreads)
+        assertEquals(1, firstTier[5].commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, firstTier[5].nativeBackend)
+        assertEquals(InferencePrecision.FP32, firstTier[5].inferencePrecision)
+    }
+
+    @Test
+    fun cpuCalibrationRequiresFivePercentUpgradeAndKeepsConservativeTie() = runBlocking {
+        suspend fun calibratedTile(candidateDuration: Long): Int {
+            val repository = RecordingBenchmarkRepository()
+            val baseRequest = request(outputScale = 1).let { calibrationRequest ->
+                calibrationRequest.copy(baseParams = calibrationRequest.baseParams.copy(tileSize = 512))
+            }
+            val runner = testRunner(
+                probe = object : InferenceCalibrationProbe {
+                    override suspend fun run(
+                        input: RgbImage,
+                        params: UpscaleParams
+                    ): CalibrationProbeOutput {
+                        val duration = when {
+                            params.accelerationMode == AccelerationMode.CPU &&
+                                params.tileSize in setOf(64, 128) -> candidateDuration
+                            params.accelerationMode == AccelerationMode.CPU -> 1_000L
+                            else -> successfulDuration(params)
+                        }
+                        return CalibrationProbeOutput(
+                            RgbImage(input.width, input.height, input.copyBytes()),
+                            duration
+                        )
+                    }
+
+                    override fun cancel(taskId: String) = Unit
+                },
+                repository = repository,
+                cpuCalibrationCandidates = CpuCalibrationCandidates(
+                    tileSizes = listOf(64, 128),
+                    cpuThreads = listOf(4),
+                    openmpBlocktimeMs = listOf(20),
+                    postprocessThreads = listOf(1)
+                )
+            )
+
+            assertTrue(runner.run(baseRequest) is CalibrationRunResult.Completed)
+            return repository.saved.single().cpuProfiles.first().tileSize
+        }
+
+        assertEquals(512, calibratedTile(candidateDuration = 951L))
+        assertEquals(64, calibratedTile(candidateDuration = 950L))
+    }
+
+    @Test
+    fun defaultCpuCandidatesIncludePhysicalCoreLimit() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuThreads = mutableListOf<Int>()
+        val runner = InferenceCalibrationRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.accelerationMode == AccelerationMode.CPU) {
+                        cpuThreads += params.cpuThreads
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            workloadOutputEdges = ResolutionTier.entries.associateWith { 128 },
+            availableHeapBytesProvider = { Long.MAX_VALUE }
+        )
+        val sixCoreRequest = request(outputScale = 1).let { calibrationRequest ->
+            calibrationRequest.copy(
+                device = calibrationRequest.device.copy(
+                    physicalCoreCount = 6,
+                    bigCoreCount = 4,
+                    littleCoreCount = 2
+                )
+            )
+        }
+
+        assertTrue(runner.run(sixCoreRequest) is CalibrationRunResult.Completed)
+        assertTrue(cpuThreads.contains(6))
+    }
+
+    @Test
+    fun cpuOnlyDeviceDoesNotPublishBenchmarkWithInventedFp16Quality() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val probeCount = AtomicInteger(0)
+        val runner = InferenceCalibrationRunner(
+            probe = successfulProbe(probeCount),
+            repository = repository,
+            workloadOutputEdges = ResolutionTier.entries.associateWith { 128 },
+            availableHeapBytesProvider = { Long.MAX_VALUE }
+        )
+        val cpuOnlyRequest = request(outputScale = 1).let { calibrationRequest ->
+            calibrationRequest.copy(
+                device = calibrationRequest.device.copy(
+                    supportsVulkan = false,
+                    supportsFp16Storage = false,
+                    supportsFp16Arithmetic = false
+                )
+            )
+        }
+
+        val result = runner.run(cpuOnlyRequest)
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE),
+            result
+        )
+        assertEquals(0, probeCount.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun fasterCpuCandidateWithRejectedPixelQualityIsNotSelected() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    val corruptCandidate = params.accelerationMode == AccelerationMode.CPU &&
+                        params.tileSize == 64
+                    return CalibrationProbeOutput(
+                        image = if (corruptCandidate) {
+                            RgbImage(
+                                input.width,
+                                input.height,
+                                ByteArray(input.byteCount) { 255.toByte() }
+                            )
+                        } else {
+                            RgbImage(input.width, input.height, input.copyBytes())
+                        },
+                        durationNanos = if (corruptCandidate) 1L else successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            cpuCalibrationCandidates = CpuCalibrationCandidates(
+                tileSizes = listOf(64, 128),
+                cpuThreads = listOf(4),
+                openmpBlocktimeMs = listOf(20),
+                postprocessThreads = listOf(1),
+                includeDeviceTopologyThreads = false
+            )
+        )
+
+        assertTrue(runner.run(request(outputScale = 1)) is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().cpuProfiles.all { it.tileSize == 128 })
+    }
+
+    @Test
+    fun cpuProbeFailureAfterCompletedTierPublishesNoPartialProfiles() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput? {
+                    if (params.accelerationMode == AccelerationMode.CPU && input.width == 256) {
+                        return null
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            workloadOutputEdges = mapOf(
+                ResolutionTier.SMALL to 128,
+                ResolutionTier.STANDARD to 256,
+                ResolutionTier.LARGE to 384
+            ),
+            cpuCalibrationCandidates = CpuCalibrationCandidates(
+                tileSizes = listOf(128),
+                cpuThreads = listOf(4),
+                openmpBlocktimeMs = listOf(20),
+                postprocessThreads = listOf(1)
+            )
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED),
+            result
+        )
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun thermalAbortInsideCpuCalibrationPublishesNoProfiles() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuProbeCount = AtomicInteger(0)
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.accelerationMode == AccelerationMode.CPU) {
+                        cpuProbeCount.incrementAndGet()
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            thermalLevelProvider = {
+                if (cpuProbeCount.get() > 0) ThermalLevel.MODERATE else ThermalLevel.NORMAL
+            },
+            cpuCalibrationCandidates = baselineOnlyCpuCandidates()
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Failed)
+        assertEquals(1, cpuProbeCount.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun heapDropAfterOneCpuTierPublishesNoPartialProfiles() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuProbeCount = AtomicInteger(0)
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    if (params.accelerationMode == AccelerationMode.CPU) {
+                        cpuProbeCount.incrementAndGet()
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            availableHeapBytesProvider = {
+                if (cpuProbeCount.get() > 0) 0L else Long.MAX_VALUE
+            },
+            cpuCalibrationCandidates = baselineOnlyCpuCandidates()
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+            result
+        )
+        assertEquals(1, cpuProbeCount.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun timeoutDuringCpuCalibrationCancelsProbeAndPublishesNothing() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuStarted = CompletableDeferred<Unit>()
+        val cancelled = mutableListOf<String>()
+        val runner = testRunner(
+            probe = blockingCpuProbe(cpuStarted, cancelled),
+            repository = repository,
+            timeoutMs = 250L,
+            cpuCalibrationCandidates = baselineOnlyCpuCandidates()
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.TimedOut)
+        assertTrue(cpuStarted.isCompleted)
+        awaitNativeCancel(cancelled)
+        assertEquals(1, cancelled.size)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun callerCancellationDuringCpuCalibrationRethrowsAndPublishesNothing() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cpuStarted = CompletableDeferred<Unit>()
+        val cancelled = mutableListOf<String>()
+        val runner = testRunner(
+            probe = blockingCpuProbe(cpuStarted, cancelled),
+            repository = repository,
+            timeoutMs = 5_000L,
+            cpuCalibrationCandidates = baselineOnlyCpuCandidates()
+        )
+        val job = async { runner.run(request(outputScale = 1)) }
+        assertTrue(withTimeoutOrNull(1_000L) { cpuStarted.await(); true } == true)
+
+        job.cancel()
+        val failure = runCatching { job.await() }.exceptionOrNull()
+
+        assertTrue(failure is CancellationException)
+        awaitNativeCancel(cancelled)
+        assertEquals(1, cancelled.size)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
     fun calibrationPatternCoversAtLeastNine128PixelTiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         var firstInput: RgbImage? = null
@@ -76,7 +487,8 @@ class InferenceCalibrationRunnerTest {
                 override fun cancel(taskId: String) = Unit
             },
             repository = repository,
-            availableHeapBytesProvider = { Long.MAX_VALUE }
+            availableHeapBytesProvider = { Long.MAX_VALUE },
+            cpuCalibrationCandidates = null
         )
 
         val result = runner.run(request(outputScale = 4))
@@ -1080,7 +1492,8 @@ class InferenceCalibrationRunnerTest {
         thermalLevelProvider: () -> ThermalLevel? = { ThermalLevel.NORMAL },
         workloadOutputEdges: Map<ResolutionTier, Int> = ResolutionTier.entries.associateWith { 512 },
         availableHeapBytesProvider: () -> Long? = { Long.MAX_VALUE },
-        calibrationPatternFactory: (Int, Int, Long) -> RgbImage = SyntheticCalibrationPattern::generate
+        calibrationPatternFactory: (Int, Int, Long) -> RgbImage = SyntheticCalibrationPattern::generate,
+        cpuCalibrationCandidates: CpuCalibrationCandidates? = null
     ): InferenceCalibrationRunner = InferenceCalibrationRunner(
         probe = probe,
         repository = repository,
@@ -1088,7 +1501,8 @@ class InferenceCalibrationRunnerTest {
         thermalLevelProvider = thermalLevelProvider,
         workloadOutputEdges = workloadOutputEdges,
         availableHeapBytesProvider = availableHeapBytesProvider,
-        calibrationPatternFactory = calibrationPatternFactory
+        calibrationPatternFactory = calibrationPatternFactory,
+        cpuCalibrationCandidates = cpuCalibrationCandidates
     )
 
     private fun successfulProbe(
@@ -1122,6 +1536,37 @@ class InferenceCalibrationRunnerTest {
         params.tileSize == 512 -> 690L
         params.tileSize == 768 -> 680L
         else -> 670L
+    }
+
+    private fun baselineOnlyCpuCandidates() = CpuCalibrationCandidates(
+        tileSizes = listOf(128),
+        cpuThreads = listOf(4),
+        openmpBlocktimeMs = listOf(20),
+        postprocessThreads = listOf(1)
+    )
+
+    private fun blockingCpuProbe(
+        cpuStarted: CompletableDeferred<Unit>,
+        cancelled: MutableList<String>
+    ) = object : InferenceCalibrationProbe {
+        override suspend fun run(
+            input: RgbImage,
+            params: UpscaleParams
+        ): CalibrationProbeOutput {
+            if (params.accelerationMode == AccelerationMode.CPU) {
+                cpuStarted.complete(Unit)
+                delay(5_000L)
+                error("unreachable")
+            }
+            return CalibrationProbeOutput(
+                RgbImage(input.width, input.height, input.copyBytes()),
+                successfulDuration(params)
+            )
+        }
+
+        override fun cancel(taskId: String) {
+            cancelled += taskId
+        }
     }
 
     private data class RecordedProbeRequest(

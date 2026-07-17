@@ -217,12 +217,21 @@ class InferenceExecutionProfileResolver(
         nowEpochMs: Long = 0L,
         outputPixels: Long? = null
     ): UpscaleParams {
-        val calibratedVulkanProfile = runCatching {
+        val resolutionTier = runCatching {
             ResolutionTier.fromOutputPixels(outputPixels)
-        }.getOrNull()?.let { tier ->
+        }.getOrNull()
+        val calibratedVulkanProfile = resolutionTier?.let { tier ->
             benchmark?.vulkanProfiles?.singleOrNull { it.resolutionTier == tier }
         }
-        val profile = AdaptiveInferencePolicy.selectExecutionProfile(
+        val calibratedCpuProfile = resolutionTier?.let { tier ->
+            benchmark?.cpuProfiles?.singleOrNull { it.resolutionTier == tier }
+        }?.takeIf {
+            benchmark != null &&
+                identity != null &&
+                AdaptiveInferencePolicy.isBenchmarkValid(benchmark.identity, identity) &&
+                nowEpochMs in benchmark.measuredAtEpochMs..benchmark.validUntilEpochMs
+        }
+        val selectedProfile = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device,
             accelerationMode = params.accelerationMode,
             ttaEnabled = params.tta,
@@ -231,9 +240,18 @@ class InferenceExecutionProfileResolver(
             currentSafeTileSize = params.tileSize,
             nowEpochMs = nowEpochMs,
             calibratedVulkanProfile = calibratedVulkanProfile
-        ).copy(
-            openmpBlocktimeMs = params.openmpBlocktimeMs,
-            postprocessThreads = params.postprocessThreads
+        )
+        val profile = selectedProfile.copy(
+            tileSize = if (params.accelerationMode == AccelerationMode.CPU) {
+                calibratedCpuProfile?.tileSize ?: selectedProfile.tileSize
+            } else {
+                selectedProfile.tileSize
+            },
+            cpuThreads = calibratedCpuProfile?.cpuThreads ?: params.cpuThreads,
+            openmpBlocktimeMs = calibratedCpuProfile?.openmpBlocktimeMs
+                ?: params.openmpBlocktimeMs,
+            postprocessThreads = calibratedCpuProfile?.postprocessThreads
+                ?: params.postprocessThreads
         )
         return InferenceExecutionProfileMapper.apply(params, profile)
     }

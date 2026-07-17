@@ -39,6 +39,47 @@ data class InferenceCalibrationRequest(
     }
 }
 
+data class CpuCalibrationCandidates(
+    val tileSizes: List<Int> = UpscaleParamsFactory.supportedTileSizes.sorted(),
+    val cpuThreads: List<Int> = listOf(1, 2, 4),
+    val openmpBlocktimeMs: List<Int> = listOf(0, 20, 50),
+    val postprocessThreads: List<Int> = listOf(1, 2, 4),
+    val includeDeviceTopologyThreads: Boolean = true
+) {
+    init {
+        requireCandidateList(tileSizes, MAX_TILE_CANDIDATES, "CPU tile") {
+            it in UpscaleParamsFactory.supportedTileSizes
+        }
+        requireCandidateList(cpuThreads, MAX_THREAD_CANDIDATES, "CPU thread") { it in 1..64 }
+        requireCandidateList(openmpBlocktimeMs, MAX_BLOCKTIME_CANDIDATES, "OpenMP blocktime") {
+            it in 0..100
+        }
+        requireCandidateList(
+            postprocessThreads,
+            MAX_THREAD_CANDIDATES,
+            "Postprocess thread"
+        ) { it in 1..64 }
+    }
+
+    private fun requireCandidateList(
+        values: List<Int>,
+        maximumSize: Int,
+        label: String,
+        isSupported: (Int) -> Boolean
+    ) {
+        require(values.isNotEmpty()) { "$label candidates must not be empty" }
+        require(values.size <= maximumSize) { "$label candidates exceed the reviewed bound" }
+        require(values.distinct().size == values.size) { "$label candidates must be unique" }
+        require(values.all(isSupported)) { "$label candidates contain an unsupported value" }
+    }
+
+    private companion object {
+        const val MAX_TILE_CANDIDATES = 8
+        const val MAX_THREAD_CANDIDATES = 8
+        const val MAX_BLOCKTIME_CANDIDATES = 4
+    }
+}
+
 enum class CalibrationFailureReason {
     UNSUPPORTED_DEVICE,
     RESOURCE_CONSTRAINED,
@@ -64,7 +105,8 @@ class InferenceCalibrationRunner(
     private val workloadOutputEdges: Map<ResolutionTier, Int> = DEFAULT_WORKLOAD_OUTPUT_EDGES,
     private val availableHeapBytesProvider: () -> Long? = { currentAvailableHeapBytes() },
     private val calibrationPatternFactory: (Int, Int, Long) -> RgbImage =
-        SyntheticCalibrationPattern::generate
+        SyntheticCalibrationPattern::generate,
+    private val cpuCalibrationCandidates: CpuCalibrationCandidates? = CpuCalibrationCandidates()
 ) {
     init {
         require(timeoutMs > 0L) { "Calibration timeout must be positive" }
@@ -138,10 +180,19 @@ class InferenceCalibrationRunner(
         taskId: String
     ): CalibrationPreparation {
         val selectedByTier = linkedMapOf<ResolutionTier, MeasuredVulkanCandidate>()
+        val selectedCpuByTier = linkedMapOf<ResolutionTier, MeasuredCpuCandidate>()
         for (tier in ResolutionTier.entries) {
             when (val result = calibrateTier(request, taskId, tier)) {
                 is CandidateProbeResult.Ready -> selectedByTier[tier] = result.candidate
                 is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+            }
+            if (cpuCalibrationCandidates != null) {
+                when (val result = calibrateCpuTier(request, taskId, tier, cpuCalibrationCandidates)) {
+                    is CpuCandidateProbeResult.Ready -> selectedCpuByTier[tier] = result.candidate
+                    is CpuCandidateProbeResult.Failed -> {
+                        return CalibrationPreparation.Failed(result.reason)
+                    }
+                }
             }
         }
 
@@ -159,9 +210,191 @@ class InferenceCalibrationRunner(
                     tileSize = selected.tileSize,
                     commandBatchSize = selected.commandBatchSize
                 )
+            },
+            cpuProfiles = selectedCpuByTier.map { (tier, selected) ->
+                CalibratedCpuProfile(
+                    resolutionTier = tier,
+                    tileSize = selected.tileSize,
+                    cpuThreads = selected.cpuThreads,
+                    openmpBlocktimeMs = selected.openmpBlocktimeMs,
+                    postprocessThreads = selected.postprocessThreads
+                )
             }
         )
         return CalibrationPreparation.Ready(benchmark)
+    }
+
+    private suspend fun calibrateCpuTier(
+        request: InferenceCalibrationRequest,
+        taskId: String,
+        tier: ResolutionTier,
+        candidates: CpuCalibrationCandidates
+    ): CpuCandidateProbeResult {
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!hasSufficientHeapFor(tier)) {
+            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val inputEdge = calibrationInputEdge(tier, request.baseParams.scale)
+        val pattern = calibrationPatternFactory(
+            inputEdge,
+            inputEdge,
+            CPU_PATTERN_SEED xor tier.ordinal.toLong()
+        )
+        val physicalCoreLimit = request.device.physicalCoreCount.coerceIn(1, 64)
+        val baselineParams = request.baseParams.copy(
+            taskId = taskId,
+            tileSize = UpscaleParamsFactory.sanitizeTileSize(request.baseParams.tileSize),
+            accelerationMode = AccelerationMode.CPU,
+            nativeBackend = NativeBackend.LEGACY_SAFE,
+            inferencePrecision = InferencePrecision.FP32,
+            cpuThreads = request.baseParams.cpuThreads
+                .takeIf { it > 0 }
+                ?.coerceAtMost(physicalCoreLimit)
+                ?: minOf(DEFAULT_CPU_THREADS, physicalCoreLimit),
+            openmpBlocktimeMs = request.baseParams.openmpBlocktimeMs.coerceIn(0, 100),
+            postprocessThreads = request.baseParams.postprocessThreads
+                .coerceIn(1, physicalCoreLimit),
+            commandBatchSize = 1,
+            modelCacheCapacity = 1,
+            tta = false,
+            pipelinePasses = emptyList()
+        )
+        ensureCalibrationThermallySafe()
+        if (!hasSufficientHeapFor(tier)) {
+            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val baselineOutput = probe.run(pattern, baselineParams)
+            ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!baselineOutput.hasExpectedShape(pattern, baselineParams.scale) ||
+            baselineOutput.durationNanos <= 0L
+        ) {
+            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        var selected = MeasuredCpuCandidate.from(
+            params = baselineParams,
+            durationNanos = baselineOutput.durationNanos,
+            quality = PERFECT_CPU_REFERENCE_QUALITY
+        )
+
+        return try {
+            selected = searchCpuStage(
+                tier = tier,
+                pattern = pattern,
+                reference = baselineOutput,
+                baselineParams = selected.applyTo(baselineParams),
+                candidateValues = candidates.tileSizes.sorted(),
+                applyValue = { params, value -> params.copy(tileSize = value) },
+                selected = selected,
+                device = request.device
+            )
+            val topologyThreads = if (candidates.includeDeviceTopologyThreads) {
+                listOfNotNull(request.device.bigCoreCount, request.device.physicalCoreCount)
+            } else {
+                emptyList()
+            }
+            selected = searchCpuStage(
+                tier = tier,
+                pattern = pattern,
+                reference = baselineOutput,
+                baselineParams = selected.applyTo(baselineParams),
+                candidateValues = (candidates.cpuThreads + topologyThreads)
+                    .filter { it <= physicalCoreLimit }
+                    .distinct()
+                    .sorted(),
+                applyValue = { params, value -> params.copy(cpuThreads = value) },
+                selected = selected,
+                device = request.device
+            )
+            selected = searchCpuStage(
+                tier = tier,
+                pattern = pattern,
+                reference = baselineOutput,
+                baselineParams = selected.applyTo(baselineParams),
+                candidateValues = candidates.openmpBlocktimeMs.sorted(),
+                applyValue = { params, value -> params.copy(openmpBlocktimeMs = value) },
+                selected = selected,
+                device = request.device
+            )
+            selected = searchCpuStage(
+                tier = tier,
+                pattern = pattern,
+                reference = baselineOutput,
+                baselineParams = selected.applyTo(baselineParams),
+                candidateValues = candidates.postprocessThreads
+                    .filter { it <= physicalCoreLimit }
+                    .sorted(),
+                applyValue = { params, value -> params.copy(postprocessThreads = value) },
+                selected = selected,
+                device = request.device
+            )
+            CpuCandidateProbeResult.Ready(selected)
+        } catch (failure: CpuCalibrationFailureException) {
+            CpuCandidateProbeResult.Failed(failure.reason)
+        }
+    }
+
+    private suspend fun searchCpuStage(
+        tier: ResolutionTier,
+        pattern: RgbImage,
+        reference: CalibrationProbeOutput,
+        baselineParams: UpscaleParams,
+        candidateValues: List<Int>,
+        applyValue: (UpscaleParams, Int) -> UpscaleParams,
+        selected: MeasuredCpuCandidate,
+        device: DeviceCapabilityProfile
+    ): MeasuredCpuCandidate {
+        var current = selected
+        candidateValues.forEach { value ->
+            val params = applyValue(baselineParams, value)
+            if (
+                MeasuredCpuCandidate.from(
+                    params,
+                    current.durationNanos,
+                    current.quality
+                ).sameControls(current)
+            ) {
+                return@forEach
+            }
+            val measured = when (
+                val result = measureCpuCandidate(tier, pattern, reference, params)
+            ) {
+                is CpuCandidateProbeResult.Ready -> result.candidate
+                is CpuCandidateProbeResult.Failed -> throw CpuCalibrationFailureException(result.reason)
+            }
+            if (AdaptiveInferencePolicy.isFp16Eligible(device, measured.quality) &&
+                isAtLeastFivePercentFaster(measured.durationNanos, current.durationNanos)
+            ) {
+                current = measured
+            }
+        }
+        return current
+    }
+
+    private suspend fun measureCpuCandidate(
+        tier: ResolutionTier,
+        pattern: RgbImage,
+        reference: CalibrationProbeOutput,
+        params: UpscaleParams
+    ): CpuCandidateProbeResult {
+        ensureCalibrationThermallySafe()
+        if (!hasSufficientHeapFor(tier)) {
+            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val output = probe.run(pattern, params)
+            ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!output.hasSameShape(reference) || output.durationNanos <= 0L) {
+            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val quality = RgbQualityEvaluator.evaluate(reference.image, output.image)
+            ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        return CpuCandidateProbeResult.Ready(
+            MeasuredCpuCandidate.from(params, output.durationNanos, quality)
+        )
     }
 
     private suspend fun calibrateTier(
@@ -399,11 +632,21 @@ class InferenceCalibrationRunner(
     }
 
     companion object {
-        const val DEFAULT_TIMEOUT_MS = 40_000L
+        // Vulkan-only calibration previously used 40 seconds. CPU calibration adds four ordered
+        // search stages for every resolution tier, so keep one atomic five-minute budget rather
+        // than making the new default path deterministically time out after the Vulkan phase.
+        const val DEFAULT_TIMEOUT_MS = 5L * 60L * 1_000L
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
         private const val PATTERN_SEED = 0x4c756d615352L
+        private const val CPU_PATTERN_SEED = 0x4350554c756d61L
         private const val MAX_UPGRADE_DURATION_RATIO = 0.95
+        private const val DEFAULT_CPU_THREADS = 4
         private const val MEBIBYTE = 1_024L * 1_024L
+        private val PERFECT_CPU_REFERENCE_QUALITY = Fp16QualityMetrics(
+            ssim = 1.0,
+            psnrDb = Double.POSITIVE_INFINITY,
+            p99ChannelError = 0
+        )
         private val SUPPORTED_TILE_SIZES = UpscaleParamsFactory.supportedTileSizes.sorted()
         private val SUPPORTED_BATCH_SIZES = listOf(1, 2, 4, 8)
         private val DEFAULT_WORKLOAD_OUTPUT_EDGES = mapOf(
@@ -456,6 +699,12 @@ class InferenceCalibrationRunner(
         data class Failed(val reason: CalibrationFailureReason) : CandidateProbeResult
     }
 
+    private sealed interface CpuCandidateProbeResult {
+        data class Ready(val candidate: MeasuredCpuCandidate) : CpuCandidateProbeResult
+
+        data class Failed(val reason: CalibrationFailureReason) : CpuCandidateProbeResult
+    }
+
     private data class MeasuredVulkanCandidate(
         val tileSize: Int,
         val commandBatchSize: Int,
@@ -463,7 +712,48 @@ class InferenceCalibrationRunner(
         val quality: Fp16QualityMetrics
     )
 
+    private data class MeasuredCpuCandidate(
+        val tileSize: Int,
+        val cpuThreads: Int,
+        val openmpBlocktimeMs: Int,
+        val postprocessThreads: Int,
+        val durationNanos: Long,
+        val quality: Fp16QualityMetrics
+    ) {
+        fun applyTo(params: UpscaleParams): UpscaleParams = params.copy(
+            tileSize = tileSize,
+            cpuThreads = cpuThreads,
+            openmpBlocktimeMs = openmpBlocktimeMs,
+            postprocessThreads = postprocessThreads
+        )
+
+        fun sameControls(other: MeasuredCpuCandidate): Boolean =
+            tileSize == other.tileSize &&
+                cpuThreads == other.cpuThreads &&
+                openmpBlocktimeMs == other.openmpBlocktimeMs &&
+                postprocessThreads == other.postprocessThreads
+
+        companion object {
+            fun from(
+                params: UpscaleParams,
+                durationNanos: Long,
+                quality: Fp16QualityMetrics
+            ) = MeasuredCpuCandidate(
+                tileSize = params.tileSize,
+                cpuThreads = params.cpuThreads,
+                openmpBlocktimeMs = params.openmpBlocktimeMs,
+                postprocessThreads = params.postprocessThreads,
+                durationNanos = durationNanos,
+                quality = quality
+            )
+        }
+    }
+
     private class CalibrationThermalAbortException : RuntimeException()
+
+    private class CpuCalibrationFailureException(
+        val reason: CalibrationFailureReason
+    ) : RuntimeException()
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
