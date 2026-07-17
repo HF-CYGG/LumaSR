@@ -2,6 +2,7 @@ package com.lumasr.domain
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class ExtremeExportPlannerTest {
@@ -14,7 +15,9 @@ class ExtremeExportPlannerTest {
             engine = SuperResEngine.REAL_ESRGAN
         )
 
-        assertEquals(512, plan.coreTileSize)
+        assertEquals(512, plan.coreTileWidth)
+        assertTrue(plan.coreBandInputHeight > 0)
+        assertEquals(32L * 1024L * 1024L, plan.rowBandBudgetBytes)
         assertEquals(64, plan.overlap)
         assertEquals(4800, plan.outputWidth)
         assertEquals(3600, plan.outputHeight)
@@ -35,7 +38,7 @@ class ExtremeExportPlannerTest {
             engine = SuperResEngine.REAL_ESRGAN
         )
 
-        assertTrue(plan.coreTileSize < 512)
+        assertTrue(plan.coreTileWidth < 512)
         assertTrue(plan.overlap < 64)
         plan.tiles.forEach { tile ->
             assertTrue(tile.regionW * plan.scale <= ExtremeExportPlanner.MAX_NATIVE_REGION_OUTPUT_SIDE)
@@ -53,7 +56,7 @@ class ExtremeExportPlannerTest {
         )
         val last = plan.tiles.last()
 
-        assertEquals(768, plan.coreTileSize)
+        assertEquals(768, plan.coreTileWidth)
         assertEquals(1025, last.coreX + last.coreW)
         assertEquals(700, last.coreY + last.coreH)
         assertTrue(last.regionX >= 0)
@@ -85,5 +88,112 @@ class ExtremeExportPlannerTest {
         }
 
         assertTrue(covered.all { it })
+    }
+
+    @Test
+    fun selectsFixedRowBandBudgetAtMemoryBoundaries() {
+        val cases = listOf(
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = null) to 32L,
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = 768L * MIB - 1L) to 16L,
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = 768L * MIB) to 32L,
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = 1536L * MIB - 1L) to 32L,
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = 1536L * MIB) to 64L,
+            ProcessingResourceProfile(1024, 1024, availableMemoryBytes = Long.MAX_VALUE) to 64L,
+            ProcessingResourceProfile(1024, 1024, isLowRamDevice = true, availableMemoryBytes = Long.MAX_VALUE) to 16L
+        )
+
+        cases.forEach { (profile, expectedMib) ->
+            val plan = ExtremeExportPlanner.plan(
+                imageWidth = 1024,
+                imageHeight = 1024,
+                scale = 4,
+                engine = SuperResEngine.REAL_ESRGAN,
+                resourceProfile = profile
+            )
+
+            assertEquals(expectedMib * MIB, plan.rowBandBudgetBytes)
+            assertTrue(plan.rowBandBudgetBytes <= 64L * MIB)
+        }
+    }
+
+    @Test
+    fun createsRectangularBandsInStrictRowMajorOrder() {
+        val plan = ExtremeExportPlanner.plan(
+            imageWidth = 4096,
+            imageHeight = 1024,
+            scale = 4,
+            engine = SuperResEngine.REAL_ESRGAN,
+            resourceProfile = ProcessingResourceProfile(
+                imageWidth = 4096,
+                imageHeight = 1024,
+                isLowRamDevice = true,
+                availableMemoryBytes = Long.MAX_VALUE
+            )
+        )
+
+        assertEquals(512, plan.coreTileWidth)
+        assertTrue(plan.coreBandInputHeight < plan.coreTileWidth)
+        assertEquals(plan.tiles.sortedWith(compareBy<ExtremeExportTileSpec> { it.outputY }.thenBy { it.outputX }), plan.tiles)
+        plan.tiles.zipWithNext().forEach { (current, next) ->
+            assertTrue(
+                current.outputY < next.outputY ||
+                    (current.outputY == next.outputY && current.outputX < next.outputX)
+            )
+        }
+        assertEquals(plan.coreBandInputHeight, plan.tiles.first().coreH)
+        assertTrue(plan.tiles.all { it.outputW > 0 && it.outputH > 0 })
+    }
+
+    @Test
+    fun derivesBandHeightFromScaledOutputRowsWithinBudget() {
+        val plan = ExtremeExportPlanner.plan(
+            imageWidth = 4096,
+            imageHeight = 1024,
+            scale = 4,
+            engine = SuperResEngine.REAL_ESRGAN,
+            resourceProfile = ProcessingResourceProfile(
+                imageWidth = 4096,
+                imageHeight = 1024,
+                isLowRamDevice = true
+            )
+        )
+
+        assertEquals(85, plan.coreBandInputHeight)
+        val bandBytes = plan.coreBandInputHeight.toLong() * plan.outputWidth * plan.scale * 3L
+        assertTrue(bandBytes <= plan.rowBandBudgetBytes)
+    }
+
+    @Test
+    fun rejectsPathologicalTileCountBeforeAllocatingTileList() {
+        try {
+            ExtremeExportPlanner.plan(
+                imageWidth = 1_000_000,
+                imageHeight = 1_000_000,
+                scale = 1,
+                engine = SuperResEngine.WAIFU2X
+            )
+            fail("Expected pathological tile count failure")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("tiles", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun rejectsOutputDimensionOverflowInsteadOfWrapping() {
+        try {
+            ExtremeExportPlanner.plan(
+                imageWidth = Int.MAX_VALUE,
+                imageHeight = 2,
+                scale = 2,
+                engine = SuperResEngine.WAIFU2X
+            )
+            fail("Expected checked output dimension failure")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("overflow", ignoreCase = true))
+        }
+    }
+
+    private companion object {
+        const val MIB = 1024L * 1024L
     }
 }

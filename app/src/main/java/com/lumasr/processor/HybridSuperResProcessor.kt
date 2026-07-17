@@ -8,6 +8,7 @@ import android.os.Build
 import android.util.Log
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
+import com.lumasr.domain.ExtremeAccelerationDecision
 import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.ExtremeAccelerationPolicy
 import com.lumasr.domain.ExtremeExportPlanner
@@ -31,12 +32,17 @@ import java.io.File
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 
 fun interface ExtremeRegionSourceFactory {
     fun open(path: String): ExtremeRegionSource?
+}
+
+fun interface ExtremeResourceProfileProvider {
+    fun profile(imageWidth: Int, imageHeight: Int): ProcessingResourceProfile
 }
 
 interface ExtremeRegionSource : AutoCloseable {
@@ -56,6 +62,9 @@ class HybridSuperResProcessor(
     private val supportedAbisProvider: () -> List<String> = { Build.SUPPORTED_ABIS.toList() },
     private val gpuHealthProbe: NativeGpuHealthProbe = NativeGpuHealthProbe { true },
     private val regionSourceFactory: ExtremeRegionSourceFactory = AndroidExtremeRegionSourceFactory,
+    private val extremeResourceProfileProvider: ExtremeResourceProfileProvider = ExtremeResourceProfileProvider { width, height ->
+        ProcessingResourceProfile(width, height)
+    },
     private val onExtremeGpuDisabled: (String) -> Unit = {}
 ) : SuperResProcessor, NativeCacheOwner {
     private val sessionDisabledExtremeGpuKeys = mutableSetOf<String>()
@@ -209,8 +218,6 @@ class HybridSuperResProcessor(
         onProgress: (UpscaleProgress) -> Unit,
         runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
-        val merger = nativeProcessor as? NativeRawTileMerger
-            ?: return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Native PNG merger is unavailable.")
         val regionSource = regionSourceFactory.open(params.inputPath)
             ?: return UpscaleResult(
                 params.taskId,
@@ -219,16 +226,18 @@ class HybridSuperResProcessor(
                 false,
                 UpscaleErrorMapper.userMessage(UpscaleErrorCode.INPUT_UNSUPPORTED)
             )
+        val tempFiles = mutableListOf<File>()
+        try {
+        val resourceProfile = extremeResourceProfileProvider.profile(regionSource.width, regionSource.height)
         val plan = ExtremeExportPlanner.plan(
             imageWidth = regionSource.width,
             imageHeight = regionSource.height,
             scale = params.scale,
-            engine = params.engine
+            engine = params.engine,
+            resourceProfile = resourceProfile
         )
         val taskDir = File(params.outputPath).parentFile ?: File(params.outputPath).absoluteFile.parentFile
-        val tempFiles = mutableListOf<File>()
         val rawTiles = mutableListOf<NativeRawTile>()
-        val resourceProfile = ProcessingResourceProfile(regionSource.width, regionSource.height)
         val accelerationDecision = ExtremeAccelerationPolicy.decide(
             params = params,
             supportedAbis = supportedAbisProvider(),
@@ -246,7 +255,38 @@ class HybridSuperResProcessor(
 
         onProgress(params.progress(UpscaleStage.ANALYZING, "Planning extreme tiled export", 0.02f))
         val bitmapRegionProcessor = nativeProcessor as? NativeBitmapRegionProcessor
-        try {
+        val sessionProcessor = nativeProcessor as? NativeExtremePngSessionProcessor
+        val canUsePngSession = bitmapRegionProcessor != null &&
+            sessionProcessor != null &&
+            params.pipelinePasses.isEmpty() &&
+            params.nativeScalePlan().size == 1 &&
+            !params.inputPath.endsWith(".ppm", ignoreCase = true)
+        run {
+            if (canUsePngSession) {
+                val session = try {
+                    sessionProcessor?.begin(params, plan)
+                } catch (failure: CancellationException) {
+                    throw failure
+                } catch (failure: Exception) {
+                    runCatching {
+                        Log.w(LOG_TAG, "Extreme PNG session unavailable; using raw tile fallback", failure)
+                    }
+                    null
+                }
+                if (session != null) {
+                    return processExtremePngSession(
+                        params = params,
+                        jobs = jobs,
+                        regionSource = regionSource,
+                        session = session,
+                        accelerationDecision = accelerationDecision,
+                        onProgress = onProgress,
+                        runtimeControlProvider = runtimeControlProvider
+                    )
+                }
+            }
+            val merger = nativeProcessor as? NativeRawTileMerger
+                ?: return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Native PNG merger is unavailable.")
             if (bitmapRegionProcessor != null) {
                 jobs.forEachIndexed { index, scheduledJob ->
                     var job = scheduledJob
@@ -412,9 +452,96 @@ class HybridSuperResProcessor(
             } else {
                 UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Extreme PNG merge failed.")
             }
+        }
         } finally {
             regionSource.close()
             tempFiles.forEach { it.delete() }
+        }
+    }
+
+    private suspend fun processExtremePngSession(
+        params: UpscaleParams,
+        jobs: List<com.lumasr.domain.ExtremeTileJob>,
+        regionSource: ExtremeRegionSource,
+        session: NativeExtremePngSession,
+        accelerationDecision: ExtremeAccelerationDecision,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): UpscaleResult {
+        var finished = false
+        var forceCpuForRemainingTiles = false
+        var acceptsSessionProgress = true
+        try {
+            jobs.forEachIndexed { index, scheduledJob ->
+                var job = if (forceCpuForRemainingTiles) {
+                    scheduledJob.copy(accelerationMode = AccelerationMode.CPU)
+                } else {
+                    scheduledJob
+                }
+                val tile = job.tileSpec
+                var regionBitmap: Bitmap? = null
+                try {
+                    regionBitmap = regionSource.decode(tile)
+                    var tileParams = params.forExtremeSessionTile(tile, job.accelerationMode, job.attempt)
+                    var acceptsTileProgress = true
+                    var result = try {
+                        session.processBitmapTile(
+                            params = tileParams,
+                            bitmap = regionBitmap,
+                            tile = tile,
+                            onProgress = { progress ->
+                                if (acceptsSessionProgress && acceptsTileProgress) {
+                                    onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
+                                }
+                            },
+                            runtimeControlProvider = runtimeControlProvider
+                        )
+                    } finally {
+                        acceptsTileProgress = false
+                    }
+                    if (!result.success && accelerationDecision.allowGpuRetry &&
+                        job.accelerationMode != AccelerationMode.CPU && result.isGpuRecoverableFailure()
+                    ) {
+                        disableExtremeGpuForSession(params.extremeGpuKey())
+                        forceCpuForRemainingTiles = true
+                        job = job.asCpuRetry()
+                        tileParams = params.forExtremeSessionTile(tile, job.accelerationMode, job.attempt)
+                        acceptsTileProgress = true
+                        result = try {
+                            session.processBitmapTile(
+                                params = tileParams,
+                                bitmap = regionBitmap,
+                                tile = tile,
+                                onProgress = { progress ->
+                                    if (acceptsSessionProgress && acceptsTileProgress) {
+                                        onProgress(progress.asExtremeTileProgress(index, jobs.size, job.attempt))
+                                    }
+                                },
+                                runtimeControlProvider = runtimeControlProvider
+                            )
+                        } finally {
+                            acceptsTileProgress = false
+                        }
+                    }
+                    if (!result.success) {
+                        return result.copy(taskId = params.taskId)
+                    }
+                } finally {
+                    regionBitmap?.recycle()
+                }
+            }
+
+            onProgress(params.progress(UpscaleStage.SAVING, "Streaming PNG output", 0.96f))
+            acceptsSessionProgress = false
+            if (session.finish() != NativeProcessCode.OK) {
+                return UpscaleResult(params.taskId, UpscaleStage.FAILED, null, false, "Extreme PNG session finalization failed.")
+            }
+            finished = true
+            return UpscaleResult(params.taskId, UpscaleStage.DONE, params.outputPath, true, "Extreme export complete")
+        } finally {
+            acceptsSessionProgress = false
+            if (!finished) session.abort()
+            session.close()
         }
     }
 
@@ -714,6 +841,23 @@ class HybridSuperResProcessor(
             pipelineLabel = pipelineLabel
         )
     }
+
+    private fun UpscaleParams.forExtremeSessionTile(
+        tile: ExtremeExportTileSpec,
+        accelerationMode: AccelerationMode,
+        retryCount: Int
+    ): UpscaleParams = copy(
+        accelerationMode = accelerationMode,
+        retryCount = retryCount,
+        regionIndex = tile.index,
+        exportMode = ExportMode.SAFE_IMAGE,
+        outputMode = NativeOutputMode.PNG_IMAGE,
+        outputCropLeft = tile.outputCropLeft,
+        outputCropTop = tile.outputCropTop,
+        outputCropWidth = tile.outputCropWidth,
+        outputCropHeight = tile.outputCropHeight,
+        pipelinePasses = emptyList()
+    )
 
     private companion object {
         private const val LOG_TAG = "LumaSRPerformance"
