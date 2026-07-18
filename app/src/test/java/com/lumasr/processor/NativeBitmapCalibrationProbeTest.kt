@@ -1,6 +1,7 @@
 package com.lumasr.processor
 
 import android.graphics.Bitmap
+import com.lumasr.domain.CalibrationProbeMeasurement
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.CalibrationProbeOutput
 import com.lumasr.domain.OutputFormat
@@ -28,6 +29,35 @@ import org.junit.rules.TemporaryFolder
 class NativeBitmapCalibrationProbeTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun measuresOutputBoundsWithoutDecodingPixelsAndDeletesTemporaryFile() = runBlocking {
+        val root = temporaryFolder.newFolder("bounds-only")
+        var fullDecodeCalls = 0
+        val processor = RecordingRegionProcessor { params ->
+            File(params.outputPath).writeBytes(byteArrayOf(1, 2, 3))
+            successful(params)
+        }
+        val probe = NativeBitmapCalibrationProbe(
+            processor = processor,
+            cancelNative = {},
+            directory = root,
+            bitmapFactory = { null },
+            outputDecoder = {
+                fullDecodeCalls += 1
+                error("measure must not decode output pixels")
+            },
+            outputBoundsDecoder = { 2_048 to 2_048 },
+            nanoTime = sequenceOf(10L, 40L).iterator()::next
+        )
+
+        val result = probe.measure(RgbImage(1, 1, byteArrayOf(1, 2, 3)), params())
+
+        assertEquals(CalibrationProbeMeasurement(2_048, 2_048, 30L), result)
+        assertEquals(0, fullDecodeCalls)
+        assertTrue(processor.outputExistedDuringRun)
+        assertTrue(root.listFiles().orEmpty().isEmpty())
+    }
 
     @Test
     fun decodesSuccessfulOutputAndDeletesTemporaryFile() = runBlocking {

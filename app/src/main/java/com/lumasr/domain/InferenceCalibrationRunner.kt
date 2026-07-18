@@ -22,8 +22,23 @@ data class CalibrationProbeOutput(
     val durationNanos: Long
 )
 
+data class CalibrationProbeMeasurement(
+    val outputWidth: Int,
+    val outputHeight: Int,
+    val durationNanos: Long
+)
+
 interface InferenceCalibrationProbe {
     suspend fun run(input: RgbImage, params: UpscaleParams): CalibrationProbeOutput?
+
+    suspend fun measure(input: RgbImage, params: UpscaleParams): CalibrationProbeMeasurement? =
+        run(input, params)?.let { output ->
+            CalibrationProbeMeasurement(
+                outputWidth = output.image.width,
+                outputHeight = output.image.height,
+                durationNanos = output.durationNanos
+            )
+        }
 
     fun cancel(taskId: String)
 }
