@@ -22,7 +22,73 @@ class InferenceCalibrationRunnerTest {
     @Test
     fun defaultCalibrationBoundsCpuThreadGridAndReservesAtomicRunBudget() {
         assertEquals(listOf(1, 2, 4), CpuCalibrationCandidates().cpuThreads)
+        assertEquals(
+            listOf(64, 128, 256, 512, 768, 1_024),
+            VulkanCalibrationCandidates().tileSizes
+        )
         assertEquals(5L * 60L * 1_000L, InferenceCalibrationRunner.DEFAULT_TIMEOUT_MS)
+    }
+
+    @Test
+    fun productionCandidateBudgetMeasuresEveryRealTierWithoutExpandingSearchGrid() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val measured = mutableListOf<RecordedProbeRequest>()
+        val outputEdges = mapOf(
+            ResolutionTier.SMALL to 2_048,
+            ResolutionTier.STANDARD to 3_072,
+            ResolutionTier.LARGE to 5_120
+        )
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    image = RgbImage(
+                        input.width * params.scale,
+                        input.height * params.scale,
+                        ByteArray(
+                            input.width * params.scale * input.height * params.scale *
+                                RgbImage.CHANNEL_COUNT
+                        )
+                    ),
+                    durationNanos = successfulDuration(params)
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement {
+                    measured += RecordedProbeRequest(input.width, input.height, params)
+                    return CalibrationProbeMeasurement(
+                        outputWidth = input.width * params.scale,
+                        outputHeight = input.height * params.scale,
+                        durationNanos = successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            workloadOutputEdges = outputEdges,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded(),
+            cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        )
+
+        val result = runner.run(request(outputScale = 2))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(9, measured.size)
+        outputEdges.values.forEach { outputEdge ->
+            val tierRequests = measured.filter { it.inputWidth * it.params.scale == outputEdge }
+            assertEquals(3, tierRequests.size)
+            assertEquals(1, tierRequests.count { it.params.nativeBackend == NativeBackend.OPTIMIZED })
+            assertEquals(1, tierRequests.count { it.params.accelerationMode == AccelerationMode.CPU })
+            assertTrue(tierRequests.all { it.params.tileSize == 128 })
+            assertTrue(tierRequests.all { it.params.commandBatchSize == 1 })
+        }
+        assertEquals(3, repository.saved.single().vulkanProfiles.size)
+        assertEquals(3, repository.saved.single().cpuProfiles.size)
     }
 
     @Test
@@ -1806,6 +1872,7 @@ class InferenceCalibrationRunnerTest {
         workloadOutputEdges: Map<ResolutionTier, Int> = ResolutionTier.entries.associateWith { 512 },
         availableHeapBytesProvider: () -> Long? = { Long.MAX_VALUE },
         calibrationPatternFactory: (Int, Int, Long) -> RgbImage = SyntheticCalibrationPattern::generate,
+        vulkanCalibrationCandidates: VulkanCalibrationCandidates = VulkanCalibrationCandidates(),
         cpuCalibrationCandidates: CpuCalibrationCandidates? = null
     ): InferenceCalibrationRunner = InferenceCalibrationRunner(
         probe = probe,
@@ -1815,6 +1882,7 @@ class InferenceCalibrationRunnerTest {
         workloadOutputEdges = workloadOutputEdges,
         availableHeapBytesProvider = availableHeapBytesProvider,
         calibrationPatternFactory = calibrationPatternFactory,
+        vulkanCalibrationCandidates = vulkanCalibrationCandidates,
         cpuCalibrationCandidates = cpuCalibrationCandidates
     )
 

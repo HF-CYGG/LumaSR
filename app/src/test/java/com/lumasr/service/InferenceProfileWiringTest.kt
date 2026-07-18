@@ -98,6 +98,14 @@ class InferenceProfileWiringTest {
         assertTrue(factory.contains("InferenceCalibrationRunner.currentAvailableHeapBytes()"))
     }
 
+    @Test
+    fun calibrationFactoryUsesBoundedProductionCandidateBudget() {
+        val factory = source("ui/CalibrationAndroidFactory.kt")
+
+        assertTrue(factory.contains("VulkanCalibrationCandidates.productionBounded()"))
+        assertTrue(factory.contains("CpuCalibrationCandidates.baselineOnly()"))
+    }
+
     private fun source(relativePath: String): String = File(
         "src/main/java/com/lumasr/$relativePath"
     ).readText()

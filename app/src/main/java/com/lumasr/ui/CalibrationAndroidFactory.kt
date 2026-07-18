@@ -8,14 +8,16 @@ import com.lumasr.data.DeviceCapabilityRepository
 import com.lumasr.data.FileInferenceBenchmarkRepository
 import com.lumasr.data.ModelManifestRepository
 import com.lumasr.data.ThermalSampler
-import com.lumasr.domain.InferenceExecutionProfileResolver
+import com.lumasr.domain.CpuCalibrationCandidates
 import com.lumasr.domain.InferenceCalibrationRunner
+import com.lumasr.domain.InferenceExecutionProfileResolver
 import com.lumasr.domain.LazyProcessingExecutionProfileResolver
 import com.lumasr.domain.ModelArtifactIdentityFactory
 import com.lumasr.domain.CalibrationRequestExecutor
 import com.lumasr.domain.DeviceCalibrationCoordinator
 import com.lumasr.domain.OnDeviceCalibrationCoordinator
 import com.lumasr.domain.ProcessingExecutionProfileResolver
+import com.lumasr.domain.VulkanCalibrationCandidates
 import com.lumasr.processor.NativeBitmapCalibrationProbe
 import com.lumasr.processor.NativeSuperResProcessor
 import java.io.File
@@ -63,7 +65,9 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
         thermalLevelProvider = thermalSampler::sampleLevel,
         availableHeapBytesProvider = {
             InferenceCalibrationRunner.currentAvailableHeapBytes()
-        }
+        },
+        vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded(),
+        cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
     )
     return OnDeviceCalibrationCoordinator(
         repository = repository,

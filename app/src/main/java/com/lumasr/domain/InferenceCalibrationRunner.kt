@@ -60,7 +60,8 @@ data class CpuCalibrationCandidates(
     val cpuThreads: List<Int> = listOf(1, 2, 4),
     val openmpBlocktimeMs: List<Int> = listOf(0, 20, 50),
     val postprocessThreads: List<Int> = listOf(1, 2, 4),
-    val includeDeviceTopologyThreads: Boolean = true
+    val includeDeviceTopologyThreads: Boolean = true,
+    val searchControls: Boolean = true
 ) {
     init {
         requireCandidateList(tileSizes, MAX_TILE_CANDIDATES, "CPU tile") {
@@ -89,10 +90,57 @@ data class CpuCalibrationCandidates(
         require(values.all(isSupported)) { "$label candidates contain an unsupported value" }
     }
 
-    private companion object {
-        const val MAX_TILE_CANDIDATES = 8
-        const val MAX_THREAD_CANDIDATES = 8
-        const val MAX_BLOCKTIME_CANDIDATES = 4
+    companion object {
+        private const val MAX_TILE_CANDIDATES = 8
+        private const val MAX_THREAD_CANDIDATES = 8
+        private const val MAX_BLOCKTIME_CANDIDATES = 4
+
+        fun baselineOnly() = CpuCalibrationCandidates(
+            tileSizes = listOf(128),
+            cpuThreads = listOf(4),
+            openmpBlocktimeMs = listOf(20),
+            postprocessThreads = listOf(1),
+            includeDeviceTopologyThreads = false,
+            searchControls = false
+        )
+    }
+}
+
+data class VulkanCalibrationCandidates(
+    val tileSizes: List<Int> = UpscaleParamsFactory.supportedTileSizes.sorted(),
+    val commandBatchSizes: List<Int> = listOf(2, 4, 8)
+) {
+    init {
+        require(tileSizes.isNotEmpty()) { "Vulkan tile candidates must not be empty" }
+        require(tileSizes.size <= MAX_TILE_CANDIDATES) {
+            "Vulkan tile candidates exceed the reviewed bound"
+        }
+        require(tileSizes.distinct().size == tileSizes.size) {
+            "Vulkan tile candidates must be unique"
+        }
+        require(tileSizes.all { it in UpscaleParamsFactory.supportedTileSizes }) {
+            "Vulkan tile candidates contain an unsupported value"
+        }
+        require(commandBatchSizes.size <= MAX_BATCH_CANDIDATES) {
+            "Vulkan batch candidates exceed the reviewed bound"
+        }
+        require(commandBatchSizes.distinct().size == commandBatchSizes.size) {
+            "Vulkan batch candidates must be unique"
+        }
+        require(commandBatchSizes.all { it in SUPPORTED_BATCH_CANDIDATES }) {
+            "Vulkan batch candidates contain an unsupported value"
+        }
+    }
+
+    companion object {
+        private const val MAX_TILE_CANDIDATES = 8
+        private const val MAX_BATCH_CANDIDATES = 3
+        private val SUPPORTED_BATCH_CANDIDATES = setOf(2, 4, 8)
+
+        fun productionBounded() = VulkanCalibrationCandidates(
+            tileSizes = listOf(128),
+            commandBatchSizes = emptyList()
+        )
     }
 }
 
@@ -122,6 +170,8 @@ class InferenceCalibrationRunner(
     private val availableHeapBytesProvider: () -> Long? = { currentAvailableHeapBytes() },
     private val calibrationPatternFactory: (Int, Int, Long) -> RgbImage =
         SyntheticCalibrationPattern::generate,
+    private val vulkanCalibrationCandidates: VulkanCalibrationCandidates =
+        VulkanCalibrationCandidates(),
     private val cpuCalibrationCandidates: CpuCalibrationCandidates? = CpuCalibrationCandidates()
 ) {
     init {
@@ -453,6 +503,9 @@ class InferenceCalibrationRunner(
             durationNanos = baselineOutput.durationNanos,
             quality = PERFECT_CPU_REFERENCE_QUALITY
         )
+        if (!candidates.searchControls) {
+            return CpuCandidateProbeResult.Ready(selected)
+        }
 
         return try {
             selected = searchCpuStage(
@@ -591,7 +644,7 @@ class InferenceCalibrationRunner(
         }
 
         val tileCandidates = mutableListOf<MeasuredVulkanCandidate>()
-        for (tileSize in SUPPORTED_TILE_SIZES) {
+        for (tileSize in vulkanCalibrationCandidates.tileSizes.sorted()) {
             val measured = when (
                 val result = measureCandidate(
                     pattern = pattern,
@@ -619,7 +672,9 @@ class InferenceCalibrationRunner(
 
         val measuredTileCount = estimatedTileCount(pattern, selectedTile.tileSize)
         val batchCandidates = mutableListOf<MeasuredVulkanCandidate>()
-        for (batchSize in SUPPORTED_BATCH_SIZES.drop(1).filter { it <= measuredTileCount }) {
+        for (batchSize in vulkanCalibrationCandidates.commandBatchSizes
+            .sorted()
+            .filter { it <= measuredTileCount }) {
             val measured = when (
                 val result = measureCandidate(
                     pattern = pattern,
@@ -817,8 +872,6 @@ class InferenceCalibrationRunner(
             psnrDb = Double.POSITIVE_INFINITY,
             p99ChannelError = 0
         )
-        private val SUPPORTED_TILE_SIZES = UpscaleParamsFactory.supportedTileSizes.sorted()
-        private val SUPPORTED_BATCH_SIZES = listOf(1, 2, 4, 8)
         private val DEFAULT_WORKLOAD_OUTPUT_EDGES = mapOf(
             ResolutionTier.SMALL to 2_048,
             ResolutionTier.STANDARD to 3_072,
