@@ -190,6 +190,9 @@ class InferenceExecutionProfileResolverTest {
             benchmark(
                 identity,
                 batchSize = 8,
+                profiles = listOf(
+                    CalibratedVulkanProfile(ResolutionTier.STANDARD, 512, 8)
+                ),
                 cpuProfiles = cpuResolutionProfiles()
             )
         )
@@ -335,7 +338,7 @@ class InferenceExecutionProfileResolverTest {
     }
 
     @Test
-    fun missingTierOrInvalidOutputPixelsFallsBackToLegacyRecommendedFields() = runBlocking {
+    fun missingTierOrInvalidOutputPixelsFallsBackToSafeFields() = runBlocking {
         val base = params()
         val benchmark = benchmark(
             identity = identity(base),
@@ -352,8 +355,12 @@ class InferenceExecutionProfileResolverTest {
         )
         val invalidPixels = resolver.resolve("model-a", base, 1_500L, outputPixels = -1L)
 
-        assertEquals(512 to 8, missingTier.tileSize to missingTier.commandBatchSize)
-        assertEquals(512 to 8, invalidPixels.tileSize to invalidPixels.commandBatchSize)
+        assertEquals(512 to 1, missingTier.tileSize to missingTier.commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, missingTier.nativeBackend)
+        assertEquals(InferencePrecision.FP32, missingTier.inferencePrecision)
+        assertEquals(512 to 1, invalidPixels.tileSize to invalidPixels.commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, invalidPixels.nativeBackend)
+        assertEquals(InferencePrecision.FP32, invalidPixels.inferencePrecision)
     }
 
     @Test

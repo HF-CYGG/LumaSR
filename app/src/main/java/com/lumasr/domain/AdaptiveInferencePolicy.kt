@@ -264,22 +264,19 @@ object AdaptiveInferencePolicy {
                 isFp16Eligible(device, quality)
             } == true
             val canUseOptimizedFp16 = canUseVulkan &&
-                device.gpuRoughScore?.let { it >= MIN_OPTIMIZED_GPU_ROUGH_SCORE } == true &&
                 benchmarkIsValid &&
-                qualityAllowsFp16
+                qualityAllowsFp16 &&
+                calibratedVulkanProfile != null
 
             if (canUseOptimizedFp16) {
+                val measuredProfile = requireNotNull(calibratedVulkanProfile)
                 InferenceExecutionProfile(
                     backend = NativeBackend.OPTIMIZED,
                     accelerationMode = accelerationMode,
                     precision = InferencePrecision.FP16,
                     cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
-                    tileSize = calibratedVulkanProfile?.tileSize ?: safeTileSize,
-                    commandBatchSize = calibratedVulkanProfile?.commandBatchSize
-                        ?: benchmarkResult
-                            ?.recommendedCommandBatchSize
-                            ?.coerceIn(1, MAX_COMMAND_BATCH_SIZE)
-                        ?: 1,
+                    tileSize = measuredProfile.tileSize,
+                    commandBatchSize = measuredProfile.commandBatchSize,
                     gpuHeadroomPercent = 8,
                     modelCacheCapacity = 2,
                     tta = false
@@ -341,7 +338,6 @@ object AdaptiveInferencePolicy {
             !device.isLowRamDevice &&
             device.memoryBucketMb > 0 &&
             device.physicalCoreCount > 0 &&
-            device.gpuRoughScore?.let { it >= MIN_OPTIMIZED_GPU_ROUGH_SCORE } == true &&
             benchmarkIsValid &&
             calibratedTtaProfile?.let { isTtaProfileEligible(device, it) } == true
         return if (canUseOptimizedTta) {
@@ -356,10 +352,6 @@ object AdaptiveInferencePolicy {
             safeProfile
         }
     }
-
-    // ncnn documents scores above 75 as high-end and below 10 as low-end.
-    const val MIN_OPTIMIZED_GPU_ROUGH_SCORE = 75
-    private const val MAX_COMMAND_BATCH_SIZE = 8
 
     fun initialThermalState(profile: InferenceExecutionProfile): ThermalPolicyState {
         return ThermalPolicyState(
