@@ -30,7 +30,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun productionCandidateBudgetMeasuresEveryRealTierWithoutExpandingSearchGrid() = runBlocking {
+    fun productionCandidateBudgetSearchesBoundedGridAcrossEveryRealTier() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val measured = mutableListOf<RecordedProbeRequest>()
         val requestedCacheCapacities = mutableListOf<Int>()
@@ -88,38 +88,37 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(setOf(3), requestedCacheCapacities.toSet())
-        assertEquals(9, measured.size)
+        assertEquals(27, measured.size)
         outputEdges.values.forEach { outputEdge ->
             val tierRequests = measured.filter { it.inputWidth * it.params.scale == outputEdge }
-            assertEquals(3, tierRequests.size)
-            assertEquals(1, tierRequests.count { it.params.nativeBackend == NativeBackend.OPTIMIZED })
+            assertEquals(9, tierRequests.size)
+            assertEquals(6, tierRequests.count { it.params.nativeBackend == NativeBackend.OPTIMIZED })
             assertEquals(1, tierRequests.count { it.params.accelerationMode == AccelerationMode.CPU })
-            assertTrue(tierRequests.all { it.params.tileSize == 128 })
-            assertTrue(tierRequests.all { it.params.commandBatchSize == 1 })
+            assertEquals(
+                listOf(64, 128, 256),
+                tierRequests
+                    .filter { it.params.nativeBackend == NativeBackend.OPTIMIZED }
+                    .filter { it.params.commandBatchSize == 1 }
+                    .map { it.params.tileSize }
+            )
+            assertEquals(
+                listOf(2, 4),
+                tierRequests
+                    .filter { it.params.commandBatchSize > 1 }
+                    .take(2)
+                    .map { it.params.commandBatchSize }
+            )
         }
         assertEquals(3, repository.saved.single().vulkanProfiles.size)
         assertEquals(3, repository.saved.single().cpuProfiles.size)
         val startedSteps = progressEvents.filter {
             it.type == CalibrationProgressEventType.STEP_STARTED
         }
-        assertEquals(11, startedSteps.size)
-        assertTrue(progressEvents.all { it.totalSteps == 11 })
-        assertEquals(
-            listOf(
-                "FP32 质量基准",
-                "FP16 质量候选",
-                "SMALL Vulkan FP32",
-                "SMALL Vulkan FP16",
-                "SMALL CPU FP32",
-                "STANDARD Vulkan FP32",
-                "STANDARD Vulkan FP16",
-                "STANDARD CPU FP32",
-                "LARGE Vulkan FP32",
-                "LARGE Vulkan FP16",
-                "LARGE CPU FP32"
-            ),
-            startedSteps.map { it.title }
-        )
+        assertEquals(23, startedSteps.size)
+        assertTrue(progressEvents.all { it.totalSteps == 23 })
+        assertEquals(3, startedSteps.count { it.title.endsWith("Vulkan FP32") })
+        assertEquals(6, startedSteps.count { it.title.contains("batch=") })
+        assertEquals(3, startedSteps.count { it.title.endsWith("CPU FP32") })
         assertTrue(progressEvents.any { it.logMessage.contains("tile=128") })
         assertTrue(progressEvents.any { it.logMessage.contains("batch=1") })
         assertTrue(progressEvents.any { it.logMessage.contains("输出 2048×2048") })
@@ -695,7 +694,7 @@ class InferenceCalibrationRunnerTest {
         expectedWorkloads.forEach { (tier, expectedInputEdge, expectedOutputEdge) ->
             val tierRequests = requests.filter { it.inputWidth == expectedInputEdge }
             val expectedBatches = if (tier == ResolutionTier.SMALL) listOf(2, 4) else listOf(2, 4, 8)
-            assertEquals(1 + 6 + expectedBatches.size, tierRequests.size)
+            assertEquals(1 + 6 + expectedBatches.size + 2, tierRequests.size)
             assertTrue(tierRequests.all { it.inputHeight == expectedInputEdge })
             assertTrue(tierRequests.all { request ->
                 val outputWidth = request.inputWidth.toLong() * request.params.scale
@@ -711,8 +710,17 @@ class InferenceCalibrationRunnerTest {
                 tierRequests.drop(1).take(6).map { it.params.tileSize }
             )
             assertTrue(tierRequests.drop(1).take(6).all { it.params.commandBatchSize == 1 })
-            assertEquals(expectedBatches, tierRequests.drop(7).map { it.params.commandBatchSize })
-            assertTrue(tierRequests.drop(7).all { it.params.tileSize == 256 })
+            assertEquals(
+                expectedBatches,
+                tierRequests.drop(7).take(expectedBatches.size).map { it.params.commandBatchSize }
+            )
+            assertTrue(
+                tierRequests.drop(7).take(expectedBatches.size).all { it.params.tileSize == 256 }
+            )
+            assertEquals(
+                listOf(NativeBackend.LEGACY_SAFE, NativeBackend.OPTIMIZED),
+                tierRequests.takeLast(2).map { it.params.nativeBackend }
+            )
         }
         val optimizedRequests = requests.filter { it.params.nativeBackend == NativeBackend.OPTIMIZED }
         assertTrue(optimizedRequests.all { it.params.inferencePrecision == InferencePrecision.FP16 })
@@ -764,6 +772,150 @@ class InferenceCalibrationRunnerTest {
         assertTrue(result is CalibrationRunResult.Completed)
         assertTrue(repository.saved.single().vulkanProfiles.all { it.tileSize == 128 })
         assertTrue(repository.saved.single().vulkanProfiles.all { it.commandBatchSize == 2 })
+    }
+
+    @Test
+    fun batchSearchCanRescueFp16ThatIsNotFastEnoughAtBatchOne() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    val duration = when {
+                        params.nativeBackend == NativeBackend.LEGACY_SAFE -> 1_000L
+                        params.commandBatchSize == 2 -> 800L
+                        params.commandBatchSize == 4 -> 790L
+                        else -> 980L
+                    }
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        duration
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = listOf(2, 4)
+            )
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(3, repository.saved.single().vulkanProfiles.size)
+        assertTrue(repository.saved.single().vulkanProfiles.all { it.commandBatchSize == 2 })
+    }
+
+    @Test
+    fun cacheMissPerformanceProbeIsRetriedBeforeItsTimingCanBeSelected() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val attemptsByIdentity = mutableMapOf<String, Int>()
+        val measured = mutableListOf<UpscaleParams>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    successfulDuration(params)
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement {
+                    measured += params
+                    val identity = listOf(
+                        params.accelerationMode,
+                        params.nativeBackend,
+                        params.inferencePrecision,
+                        params.cpuThreads,
+                        params.openmpBlocktimeMs
+                    ).joinToString("/")
+                    val attempt = attemptsByIdentity.getOrDefault(identity, 0) + 1
+                    attemptsByIdentity[identity] = attempt
+                    return CalibrationProbeMeasurement(
+                        outputWidth = input.width * params.scale,
+                        outputHeight = input.height * params.scale,
+                        durationNanos = successfulDuration(params),
+                        telemetry = CalibrationProbeTelemetry(
+                            cacheHit = attempt > 1,
+                            modelLoadMs = if (attempt > 1) 0L else 25L,
+                            requestedMaxPipelineDepth = 1,
+                            effectivePipelineDepth = 1,
+                            peakSlotBytes = 0L,
+                            producerWaitMs = 0L,
+                            consumerWaitMs = 0L,
+                            overlapMs = 0L
+                        )
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded()
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(2, attemptsByIdentity.values.count { it > 1 })
+        assertTrue(measured.zipWithNext().count { (first, second) -> first == second } >= 2)
+    }
+
+    @Test
+    fun provisionalVulkanWinnerMustPassPairedRecheckBeforeEnablement() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val fp32Durations = ArrayDeque(List(3) { listOf(1_000L, 1_000L) }.flatten())
+        val fp16Durations = ArrayDeque(List(3) { listOf(800L, 980L) }.flatten())
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    1L
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement = CalibrationProbeMeasurement(
+                    outputWidth = input.width * params.scale,
+                    outputHeight = input.height * params.scale,
+                    durationNanos = if (params.nativeBackend == NativeBackend.LEGACY_SAFE) {
+                        fp32Durations.removeFirst()
+                    } else {
+                        fp16Durations.removeFirst()
+                    }
+                )
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            )
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().vulkanProfiles.isEmpty())
+        assertTrue(repository.saved.single().vulkanTiers.all {
+            it.decision == VulkanCalibrationDecision.PERFORMANCE_REJECTED
+        })
+        assertTrue(fp32Durations.isEmpty())
+        assertTrue(fp16Durations.isEmpty())
     }
 
     @Test
@@ -1051,7 +1203,7 @@ class InferenceCalibrationRunnerTest {
             result
         )
         assertEquals(SUCCESSFUL_FIRST_TIER_PROBE_COUNT, probeCount.get())
-        assertEquals(listOf(2, 4), requests.filter { it.commandBatchSize > 1 }.map {
+        assertEquals(listOf(2, 4, 4), requests.filter { it.commandBatchSize > 1 }.map {
             it.commandBatchSize
         })
         assertTrue(repository.saved.isEmpty())
@@ -2040,10 +2192,10 @@ class InferenceCalibrationRunnerTest {
     )
 
     private companion object {
-        const val SUCCESSFUL_FIRST_TIER_PROBE_COUNT = 11
-        const val SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT = 20
-        const val SUCCESSFUL_ALL_TIERS_PROBE_COUNT = 29
-        const val SUCCESSFUL_SECOND_TIER_REFERENCE_PROBE = 12
+        const val SUCCESSFUL_FIRST_TIER_PROBE_COUNT = 13
+        const val SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT = 24
+        const val SUCCESSFUL_ALL_TIERS_PROBE_COUNT = 35
+        const val SUCCESSFUL_SECOND_TIER_REFERENCE_PROBE = 14
     }
 
     private fun slowPublicationRepository(

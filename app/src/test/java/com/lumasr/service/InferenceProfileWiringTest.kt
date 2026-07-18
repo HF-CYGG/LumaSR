@@ -103,7 +103,7 @@ class InferenceProfileWiringTest {
         val factory = source("ui/CalibrationAndroidFactory.kt")
 
         assertTrue(factory.contains("VulkanCalibrationCandidates.productionBounded()"))
-        assertTrue(factory.contains("CpuCalibrationCandidates.baselineOnly()"))
+        assertTrue(factory.contains("CpuCalibrationCandidates.productionBounded()"))
     }
 
     private fun source(relativePath: String): String = File(

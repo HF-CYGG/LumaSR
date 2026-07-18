@@ -26,8 +26,34 @@ data class CalibrationProbeOutput(
 data class CalibrationProbeMeasurement(
     val outputWidth: Int,
     val outputHeight: Int,
-    val durationNanos: Long
+    val durationNanos: Long,
+    val telemetry: CalibrationProbeTelemetry? = null
 )
+
+data class CalibrationProbeTelemetry(
+    val cacheHit: Boolean,
+    val modelLoadMs: Long,
+    val requestedMaxPipelineDepth: Int,
+    val effectivePipelineDepth: Int,
+    val peakSlotBytes: Long,
+    val producerWaitMs: Long,
+    val consumerWaitMs: Long,
+    val overlapMs: Long
+) {
+    init {
+        require(modelLoadMs >= 0L) { "Calibration model load time must be non-negative" }
+        require(requestedMaxPipelineDepth in 1..2) {
+            "Requested calibration pipeline depth must be in [1, 2]"
+        }
+        require(effectivePipelineDepth in 1..2) {
+            "Effective calibration pipeline depth must be in [1, 2]"
+        }
+        require(peakSlotBytes >= 0L) { "Calibration peak slot bytes must be non-negative" }
+        require(producerWaitMs >= 0L) { "Calibration producer wait time must be non-negative" }
+        require(consumerWaitMs >= 0L) { "Calibration consumer wait time must be non-negative" }
+        require(overlapMs >= 0L) { "Calibration overlap time must be non-negative" }
+    }
+}
 
 interface InferenceCalibrationProbe {
     suspend fun run(input: RgbImage, params: UpscaleParams): CalibrationProbeOutput?
@@ -104,6 +130,15 @@ data class CpuCalibrationCandidates(
             includeDeviceTopologyThreads = false,
             searchControls = false
         )
+
+        fun productionBounded() = CpuCalibrationCandidates(
+            tileSizes = listOf(64, 128, 256),
+            cpuThreads = listOf(2, 4, 8),
+            openmpBlocktimeMs = listOf(0, 20),
+            postprocessThreads = listOf(1, 2),
+            includeDeviceTopologyThreads = true,
+            searchControls = true
+        )
     }
 }
 
@@ -139,8 +174,8 @@ data class VulkanCalibrationCandidates(
         private val SUPPORTED_BATCH_CANDIDATES = setOf(2, 4, 8)
 
         fun productionBounded() = VulkanCalibrationCandidates(
-            tileSizes = listOf(128),
-            commandBatchSizes = emptyList()
+            tileSizes = listOf(64, 128, 256),
+            commandBatchSizes = listOf(2, 4)
         )
     }
 }
@@ -565,7 +600,12 @@ class InferenceCalibrationRunner(
             outputHeight = performancePattern.height * safeParams.scale,
             workMultiplier = TTA_WORK_MULTIPLIER
         )
-        val safeMeasurement = probe.measure(performancePattern, safeParams)
+        val safeMeasurement = measureSteadyState(
+            performancePattern,
+            safeParams,
+            "TTA STANDARD Vulkan FP32",
+            progress
+        )
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("TTA STANDARD Vulkan FP32", "探针失败")
             }
@@ -589,7 +629,12 @@ class InferenceCalibrationRunner(
             outputHeight = performancePattern.height * optimizedParams.scale,
             workMultiplier = TTA_WORK_MULTIPLIER
         )
-        val optimizedMeasurement = probe.measure(performancePattern, optimizedParams)
+        val optimizedMeasurement = measureSteadyState(
+            performancePattern,
+            optimizedParams,
+            "TTA STANDARD Vulkan FP16",
+            progress
+        )
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("TTA STANDARD Vulkan FP16", "探针失败")
             }
@@ -665,7 +710,7 @@ class InferenceCalibrationRunner(
             outputHeight = pattern.height * baselineParams.scale,
             workMultiplier = CPU_WORK_MULTIPLIER
         )
-        val baselineOutput = probe.measure(pattern, baselineParams)
+        val baselineOutput = measureSteadyState(pattern, baselineParams, baselineTitle, progress)
             ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep(baselineTitle, "探针失败")
             }
@@ -798,7 +843,7 @@ class InferenceCalibrationRunner(
             outputHeight = pattern.height * params.scale,
             workMultiplier = CPU_WORK_MULTIPLIER
         )
-        val output = probe.measure(pattern, params)
+        val output = measureSteadyState(pattern, params, title, progress)
             ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep(title, "探针失败")
             }
@@ -855,7 +900,7 @@ class InferenceCalibrationRunner(
             outputHeight = pattern.height * referenceParams.scale,
             workMultiplier = GPU_WORK_MULTIPLIER
         )
-        val reference = probe.measure(pattern, referenceParams)
+        val reference = measureSteadyState(pattern, referenceParams, referenceTitle, progress)
             ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep(referenceTitle, "探针失败")
             }
@@ -895,24 +940,7 @@ class InferenceCalibrationRunner(
             }
             tileCandidates += measured
         }
-        val selectedTile = selectQualifiedUpgrade(
-            device = request.device,
-            baselineDurationNanos = reference.durationNanos,
-            candidates = tileCandidates
-        ) ?: run {
-            val fastest = tileCandidates.minBy(MeasuredVulkanCandidate::durationNanos)
-            progress.note(
-                "$tier Vulkan 性能门",
-                "✗ 未达到 5% 提速门槛 · " +
-                    "FP32=${formatPerformanceDuration(reference.durationNanos)} · " +
-                    "FP16=${formatPerformanceDuration(fastest.durationNanos)} · " +
-                    "实测提速=${formatSpeedup(reference.durationNanos, fastest.durationNanos)}"
-            )
-            return CandidateProbeResult.Rejected(
-                baselineDurationNanos = reference.durationNanos,
-                bestCandidateDurationNanos = fastest.durationNanos
-            )
-        }
+        val selectedTile = selectConservativeCandidate(request.device, tileCandidates)
 
         val measuredTileCount = estimatedTileCount(pattern, selectedTile.tileSize)
         val batchCandidates = mutableListOf<MeasuredVulkanCandidate>()
@@ -941,13 +969,80 @@ class InferenceCalibrationRunner(
             }
             batchCandidates += measured
         }
+        val selected = selectQualifiedUpgrade(
+            device = request.device,
+            baseline = selectedTile,
+            candidates = batchCandidates
+        )
+        if (!isAtLeastFivePercentFaster(selected.durationNanos, reference.durationNanos)) {
+            val fastest = (tileCandidates + batchCandidates)
+                .minBy(MeasuredVulkanCandidate::durationNanos)
+            progress.note(
+                "$tier Vulkan 性能门",
+                "✗ 未达到 5% 提速门槛 · " +
+                    "FP32=${formatPerformanceDuration(reference.durationNanos)} · " +
+                    "FP16=${formatPerformanceDuration(fastest.durationNanos)} · " +
+                    "实测提速=${formatSpeedup(reference.durationNanos, fastest.durationNanos)}"
+            )
+            return CandidateProbeResult.Rejected(
+                baselineDurationNanos = reference.durationNanos,
+                bestCandidateDurationNanos = fastest.durationNanos
+            )
+        }
+        progress.note(
+            "$tier Vulkan 稳定性复测",
+            "> 复测 FP32 与 tile=${selected.tileSize}/batch=${selected.commandBatchSize}"
+        )
+        val referenceRecheck = measureSteadyState(
+            pattern,
+            referenceParams,
+            "$tier Vulkan FP32 复测",
+            progress
+        ) ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        val selectedParams = referenceParams.copy(
+            tileSize = selected.tileSize,
+            nativeBackend = NativeBackend.OPTIMIZED,
+            inferencePrecision = InferencePrecision.FP16,
+            commandBatchSize = selected.commandBatchSize,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
+        )
+        val selectedRecheck = measureSteadyState(
+            pattern,
+            selectedParams,
+            "$tier Vulkan FP16 复测",
+            progress
+        ) ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        if (!referenceRecheck.hasSameShape(reference) ||
+            !selectedRecheck.hasSameShape(reference) ||
+            referenceRecheck.durationNanos <= 0L ||
+            selectedRecheck.durationNanos <= 0L
+        ) {
+            return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        if (!isAtLeastFivePercentFaster(
+                selectedRecheck.durationNanos,
+                referenceRecheck.durationNanos
+            )
+        ) {
+            progress.note(
+                "$tier Vulkan 稳定性复测",
+                "✗ 复测未达到 5% 提速门槛 · " +
+                    "FP32=${formatPerformanceDuration(referenceRecheck.durationNanos)} · " +
+                    "FP16=${formatPerformanceDuration(selectedRecheck.durationNanos)}"
+            )
+            return CandidateProbeResult.Rejected(
+                baselineDurationNanos = maxOf(reference.durationNanos, referenceRecheck.durationNanos),
+                bestCandidateDurationNanos = maxOf(
+                    selected.durationNanos,
+                    selectedRecheck.durationNanos
+                )
+            )
+        }
         return CandidateProbeResult.Ready(
-            candidate = selectQualifiedUpgrade(
-                device = request.device,
-                baseline = selectedTile,
-                candidates = batchCandidates
+            candidate = selected.copy(
+                durationNanos = maxOf(selected.durationNanos, selectedRecheck.durationNanos)
             ),
-            baselineDurationNanos = reference.durationNanos
+            baselineDurationNanos = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
         )
     }
 
@@ -981,7 +1076,7 @@ class InferenceCalibrationRunner(
             outputHeight = pattern.height * params.scale,
             workMultiplier = GPU_WORK_MULTIPLIER
         )
-        val output = probe.measure(pattern, params)
+        val output = measureSteadyState(pattern, params, title, progress)
             ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep(title, "探针失败")
             }
@@ -1007,19 +1102,17 @@ class InferenceCalibrationRunner(
         )
     }
 
-    private fun selectQualifiedUpgrade(
+    private fun selectConservativeCandidate(
         device: DeviceCapabilityProfile,
-        baselineDurationNanos: Long,
         candidates: List<MeasuredVulkanCandidate>
-    ): MeasuredVulkanCandidate? {
-        var selected: MeasuredVulkanCandidate? = null
-        var currentDuration = baselineDurationNanos
-        candidates.forEach { candidate ->
+    ): MeasuredVulkanCandidate {
+        require(candidates.isNotEmpty()) { "Vulkan candidate list must not be empty" }
+        var selected = candidates.first()
+        candidates.drop(1).forEach { candidate ->
             if (AdaptiveInferencePolicy.isFp16Eligible(device, candidate.quality) &&
-                isAtLeastFivePercentFaster(candidate.durationNanos, currentDuration)
+                isAtLeastFivePercentFaster(candidate.durationNanos, selected.durationNanos)
             ) {
                 selected = candidate
-                currentDuration = candidate.durationNanos
             }
         }
         return selected
@@ -1043,6 +1136,31 @@ class InferenceCalibrationRunner(
 
     private fun isAtLeastFivePercentFaster(candidateNanos: Long, currentNanos: Long): Boolean =
         candidateNanos.toDouble() <= currentNanos.toDouble() * MAX_UPGRADE_DURATION_RATIO
+
+    private suspend fun measureSteadyState(
+        input: RgbImage,
+        params: UpscaleParams,
+        title: String,
+        progress: CalibrationProgressSession
+    ): CalibrationProbeMeasurement? {
+        val first = probe.measure(input, params) ?: return null
+        if (first.telemetry?.cacheHit != false) return first
+        progress.note(
+            "$title 模型预热",
+            "↻ 首次样本 cacheHit=0 · modelLoad=${first.telemetry.modelLoadMs}ms · 重新测量"
+        )
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        val retry = probe.measure(input, params) ?: return null
+        if (retry.telemetry?.cacheHit == false) {
+            progress.note(
+                "$title 缓存异常",
+                "✗ 复测仍为 cacheHit=0，不使用冷启动耗时"
+            )
+            return null
+        }
+        return retry
+    }
 
     private fun formatPerformanceDuration(durationNanos: Long): String = String.format(
         Locale.US,

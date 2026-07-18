@@ -3,9 +3,11 @@ package com.lumasr.processor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.lumasr.domain.CalibrationProbeMeasurement
+import com.lumasr.domain.CalibrationProbeTelemetry
 import com.lumasr.domain.CalibrationProbeOutput
 import com.lumasr.domain.InferenceCalibrationProbe
 import com.lumasr.domain.RgbImage
+import com.lumasr.domain.NativePerformanceSnapshot
 import com.lumasr.domain.UpscaleParams
 import java.io.File
 
@@ -19,7 +21,7 @@ class NativeBitmapCalibrationProbe(
     private val nanoTime: () -> Long = System::nanoTime
 ) : InferenceCalibrationProbe {
     override suspend fun run(input: RgbImage, params: UpscaleParams): CalibrationProbeOutput? {
-        return execute(input, params) { output, durationNanos ->
+        return execute(input, params) { output, durationNanos, _ ->
             val decoded = outputDecoder(output) ?: return@execute null
             CalibrationProbeOutput(decoded, durationNanos)
         }
@@ -29,34 +31,37 @@ class NativeBitmapCalibrationProbe(
         input: RgbImage,
         params: UpscaleParams
     ): CalibrationProbeMeasurement? {
-        return execute(input, params) { output, durationNanos ->
+        return execute(input, params) { output, durationNanos, telemetry ->
             val (width, height) = outputBoundsDecoder(output) ?: return@execute null
             if (width <= 0 || height <= 0) return@execute null
-            CalibrationProbeMeasurement(width, height, durationNanos)
+            CalibrationProbeMeasurement(width, height, durationNanos, telemetry)
         }
     }
 
     private suspend fun <T> execute(
         input: RgbImage,
         params: UpscaleParams,
-        decodeOutput: (File, Long) -> T?
+        decodeOutput: (File, Long, CalibrationProbeTelemetry?) -> T?
     ): T? {
         check(directory.isDirectory || directory.mkdirs()) {
             "Cannot create local calibration directory"
         }
         val output = File.createTempFile("lumasr-calibration-", ".png", directory)
         var bitmap: Bitmap? = null
+        var performanceSnapshot: NativePerformanceSnapshot? = null
         return try {
             bitmap = bitmapFactory(input)
             val startedAt = nanoTime()
             val result = processor.processBitmapRegion(
                 params = params.copy(outputPath = output.absolutePath),
                 bitmap = bitmap,
-                onProgress = {}
+                onProgress = { progress ->
+                    progress.performanceSnapshot?.let { performanceSnapshot = it }
+                }
             )
             val durationNanos = (nanoTime() - startedAt).coerceAtLeast(1L)
             if (!result.success || !output.isFile || output.length() <= 0L) return null
-            decodeOutput(output, durationNanos)
+            decodeOutput(output, durationNanos, performanceSnapshot?.toCalibrationTelemetry())
         } finally {
             bitmap?.recycle()
             output.delete()
@@ -66,6 +71,17 @@ class NativeBitmapCalibrationProbe(
     override fun cancel(taskId: String) {
         cancelNative(taskId)
     }
+
+    private fun NativePerformanceSnapshot.toCalibrationTelemetry() = CalibrationProbeTelemetry(
+        cacheHit = cacheHit,
+        modelLoadMs = modelLoadMs,
+        requestedMaxPipelineDepth = requestedMaxPipelineDepth,
+        effectivePipelineDepth = effectivePipelineDepth,
+        peakSlotBytes = peakSlotBytes,
+        producerWaitMs = producerWaitMs,
+        consumerWaitMs = consumerWaitMs,
+        overlapMs = overlapMs
+    )
 
     companion object {
         private fun createBitmap(image: RgbImage): Bitmap {

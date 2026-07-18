@@ -67,7 +67,7 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
             InferenceCalibrationRunner.currentAvailableHeapBytes()
         },
         vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded(),
-        cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        cpuCalibrationCandidates = CpuCalibrationCandidates.productionBounded()
     )
     return OnDeviceCalibrationCoordinator(
         repository = repository,
