@@ -114,8 +114,18 @@ class InferenceCalibrationRunnerTest {
         val startedSteps = progressEvents.filter {
             it.type == CalibrationProgressEventType.STEP_STARTED
         }
-        assertEquals(23, startedSteps.size)
-        assertTrue(progressEvents.all { it.totalSteps == 23 })
+        val settledSteps = progressEvents.filter {
+            it.type == CalibrationProgressEventType.STEP_COMPLETED ||
+                it.type == CalibrationProgressEventType.STEP_SKIPPED
+        }
+        assertEquals(29, startedSteps.size)
+        assertEquals(35, settledSteps.size)
+        assertTrue(progressEvents.all { it.totalSteps == 35 })
+        assertEquals(35, progressEvents.last().stepIndex)
+        assertEquals(
+            progressEvents.last().totalWorkUnits,
+            progressEvents.last().completedWorkUnits
+        )
         assertEquals(3, startedSteps.count { it.title.endsWith("Vulkan FP32") })
         assertEquals(6, startedSteps.count { it.title.contains("batch=") })
         assertEquals(3, startedSteps.count { it.title.endsWith("CPU FP32") })
@@ -154,6 +164,126 @@ class InferenceCalibrationRunnerTest {
         )
         assertTrue(events.any { it.logMessage.contains("探针失败") })
         assertFalse(events.any { it.logMessage.contains("校准结果已发布") })
+    }
+
+    @Test
+    fun resourceWatchdogCancelsNativeAndPreventsPartialPublication() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cancelled = mutableListOf<String>()
+        val samples = AtomicInteger(0)
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    delay(5_000L)
+                    error("unreachable")
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelled += taskId
+                }
+            },
+            repository = repository,
+            resourceSnapshotProvider = {
+                val delta = if (samples.getAndIncrement() == 0) 0L else 129L * 1_024L * 1_024L
+                CalibrationResourceSnapshot(
+                    pssBytes = 100L + delta,
+                    nativeHeapBytes = 200L,
+                    isLowMemory = false
+                )
+            },
+            resourceSampleIntervalMs = 10L
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+            result
+        )
+        assertEquals(1, cancelled.size)
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun requiredResourceMonitoringFailsBeforeProbingWhenBaselineIsUnavailable() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val probes = AtomicInteger(0)
+        val runner = testRunner(
+            probe = successfulProbe(probeCount = probes),
+            repository = repository,
+            resourceSnapshotProvider = { null },
+            requireResourceMonitoring = true
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+            result
+        )
+        assertEquals(0, probes.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun oversizedVulkanSlotIsSkippedAndSettledWithoutRunningTheCandidate() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val measuredTiles = mutableListOf<Int>()
+        val events = mutableListOf<CalibrationProgressEvent>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    successfulDuration(params)
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement {
+                    measuredTiles += params.tileSize
+                    return CalibrationProbeMeasurement(
+                        input.width * params.scale,
+                        input.height * params.scale,
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128, 256),
+                commandBatchSizes = emptyList()
+            ),
+            runtimePipelineSlotEstimator = RuntimePipelineSlotEstimator { params ->
+                slotEstimate(
+                    perSlotBytes = if (params.tileSize == 256) {
+                        CalibrationResourceWatchdog.MAX_SINGLE_SLOT_BYTES + 1L
+                    } else {
+                        1L
+                    }
+                )
+            }
+        )
+
+        val result = runner.run(
+            request(outputScale = 1),
+            CalibrationProgressReporter(events::add)
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertFalse(measuredTiles.contains(256))
+        assertTrue(events.any {
+            it.type == CalibrationProgressEventType.STEP_SKIPPED &&
+                it.logMessage.contains("64 MiB")
+        })
     }
 
     @Test
@@ -676,7 +806,8 @@ class InferenceCalibrationRunnerTest {
             },
             repository = repository,
             availableHeapBytesProvider = { Long.MAX_VALUE },
-            cpuCalibrationCandidates = null
+            cpuCalibrationCandidates = null,
+            runtimePipelineSlotEstimator = RuntimePipelineSlotEstimator { slotEstimate(1L) }
         )
 
         val result = runner.run(request(outputScale = 4))
@@ -1029,7 +1160,8 @@ class InferenceCalibrationRunnerTest {
                 override fun cancel(taskId: String) = Unit
             },
             repository = repository,
-            workloadOutputEdges = ResolutionTier.entries.associateWith { 384 }
+            workloadOutputEdges = ResolutionTier.entries.associateWith { 384 },
+            runtimePipelineSlotEstimator = RuntimePipelineSlotEstimator { slotEstimate(1L) }
         )
 
         val result = runner.run(request(outputScale = 4))
@@ -1824,6 +1956,7 @@ class InferenceCalibrationRunnerTest {
     @Test
     fun candidateBelowQualityThresholdPublishesSafeOnlyCalibration() = runBlocking {
         val repository = RecordingBenchmarkRepository()
+        val events = mutableListOf<CalibrationProgressEvent>()
         var attempt = 0
         val runner = testRunner(
             probe = object : InferenceCalibrationProbe {
@@ -1842,7 +1975,10 @@ class InferenceCalibrationRunnerTest {
             repository = repository
         )
 
-        val result = runner.run(request(outputScale = 1))
+        val result = runner.run(
+            request(outputScale = 1),
+            CalibrationProgressReporter(events::add)
+        )
 
         assertTrue(result is CalibrationRunResult.Completed)
         val saved = repository.saved.single()
@@ -1851,6 +1987,18 @@ class InferenceCalibrationRunnerTest {
             ResolutionTier.entries.map { VulkanCalibrationDecision.QUALITY_REJECTED },
             saved.vulkanTiers.map(CalibratedVulkanTier::decision)
         )
+        assertEquals(
+            events.last().totalSteps,
+            events.count {
+                it.type == CalibrationProgressEventType.STEP_COMPLETED ||
+                    it.type == CalibrationProgressEventType.STEP_SKIPPED
+            }
+        )
+        assertEquals(events.last().totalWorkUnits, events.last().completedWorkUnits)
+        assertTrue(events.any {
+            it.type == CalibrationProgressEventType.STEP_SKIPPED &&
+                it.logMessage.contains("质量门")
+        })
     }
 
     @Test
@@ -2191,7 +2339,12 @@ class InferenceCalibrationRunnerTest {
         calibrationPatternFactory: (Int, Int, Long) -> RgbImage = SyntheticCalibrationPattern::generate,
         vulkanCalibrationCandidates: VulkanCalibrationCandidates = VulkanCalibrationCandidates(),
         cpuCalibrationCandidates: CpuCalibrationCandidates? = null,
-        runtimePipelineResourcesProvider: () -> RuntimePipelineResources? = { null }
+        runtimePipelineResourcesProvider: () -> RuntimePipelineResources? = { null },
+        resourceSnapshotProvider: () -> CalibrationResourceSnapshot? = { null },
+        resourceSampleIntervalMs: Long = 1_000L,
+        requireResourceMonitoring: Boolean = false,
+        runtimePipelineSlotEstimator: RuntimePipelineSlotEstimator =
+            CheckedRuntimePipelineSlotEstimator
     ): InferenceCalibrationRunner = InferenceCalibrationRunner(
         probe = probe,
         repository = repository,
@@ -2202,7 +2355,23 @@ class InferenceCalibrationRunnerTest {
         calibrationPatternFactory = calibrationPatternFactory,
         vulkanCalibrationCandidates = vulkanCalibrationCandidates,
         cpuCalibrationCandidates = cpuCalibrationCandidates,
-        runtimePipelineResourcesProvider = runtimePipelineResourcesProvider
+        runtimePipelineResourcesProvider = runtimePipelineResourcesProvider,
+        resourceSnapshotProvider = resourceSnapshotProvider,
+        resourceSampleIntervalMs = resourceSampleIntervalMs,
+        requireResourceMonitoring = requireResourceMonitoring,
+        runtimePipelineSlotEstimator = runtimePipelineSlotEstimator
+    )
+
+    private fun slotEstimate(perSlotBytes: Long) = RuntimePipelineSlotEstimate(
+        inputRgbBytes = 0L,
+        preprocessFloatBytes = 0L,
+        vkInputBytes = 0L,
+        vkOutputBytes = 0L,
+        downloadFloatBytes = 0L,
+        outputRgbBytes = 0L,
+        scratchBytes = 0L,
+        perSlotBytes = perSlotBytes,
+        twoSlotBytes = perSlotBytes * 2L
     )
 
     private fun depthAwareProbe(

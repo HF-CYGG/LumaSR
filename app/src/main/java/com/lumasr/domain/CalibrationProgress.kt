@@ -4,6 +4,7 @@ enum class CalibrationProgressEventType {
     SESSION_STARTED,
     STEP_STARTED,
     STEP_COMPLETED,
+    STEP_SKIPPED,
     NOTE
 }
 

@@ -70,7 +70,8 @@ object CalibrationProgressUiReducer {
             state.progressFraction
         }
         val completedStepProgress = if (
-            event.type == CalibrationProgressEventType.STEP_COMPLETED && event.totalSteps > 0
+            (event.type == CalibrationProgressEventType.STEP_COMPLETED ||
+                event.type == CalibrationProgressEventType.STEP_SKIPPED) && event.totalSteps > 0
         ) {
             event.stepIndex.toFloat() / event.totalSteps.toFloat()
         } else {
@@ -78,11 +79,16 @@ object CalibrationProgressUiReducer {
         }
         val progress = maxOf(state.progressFraction, workProgress, completedStepProgress)
             .coerceIn(0f, 1f)
-        val estimate = estimateRemainingMs(
+        val recalculatedEstimate = estimateRemainingMs(
             elapsedMs = elapsedMs,
             completedWorkUnits = completedWork,
             totalWorkUnits = totalWork
         )
+        val estimate = when {
+            state.estimatedRemainingMs == null -> recalculatedEstimate
+            recalculatedEstimate == null -> state.estimatedRemainingMs
+            else -> minOf(state.estimatedRemainingMs, recalculatedEstimate)
+        }
         val nextLogs = event.logMessage
             .takeIf { it.isNotBlank() }
             ?.let { state.logLines + CalibrationConsoleLine(event.elapsedMs, it) }
@@ -152,7 +158,7 @@ object CalibrationProgressUiReducer {
         completedWorkUnits: Long,
         totalWorkUnits: Long
     ): Long? {
-        if (completedWorkUnits <= 0L || totalWorkUnits <= 0L) return null
+        if (elapsedMs <= 0L || completedWorkUnits <= 0L || totalWorkUnits <= 0L) return null
         if (completedWorkUnits >= totalWorkUnits) return 0L
         val remainingWork = totalWorkUnits - completedWorkUnits
         val rawEstimate = runCatching {

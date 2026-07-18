@@ -41,6 +41,22 @@ class CalibrationProgressUiStateTest {
     }
 
     @Test
+    fun zeroElapsedSkippedWorkDoesNotFabricateAZeroEta() {
+        val state = CalibrationProgressUiReducer.apply(
+            CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L),
+            event(
+                type = CalibrationProgressEventType.STEP_SKIPPED,
+                elapsedMs = 0L,
+                completedWorkUnits = 10L,
+                totalWorkUnits = 100L,
+                logMessage = "skipped"
+            )
+        )
+
+        assertNull(state.estimatedRemainingMs)
+    }
+
+    @Test
     fun appendsEveryRealLogLineInOrderAndTicksEstimateDown() {
         val started = CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L)
         val first = CalibrationProgressUiReducer.apply(
@@ -93,6 +109,38 @@ class CalibrationProgressUiStateTest {
         )
 
         assertEquals(4f / 15f, state.progressFraction, 0.0001f)
+    }
+
+    @Test
+    fun skippedStepSettlesWorkAndNeverMakesEtaOrProgressMoveBackward() {
+        val measured = CalibrationProgressUiReducer.apply(
+            CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L),
+            event(
+                type = CalibrationProgressEventType.STEP_COMPLETED,
+                elapsedMs = 10_000L,
+                completedWorkUnits = 20L,
+                totalWorkUnits = 100L,
+                logMessage = "completed",
+                stepIndex = 2,
+                totalSteps = 10
+            )
+        )
+        val skipped = CalibrationProgressUiReducer.apply(
+            measured,
+            event(
+                type = CalibrationProgressEventType.STEP_SKIPPED,
+                elapsedMs = 20_000L,
+                completedWorkUnits = 21L,
+                totalWorkUnits = 100L,
+                logMessage = "skipped: slot budget",
+                stepIndex = 3,
+                totalSteps = 10
+            )
+        )
+
+        assertTrue(skipped.progressFraction >= measured.progressFraction)
+        assertTrue(requireNotNull(skipped.estimatedRemainingMs) <= requireNotNull(measured.estimatedRemainingMs))
+        assertEquals("skipped: slot budget", skipped.logLines.last().text)
     }
 
     @Test
