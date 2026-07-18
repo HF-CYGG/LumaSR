@@ -1,5 +1,6 @@
 package com.lumasr.data
 
+import com.lumasr.domain.QnnCapabilitySnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -9,6 +10,61 @@ import org.junit.Test
 import java.io.File
 
 class DeviceCapabilityRepositoryTest {
+    @Test
+    fun disabledAndroidQnnProbeNeverLoadsProprietaryAdapter() {
+        var reads = 0
+        val probe = AndroidQnnCapabilityProbe(
+            enabledProvider = { false },
+            sdkIntProvider = { 35 },
+            isArm64Provider = { true },
+            recordReader = {
+                reads += 1
+                NativeQnnCapabilityRecord("provider", "v73", true, false)
+            }
+        )
+
+        val snapshot = probe.snapshot()
+
+        assertFalse(snapshot.isAvailable)
+        assertEquals(0, reads)
+        assertEquals("QNN runtime not packaged", snapshot.unavailableReason)
+    }
+
+    @Test
+    fun malformedAndroidQnnProbeResultFailsClosed() {
+        val probe = AndroidQnnCapabilityProbe(
+            enabledProvider = { true },
+            sdkIntProvider = { 35 },
+            isArm64Provider = { true },
+            recordReader = { NativeQnnCapabilityRecord(" provider ", "htp-v73", true, false) }
+        )
+
+        val snapshot = probe.snapshot()
+
+        assertFalse(snapshot.isAvailable)
+        assertEquals("QNN capability probe failed", snapshot.unavailableReason)
+    }
+
+    @Test
+    fun publishesQnnCapabilityAndInvalidatesProfileWhenProviderBuildChanges() {
+        fun qnn(providerBuildId: String) = QnnCapabilitySnapshot(
+            isAvailable = true,
+            sdkInt = 35,
+            isArm64 = true,
+            providerBuildId = providerBuildId,
+            htpArchitecture = "v73",
+            supportsFp16 = true,
+            supportsA16W8 = false
+        )
+
+        val first = repository(qnnSnapshot = qnn("2.31.0.250130" )).loadProfile()
+        val second = repository(qnnSnapshot = qnn("2.32.0.250228")).loadProfile()
+
+        assertEquals("v73", first.qnnCapabilities?.htpArchitecture)
+        assertTrue(first.qnnCapabilities?.supportsFp16 == true)
+        assertNotEquals(first.profileKey, second.profileKey)
+    }
+
     @Test
     fun assemblesLowRamStateAndStableMemoryBucket() {
         val profile = repository(
@@ -241,10 +297,21 @@ class DeviceCapabilityRepositoryTest {
             supportsVulkan = true,
             supportsFp16Storage = true,
             supportsFp16Arithmetic = true
+        ),
+        qnnSnapshot: QnnCapabilitySnapshot = QnnCapabilitySnapshot(
+            isAvailable = false,
+            sdkInt = androidSnapshot.sdkInt,
+            isArm64 = true,
+            providerBuildId = null,
+            htpArchitecture = null,
+            supportsFp16 = false,
+            supportsA16W8 = false,
+            unavailableReason = "QNN runtime not packaged"
         )
     ) = DeviceCapabilityRepository(
         androidSource = AndroidCapabilitySource { androidSnapshot },
-        nativeProbe = NativeCapabilityProbe { nativeSnapshot }
+        nativeProbe = NativeCapabilityProbe { nativeSnapshot },
+        qnnProbe = QnnCapabilityProbe { qnnSnapshot }
     )
 
     private fun androidSnapshot(

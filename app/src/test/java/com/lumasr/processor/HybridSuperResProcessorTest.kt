@@ -6,9 +6,15 @@ import com.lumasr.domain.ExportMode
 import com.lumasr.domain.ExtremeExportPlan
 import com.lumasr.domain.ExtremeExportTileSpec
 import com.lumasr.domain.InferenceStopReason
+import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceRuntimeBackend
+import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingResourceProfile
+import com.lumasr.domain.QnnExecutionConfig
+import com.lumasr.domain.QnnPerformanceMode
+import com.lumasr.domain.QnnPrecision
 import com.lumasr.domain.RuntimeInferenceControl
 import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
@@ -34,6 +40,66 @@ import java.io.File
 class HybridSuperResProcessorTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun routesQnnRuntimeRequestsToDedicatedProcessor() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val qnnProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            qnnProcessor = qnnProcessor,
+            nativeAvailable = { true },
+            qnnAvailable = { true }
+        )
+
+        val result = processor.process(qnnParams()) {}
+
+        assertTrue(result.success)
+        assertTrue(nativeProcessor.calls.isEmpty())
+        assertEquals(listOf(qnnParams()), qnnProcessor.calls)
+    }
+
+    @Test
+    fun unavailableQnnFallsBackToFailClosedNcnnProfile() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val qnnProcessor = RecordingProcessor()
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            qnnProcessor = qnnProcessor,
+            nativeAvailable = { true },
+            qnnAvailable = { false }
+        )
+
+        val result = processor.process(qnnParams()) {}
+
+        assertTrue(result.success)
+        assertTrue(qnnProcessor.calls.isEmpty())
+        val fallback = nativeProcessor.calls.single()
+        assertEquals(InferenceRuntimeBackend.NCNN, fallback.runtimeBackend)
+        assertEquals(AccelerationMode.AUTO, fallback.accelerationMode)
+        assertEquals(NativeBackend.LEGACY_SAFE, fallback.nativeBackend)
+        assertEquals(InferencePrecision.FP32, fallback.inferencePrecision)
+        assertEquals(null, fallback.qnnExecutionConfig)
+    }
+
+    @Test
+    fun qnnFailureFallsBackToNcnnWithoutReusingQnnSelection() = runBlocking {
+        val nativeProcessor = RecordingProcessor()
+        val qnnProcessor = StaticProcessor(
+            UpscaleResult("task-1", UpscaleStage.FAILED, null, false, "QNN graph failed")
+        )
+        val processor = HybridSuperResProcessor(
+            nativeProcessor = nativeProcessor,
+            qnnProcessor = qnnProcessor,
+            nativeAvailable = { true },
+            qnnAvailable = { true }
+        )
+
+        val result = processor.process(qnnParams()) {}
+
+        assertTrue(result.success)
+        assertEquals(InferenceRuntimeBackend.NCNN, nativeProcessor.calls.single().runtimeBackend)
+    }
 
     @Test
     fun nativeUnavailableFailsByDefaultInsteadOfMockingSuccess() = runBlocking {
@@ -738,6 +804,18 @@ class HybridSuperResProcessorTest {
         accelerationMode = AccelerationMode.AUTO,
         tta = false,
         outputFormat = OutputFormat.PNG
+    )
+
+    private fun qnnParams() = defaultParams().copy(
+        accelerationMode = AccelerationMode.QNN_HTP,
+        runtimeBackend = InferenceRuntimeBackend.QNN_HTP,
+        qnnExecutionConfig = QnnExecutionConfig(
+            graphKey = "waifu2x-cunet-fp16-v73",
+            precision = QnnPrecision.FP16,
+            tileSize = 256,
+            maxPipelineDepth = 2,
+            performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE
+        )
     )
 }
 

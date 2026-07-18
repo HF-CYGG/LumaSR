@@ -259,6 +259,21 @@ class InferenceCalibrationRunner(
             mode = request.mode
         )
         progress.startSession()
+        request.device.qnnCapabilities?.let { qnn ->
+            if (qnn.isAvailable) {
+                progress.note(
+                    "QNN HTP 能力",
+                    "# provider=${qnn.providerBuildId} · htp=${qnn.htpArchitecture} · " +
+                        "fp16=${if (qnn.supportsFp16) 1 else 0} · " +
+                        "a16w8=${if (qnn.supportsA16W8) 1 else 0}"
+                )
+            } else {
+                progress.note(
+                    "QNN HTP 能力",
+                    "↪ 跳过 QNN 校准 · ${qnn.unavailableReason ?: "能力快照不可用"}"
+                )
+            }
+        }
         if ((request.mode != CalibrationMode.LEGACY && !request.device.isQualcommAdreno) ||
             !request.device.supportsVulkan ||
             !request.device.supportsFp16Storage ||

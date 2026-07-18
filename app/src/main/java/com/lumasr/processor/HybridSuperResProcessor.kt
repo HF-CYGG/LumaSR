@@ -10,12 +10,15 @@ import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
 import com.lumasr.domain.ExtremeAccelerationDecision
 import com.lumasr.domain.InferenceStopReason
+import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceRuntimeBackend
 import com.lumasr.domain.ExtremeAccelerationPolicy
 import com.lumasr.domain.ExtremeExportPlanner
 import com.lumasr.domain.ExtremeExportTileSpec
 import com.lumasr.domain.ExtremeTileScheduler
 import com.lumasr.domain.NativeGpuHealthProbe
 import com.lumasr.domain.NativeOutputMode
+import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.ProcessingResourceProfile
 import com.lumasr.domain.RgbTransportBudgetDecision
 import com.lumasr.domain.RuntimeRgbTransportBudgetPolicy
@@ -39,6 +42,33 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+
+enum class QnnFallbackReason {
+    RUNTIME_UNAVAILABLE,
+    REQUEST_UNSUPPORTED,
+    EXECUTION_FAILED,
+    EXECUTION_EXCEPTION
+}
+
+data class QnnRuntimeEvent(
+    val taskId: String,
+    val selected: Boolean,
+    val fallbackReason: QnnFallbackReason? = null
+)
+
+fun interface QnnRuntimeReporter {
+    fun report(event: QnnRuntimeEvent)
+}
+
+private val DEFAULT_QNN_RUNTIME_REPORTER = QnnRuntimeReporter { event ->
+    runCatching {
+        Log.i(
+            "LumaSRPerformance",
+            "task=${event.taskId} runtime=qnn-htp selected=${if (event.selected) 1 else 0} " +
+                "fallback=${event.fallbackReason?.name ?: "none"}"
+        )
+    }
+}
 
 fun interface ExtremeRegionSourceFactory {
     fun open(path: String): ExtremeRegionSource?
@@ -136,7 +166,10 @@ class HybridSuperResProcessor(
         DEFAULT_RGB_TRANSPORT_BUDGET_PROVIDER,
     private val pipelineTransportReporter: PipelineTransportReporter =
         DEFAULT_PIPELINE_TRANSPORT_REPORTER,
-    private val onExtremeGpuDisabled: (String) -> Unit = {}
+    private val onExtremeGpuDisabled: (String) -> Unit = {},
+    private val qnnProcessor: SuperResProcessor = QnnNativeSuperResProcessor(),
+    private val qnnAvailable: () -> Boolean = { QnnNativeSuperResProcessor.isAvailable() },
+    private val qnnRuntimeReporter: QnnRuntimeReporter = DEFAULT_QNN_RUNTIME_REPORTER
 ) : SuperResProcessor, NativeCacheOwner {
     private val sessionDisabledExtremeGpuKeys = mutableSetOf<String>()
 
@@ -145,6 +178,9 @@ class HybridSuperResProcessor(
         onProgress: (UpscaleProgress) -> Unit,
         runtimeControlProvider: RuntimeInferenceControlProvider?
     ): UpscaleResult {
+        if (params.runtimeBackend == InferenceRuntimeBackend.QNN_HTP) {
+            return processQnnOrFallback(params, onProgress, runtimeControlProvider)
+        }
         return if (nativeAvailable()) {
             if (params.exportMode == ExportMode.EXTREME_SINGLE_PNG) {
                 processExtremeSinglePng(params, onProgress, runtimeControlProvider)
@@ -167,6 +203,7 @@ class HybridSuperResProcessor(
     }
 
     override fun cancel(taskId: String, reason: InferenceStopReason) {
+        qnnProcessor.cancel(taskId, reason)
         if (nativeAvailable()) {
             nativeProcessor.cancel(taskId, reason)
         }
@@ -175,7 +212,59 @@ class HybridSuperResProcessor(
 
     override fun clearNativeCache() {
         (nativeProcessor as? NativeCacheOwner)?.clearNativeCache()
+        (qnnProcessor as? NativeCacheOwner)?.clearNativeCache()
     }
+
+    private suspend fun processQnnOrFallback(
+        params: UpscaleParams,
+        onProgress: (UpscaleProgress) -> Unit,
+        runtimeControlProvider: RuntimeInferenceControlProvider?
+    ): UpscaleResult {
+        val unsupported = params.qnnExecutionConfig == null ||
+            params.accelerationMode != AccelerationMode.QNN_HTP ||
+            params.exportMode == ExportMode.EXTREME_SINGLE_PNG ||
+            params.pipelinePasses.isNotEmpty()
+        if (unsupported) {
+            qnnRuntimeReporter.report(
+                QnnRuntimeEvent(params.taskId, selected = false, QnnFallbackReason.REQUEST_UNSUPPORTED)
+            )
+            return process(params.toSafeNcnnFallback(), onProgress, runtimeControlProvider)
+        }
+        if (!runCatching(qnnAvailable).getOrDefault(false)) {
+            qnnRuntimeReporter.report(
+                QnnRuntimeEvent(params.taskId, selected = false, QnnFallbackReason.RUNTIME_UNAVAILABLE)
+            )
+            return process(params.toSafeNcnnFallback(), onProgress, runtimeControlProvider)
+        }
+
+        val qnnResult = try {
+            qnnRuntimeReporter.report(QnnRuntimeEvent(params.taskId, selected = true))
+            qnnProcessor.process(params, onProgress, runtimeControlProvider)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            qnnRuntimeReporter.report(
+                QnnRuntimeEvent(params.taskId, selected = false, QnnFallbackReason.EXECUTION_EXCEPTION)
+            )
+            return process(params.toSafeNcnnFallback(), onProgress, runtimeControlProvider)
+        }
+        if (qnnResult.success || qnnResult.stage == UpscaleStage.CANCELLED) return qnnResult
+
+        qnnRuntimeReporter.report(
+            QnnRuntimeEvent(params.taskId, selected = false, QnnFallbackReason.EXECUTION_FAILED)
+        )
+        return process(params.toSafeNcnnFallback(), onProgress, runtimeControlProvider)
+    }
+
+    private fun UpscaleParams.toSafeNcnnFallback(): UpscaleParams = copy(
+        accelerationMode = AccelerationMode.AUTO,
+        nativeBackend = NativeBackend.LEGACY_SAFE,
+        inferencePrecision = InferencePrecision.FP32,
+        commandBatchSize = 1,
+        maxPipelineDepth = 1,
+        runtimeBackend = InferenceRuntimeBackend.NCNN,
+        qnnExecutionConfig = null
+    )
 
     private suspend fun processSingleOrChainedPass(
         params: UpscaleParams,

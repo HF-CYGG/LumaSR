@@ -80,7 +80,9 @@ object InferenceExecutionProfileMapper {
         commandBatchSize = profile.commandBatchSize,
         modelCacheCapacity = profile.modelCacheCapacity,
         maxPipelineDepth = profile.maxPipelineDepth.coerceIn(1, 2),
-        vulkanTuning = profile.vulkanTuning
+        vulkanTuning = profile.vulkanTuning,
+        runtimeBackend = profile.runtimeBackend,
+        qnnExecutionConfig = profile.qnnConfig
     )
 
     fun from(params: UpscaleParams): InferenceExecutionProfile = InferenceExecutionProfile(
@@ -98,7 +100,9 @@ object InferenceExecutionProfileMapper {
         modelCacheCapacity = params.modelCacheCapacity.coerceIn(1, 2),
         tta = params.tta,
         maxPipelineDepth = params.maxPipelineDepth.coerceIn(1, 2),
-        vulkanTuning = params.vulkanTuning
+        vulkanTuning = params.vulkanTuning,
+        runtimeBackend = params.runtimeBackend,
+        qnnConfig = params.qnnExecutionConfig
     )
 }
 
@@ -249,6 +253,9 @@ class InferenceExecutionProfileResolver(
                 AdaptiveInferencePolicy.isBenchmarkValid(benchmark.identity, identity) &&
                 nowEpochMs in benchmark.measuredAtEpochMs..benchmark.validUntilEpochMs
         }
+        val calibratedQnnProfile = resolutionTier?.let { tier ->
+            benchmark?.qnnProfiles?.singleOrNull { it.resolutionTier == tier }
+        }
         val selectedProfile = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device,
             accelerationMode = params.accelerationMode,
@@ -258,7 +265,8 @@ class InferenceExecutionProfileResolver(
             currentSafeTileSize = params.tileSize,
             nowEpochMs = nowEpochMs,
             calibratedVulkanProfile = calibratedVulkanProfile,
-            calibratedTtaProfile = calibratedTtaProfile
+            calibratedTtaProfile = calibratedTtaProfile,
+            calibratedQnnProfile = calibratedQnnProfile
         )
         val profile = selectedProfile.copy(
             tileSize = if (!params.tta && params.accelerationMode == AccelerationMode.CPU) {

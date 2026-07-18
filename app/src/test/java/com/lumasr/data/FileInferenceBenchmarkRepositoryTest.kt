@@ -3,12 +3,15 @@ package com.lumasr.data
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedQnnProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
 import com.lumasr.domain.CalibrationMode
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
+import com.lumasr.domain.QnnPerformanceMode
+import com.lumasr.domain.QnnPrecision
 import com.lumasr.domain.ResolutionTier
 import com.lumasr.domain.VulkanCalibrationDecision
 import com.lumasr.domain.VulkanExecutionTuning
@@ -38,8 +41,61 @@ class FileInferenceBenchmarkRepositoryTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun persistsSchemaV6CalibrationModeAndVulkanTuning() = runBlocking {
-        val root = temporaryFolder.newFolder("schema-v6-adreno-tuning")
+    fun roundTripsSchemaV7QnnProfilesWithoutRawDeviceData() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v7-qnn")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val expected = result(
+            identity = identity(),
+            qnnProfiles = listOf(
+                CalibratedQnnProfile(
+                    resolutionTier = ResolutionTier.LARGE,
+                    graphKey = "realcugan-x4-fp16-v73",
+                    precision = QnnPrecision.FP16,
+                    tileSize = 256,
+                    maxPipelineDepth = 2,
+                    performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE,
+                    quality = passingQuality(),
+                    ncnnMedianDurationNanos = 2_000L,
+                    qnnMedianDurationNanos = 1_600L,
+                    ncnnP95DurationNanos = 2_400L,
+                    qnnP95DurationNanos = 2_000L,
+                    sampleCount = 30,
+                    measurementDurationMs = 60_000L
+                )
+            )
+        )
+
+        repository.save(expected)
+
+        assertEquals(listOf(expected), repository.list())
+        val json = File(root, "inference-benchmarks.json").readText()
+        assertTrue(json.contains("\"schemaVersion\":7"))
+        assertTrue(json.contains("\"graphKey\":\"realcugan-x4-fp16-v73\""))
+        assertFalse(json.contains("SM8650"))
+        assertFalse(json.contains("/storage/"))
+    }
+
+    @Test
+    fun schemaV6RecordsDefaultToEmptyQnnProfiles() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v6-compatible")
+        val repository = FileInferenceBenchmarkRepository(root)
+        repository.save(result(identity = identity()))
+        val record = File(root, "inference-benchmarks.json")
+        record.writeText(
+            record.readText()
+                .replace("\"schemaVersion\":7", "\"schemaVersion\":6")
+                .replace(",\"qnnProfiles\":[]", "")
+        )
+
+        val restored = repository.list()
+
+        assertEquals(1, restored.size)
+        assertTrue(restored.single().qnnProfiles.isEmpty())
+    }
+
+    @Test
+    fun persistsSchemaV7CalibrationModeAndVulkanTuning() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v7-adreno-tuning")
         val repository = FileInferenceBenchmarkRepository(root)
         val tuning = VulkanExecutionTuning(
             useSubgroupOps = false,
@@ -64,7 +120,7 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":6"))
+        assertTrue(json.contains("\"schemaVersion\":7"))
         assertTrue(json.contains("\"calibrationMode\":\"QUICK\""))
         assertTrue(json.contains("\"useSubgroupOps\":false"))
     }
@@ -83,7 +139,7 @@ class FileInferenceBenchmarkRepositoryTest {
     }
 
     @Test
-    fun persistsSchemaV6PositiveAndNegativeVulkanTierEvidence() = runBlocking {
+    fun persistsSchemaV7PositiveAndNegativeVulkanTierEvidence() = runBlocking {
         val root = temporaryFolder.newFolder("schema-v5-tier-evidence")
         val repository = FileInferenceBenchmarkRepository(root)
         val enabledProfile = CalibratedVulkanProfile(
@@ -120,7 +176,7 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":6"))
+        assertTrue(json.contains("\"schemaVersion\":7"))
         assertTrue(json.contains("\"decision\":\"PERFORMANCE_REJECTED\""))
         assertTrue(json.contains("\"maxPipelineDepth\":2"))
     }
@@ -229,7 +285,7 @@ class FileInferenceBenchmarkRepositoryTest {
         repository.save(expected)
 
         assertEquals(listOf(expected), repository.list())
-        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":6"))
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":7"))
     }
 
     @Test
@@ -261,7 +317,7 @@ class FileInferenceBenchmarkRepositoryTest {
         assertEquals(listOf(resolutionAwareResult("valid-profile")), records)
         assertTrue(records.single().ttaProfiles.isEmpty())
         assertTrue(record.exists())
-        assertTrue(record.readText().contains("\"schemaVersion\":6"))
+        assertTrue(record.readText().contains("\"schemaVersion\":7"))
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
@@ -688,6 +744,7 @@ class FileInferenceBenchmarkRepositoryTest {
         },
         cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
         ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
+        qnnProfiles: List<CalibratedQnnProfile> = emptyList(),
         calibrationMode: CalibrationMode = CalibrationMode.LEGACY
     ) = InferenceBenchmarkResult(
         identity = identity,
@@ -697,6 +754,7 @@ class FileInferenceBenchmarkRepositoryTest {
         vulkanTiers = vulkanTiers,
         cpuProfiles = cpuProfiles,
         ttaProfiles = ttaProfiles,
+        qnnProfiles = qnnProfiles,
         calibrationMode = calibrationMode,
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil

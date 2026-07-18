@@ -9,7 +9,8 @@ enum class SuperResEngine {
 enum class AccelerationMode {
     AUTO,
     VULKAN,
-    CPU
+    CPU,
+    QNN_HTP
 }
 
 enum class OutputFormat {
@@ -89,7 +90,9 @@ data class UpscaleParams(
     val commandBatchSize: Int = 1,
     val modelCacheCapacity: Int = 1,
     val maxPipelineDepth: Int = 1,
-    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
+    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT,
+    val runtimeBackend: InferenceRuntimeBackend = InferenceRuntimeBackend.NCNN,
+    val qnnExecutionConfig: QnnExecutionConfig? = null
 )
 
 data class UpscalePipelinePlan(
@@ -192,7 +195,8 @@ data class RuntimeInferenceControl(
     val commandBatchSize: Int,
     val thermalHeadroomPercent: Int,
     val shouldPause: Boolean,
-    val maxPipelineDepth: Int = 1
+    val maxPipelineDepth: Int = 1,
+    val qnnPerformanceMode: QnnPerformanceMode? = null
 ) {
     fun sanitized(): RuntimeInferenceControl = copy(
         commandBatchSize = commandBatchSize.coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE),

@@ -120,7 +120,8 @@ data class DeviceCapabilityProfile(
     val supportsFp16Storage: Boolean,
     val supportsFp16Arithmetic: Boolean,
     val vulkanCapabilities: VulkanDeviceCapabilities? = null,
-    val acceleratorCalibrationKey: String? = null
+    val acceleratorCalibrationKey: String? = null,
+    val qnnCapabilities: QnnCapabilitySnapshot? = null
 ) {
     val isQualcommAdreno: Boolean
         get() = vulkanCapabilities?.isQualcommAdreno == true
@@ -139,7 +140,9 @@ data class InferenceExecutionProfile(
     val openmpBlocktimeMs: Int = 20,
     val postprocessThreads: Int = 1,
     val maxPipelineDepth: Int = 1,
-    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
+    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT,
+    val runtimeBackend: InferenceRuntimeBackend = InferenceRuntimeBackend.NCNN,
+    val qnnConfig: QnnExecutionConfig? = null
 )
 
 data class Fp16QualityMetrics(
@@ -212,6 +215,7 @@ data class InferenceBenchmarkResult(
     },
     val cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
     val ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
+    val qnnProfiles: List<CalibratedQnnProfile> = emptyList(),
     val calibrationMode: CalibrationMode = CalibrationMode.LEGACY
 ) {
     init {
@@ -240,10 +244,13 @@ data class InferenceBenchmarkResult(
                 .distinct()
                 .size == ttaProfiles.size
         ) { "Calibrated TTA keys must be unique" }
+        require(qnnProfiles.map(CalibratedQnnProfile::resolutionTier).distinct().size == qnnProfiles.size) {
+            "Calibrated QNN resolution tiers must be unique"
+        }
     }
 
     val hasEnabledOptimizations: Boolean
-        get() = vulkanProfiles.isNotEmpty() || ttaProfiles.isNotEmpty()
+        get() = vulkanProfiles.isNotEmpty() || ttaProfiles.isNotEmpty() || qnnProfiles.isNotEmpty()
 }
 
 enum class ThermalLevel {
@@ -262,6 +269,39 @@ data class ThermalPolicyState(
 )
 
 object AdaptiveInferencePolicy {
+    fun isQnnProfileEligible(
+        device: DeviceCapabilityProfile,
+        profile: CalibratedQnnProfile
+    ): Boolean {
+        val capabilities = device.qnnCapabilities ?: return false
+        return capabilities.isAvailable &&
+            capabilities.sdkInt >= QnnCapabilitySnapshot.MIN_ANDROID_SDK &&
+            capabilities.isArm64 &&
+            capabilities.supports(profile.precision) &&
+            isQualityMetricsWellFormed(profile.quality) &&
+            profile.quality.ssim >= 0.995 &&
+            profile.quality.psnrDb >= 40.0 &&
+            profile.quality.p99ChannelError <= 3 &&
+            profile.sampleCount >= 30 &&
+            profile.measurementDurationMs >= 60_000L &&
+            isAtLeastFifteenPercentFaster(
+                baselineDurationNanos = profile.ncnnMedianDurationNanos,
+                candidateDurationNanos = profile.qnnMedianDurationNanos
+            ) &&
+            profile.qnnP95DurationNanos <= profile.ncnnP95DurationNanos
+    }
+
+    internal fun isAtLeastFifteenPercentFaster(
+        baselineDurationNanos: Long,
+        candidateDurationNanos: Long
+    ): Boolean {
+        if (baselineDurationNanos <= 0L || candidateDurationNanos <= 0L) return false
+        val quotient = baselineDurationNanos / 20L
+        val remainder = baselineDurationNanos % 20L
+        val requiredImprovement = quotient * 3L + (remainder * 3L + 19L) / 20L
+        return candidateDurationNanos <= baselineDurationNanos - requiredImprovement
+    }
+
     fun isFp16Eligible(
         device: DeviceCapabilityProfile,
         quality: Fp16QualityMetrics
@@ -350,7 +390,8 @@ object AdaptiveInferencePolicy {
         currentSafeTileSize: Int,
         nowEpochMs: Long,
         calibratedVulkanProfile: CalibratedVulkanProfile? = null,
-        calibratedTtaProfile: CalibratedTtaProfile? = null
+        calibratedTtaProfile: CalibratedTtaProfile? = null,
+        calibratedQnnProfile: CalibratedQnnProfile? = null
     ): InferenceExecutionProfile {
         val safeTileSize = UpscaleParamsFactory.sanitizeTileSize(currentSafeTileSize)
         if (ttaEnabled) {
@@ -365,6 +406,33 @@ object AdaptiveInferencePolicy {
             )
         }
         val isCapabilityUnknown = device.physicalCoreCount <= 0 || device.memoryBucketMb <= 0
+        val benchmarkIsValid = benchmarkResult != null &&
+            currentBenchmarkIdentity != null &&
+            isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity) &&
+            nowEpochMs >= benchmarkResult.measuredAtEpochMs &&
+            nowEpochMs <= benchmarkResult.validUntilEpochMs
+        val canUseQnn = !device.isLowRamDevice &&
+            !isCapabilityUnknown &&
+            accelerationMode in setOf(AccelerationMode.AUTO, AccelerationMode.QNN_HTP) &&
+            benchmarkIsValid &&
+            calibratedQnnProfile?.let { isQnnProfileEligible(device, it) } == true
+        if (canUseQnn) {
+            val measuredProfile = requireNotNull(calibratedQnnProfile)
+            return InferenceExecutionProfile(
+                backend = NativeBackend.LEGACY_SAFE,
+                accelerationMode = AccelerationMode.QNN_HTP,
+                precision = InferencePrecision.FP16,
+                cpuThreads = chooseCpuThreads(device, requestedThreads = 4),
+                tileSize = measuredProfile.tileSize,
+                commandBatchSize = 1,
+                gpuHeadroomPercent = 8,
+                modelCacheCapacity = 1,
+                tta = false,
+                maxPipelineDepth = measuredProfile.maxPipelineDepth,
+                runtimeBackend = InferenceRuntimeBackend.QNN_HTP,
+                qnnConfig = measuredProfile.toExecutionConfig()
+            )
+        }
         val baseProfile = if (device.isLowRamDevice || isCapabilityUnknown) {
             conservativeFallback(device, safeTileSize).let { fallback ->
                 if (accelerationMode == AccelerationMode.CPU) {
@@ -374,12 +442,10 @@ object AdaptiveInferencePolicy {
                 }
             }
         } else {
-            val canUseVulkan = accelerationMode != AccelerationMode.CPU && device.supportsVulkan
-            val benchmarkIsValid = benchmarkResult != null &&
-                currentBenchmarkIdentity != null &&
-                isBenchmarkValid(benchmarkResult.identity, currentBenchmarkIdentity) &&
-                nowEpochMs >= benchmarkResult.measuredAtEpochMs &&
-                nowEpochMs <= benchmarkResult.validUntilEpochMs
+            val canUseVulkan = accelerationMode in setOf(
+                AccelerationMode.AUTO,
+                AccelerationMode.VULKAN
+            ) && device.supportsVulkan
             val qualityAllowsFp16 = benchmarkResult?.fp16Quality?.let { quality ->
                 isFp16Eligible(device, quality)
             } == true
@@ -408,6 +474,7 @@ object AdaptiveInferencePolicy {
                     backend = NativeBackend.LEGACY_SAFE,
                     accelerationMode = when {
                         accelerationMode == AccelerationMode.CPU -> AccelerationMode.CPU
+                        accelerationMode == AccelerationMode.QNN_HTP -> AccelerationMode.AUTO
                         device.supportsVulkan -> accelerationMode
                         else -> AccelerationMode.AUTO
                     },
@@ -495,13 +562,23 @@ object AdaptiveInferencePolicy {
 
             ThermalLevel.MODERATE -> baseline.copy(
                 commandBatchSize = (baseline.commandBatchSize / 2).coerceAtLeast(1),
-                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(10)
+                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(10),
+                maxPipelineDepth = 1,
+                qnnConfig = baseline.qnnConfig?.copy(
+                    maxPipelineDepth = 1,
+                    performanceMode = QnnPerformanceMode.BALANCED
+                )
             )
 
             ThermalLevel.SEVERE,
             ThermalLevel.CRITICAL -> baseline.copy(
                 commandBatchSize = 1,
-                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(20)
+                gpuHeadroomPercent = baseline.gpuHeadroomPercent.coerceAtLeast(20),
+                maxPipelineDepth = 1,
+                qnnConfig = baseline.qnnConfig?.copy(
+                    maxPipelineDepth = 1,
+                    performanceMode = QnnPerformanceMode.LOW_POWER
+                )
             )
         }
         return ThermalPolicyState(

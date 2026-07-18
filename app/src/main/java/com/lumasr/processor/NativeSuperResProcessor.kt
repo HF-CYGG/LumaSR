@@ -1470,7 +1470,12 @@ internal fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     noise = noise,
     tileSize = tileSize,
     gpuHeadroomPercent = gpuHeadroomPercent,
-    accelerationMode = accelerationMode.ordinal,
+    accelerationMode = when (accelerationMode) {
+        AccelerationMode.AUTO -> AccelerationMode.AUTO.ordinal
+        AccelerationMode.VULKAN -> AccelerationMode.VULKAN.ordinal
+        AccelerationMode.CPU -> AccelerationMode.CPU.ordinal
+        AccelerationMode.QNN_HTP -> error("QNN HTP requests must be dispatched before entering the ncnn bridge")
+    },
     tta = tta,
     outputMode = outputMode.ordinal,
     outputCropLeft = outputCropLeft,

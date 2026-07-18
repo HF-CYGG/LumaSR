@@ -480,7 +480,7 @@ private fun ParameterSheet(
 
             SectionLabel("加速模式")
             AnimatedSegmentedSelector(
-                items = AccelerationMode.entries,
+                items = AccelerationMode.entries.filterNot { it == AccelerationMode.QNN_HTP },
                 selected = state.accelerationMode,
                 itemLabel = { it.accelerationLabel() },
                 onSelected = onAccelerationChanged
@@ -1857,6 +1857,7 @@ private fun AccelerationMode.accelerationLabel(): String {
         AccelerationMode.AUTO -> "GPU"
         AccelerationMode.VULKAN -> "Vulkan"
         AccelerationMode.CPU -> "CPU"
+        AccelerationMode.QNN_HTP -> "QNN HTP"
     }
 }
 

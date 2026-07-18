@@ -18,6 +18,7 @@ import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.AndroidThermalSignalSource
 import com.lumasr.data.AndroidRuntimeResourceSource
+import com.lumasr.processor.AndroidAdpfHintSessionFactory
 import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
@@ -74,7 +75,8 @@ class SuperResolutionService : Service() {
                     AndroidThermalSignalSource(this)
                 )::sampleLevel,
                 runtimeResourceProvider = runtimeResourceSource,
-                executionProfileResolver = createInferenceExecutionProfileResolver(this)
+                executionProfileResolver = createInferenceExecutionProfileResolver(this),
+                adpfHintSessionFactory = AndroidAdpfHintSessionFactory(this)
             ),
             maintenance = FileProcessingTaskMaintenance(
                 taskRoot = taskDirectory,

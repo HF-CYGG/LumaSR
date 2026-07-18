@@ -82,7 +82,7 @@ class SuperResProcessingTaskRunner(
         val lastThermalLevel = AtomicReference(thermalLevel)
         val initialResources = runCatching { runtimeResourceProvider.current() }
             .getOrNull()
-            .takeIf { it.isCompleteSnapshot() }
+            .takeIf { it.isCompleteSnapshot(currentParams.runtimeBackend) }
         val lastResources = AtomicReference<RuntimePipelineResources?>(initialResources)
         val pipelineDepth = AtomicReference(
             runtimePipelineDepthPolicy.decide(currentParams, thermalLevel, initialResources)
@@ -113,7 +113,7 @@ class SuperResProcessingTaskRunner(
                     }
                     try {
                         runtimeResourceProvider.current()
-                            .takeIf { it.isCompleteSnapshot() }
+                            .takeIf { it.isCompleteSnapshot(currentParams.runtimeBackend) }
                             ?.let(lastResources::set)
                     } catch (_: Throwable) {
                         // Runtime resource sampling is best-effort; retain the last valid snapshot.
@@ -150,12 +150,15 @@ class SuperResProcessingTaskRunner(
             commandBatchSize = effectiveProfile.commandBatchSize,
             thermalHeadroomPercent = thermalHeadroomPercent,
             shouldPause = shouldPause,
-            maxPipelineDepth = maxPipelineDepth
+            maxPipelineDepth = maxPipelineDepth,
+            qnnPerformanceMode = effectiveProfile.qnnConfig?.performanceMode
         ).sanitized()
 
-    private fun RuntimePipelineResources?.isCompleteSnapshot(): Boolean =
-        this?.availableRamBytes?.let { it > 0L } == true &&
-            this.gpuHeapBudgetBytes?.let { it > 0L } == true
+    private fun RuntimePipelineResources?.isCompleteSnapshot(
+        runtimeBackend: com.lumasr.domain.InferenceRuntimeBackend
+    ): Boolean = this?.availableRamBytes?.let { it > 0L } == true &&
+        (runtimeBackend == com.lumasr.domain.InferenceRuntimeBackend.QNN_HTP ||
+            this.gpuHeapBudgetBytes?.let { it > 0L } == true)
 
     private fun logThermalTransition(previous: ThermalLevel, current: ThermalLevel) {
         runCatching { Log.i(LOG_TAG, "thermalLevel=${previous.name}->${current.name}") }

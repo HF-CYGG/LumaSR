@@ -1,5 +1,11 @@
 import java.security.KeyStore
 import java.security.MessageDigest
+import groovy.json.JsonSlurper
+
+val qnnEnabled = providers.gradleProperty("lumasr.enableQnn")
+    .map(String::toBooleanStrict)
+    .orElse(false)
+val qnnPackageDirectory = providers.environmentVariable("LUMASR_QNN_PACKAGE_DIR")
 
 plugins {
     id("com.android.application")
@@ -17,6 +23,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.2.1"
+        buildConfigField("boolean", "LUMASR_QNN_ENABLED", qnnEnabled.get().toString())
 
         externalNativeBuild {
             cmake {
@@ -150,8 +157,158 @@ android {
         getByName("test").java.srcDir(
             rootProject.file("benchmark-shared/src/main/kotlin")
         )
+        if (qnnEnabled.get() && qnnPackageDirectory.isPresent) {
+            getByName("main").jniLibs.srcDir(
+                file(qnnPackageDirectory.get()).resolve("jniLibs")
+            )
+            getByName("main").assets.srcDir(
+                file(qnnPackageDirectory.get()).resolve("assets")
+            )
+        }
     }
 }
+
+val verifyQnnPackage = tasks.register("verifyQnnPackage") {
+    group = "verification"
+    description = "Verifies the external QAIRT package lock and every packaged artifact hash."
+    inputs.property("qnnEnabled", qnnEnabled)
+
+    doLast {
+        if (!qnnEnabled.get()) return@doLast
+        if (!qnnPackageDirectory.isPresent) {
+            throw GradleException(
+                "QNN is enabled but LUMASR_QNN_PACKAGE_DIR is missing. " +
+                    "Generate and lock the QAIRT package outside the repository first."
+            )
+        }
+        val packageRoot = file(qnnPackageDirectory.get()).canonicalFile
+        val lockFile = packageRoot.resolve("qnn-package-lock.json")
+        if (!lockFile.isFile) {
+            throw GradleException("Missing QNN package lock: ${lockFile.path}")
+        }
+        @Suppress("UNCHECKED_CAST")
+        val lock = JsonSlurper().parse(lockFile) as? Map<String, Any?>
+            ?: throw GradleException("QNN package lock must be a JSON object.")
+        if ((lock["schemaVersion"] as? Number)?.toInt() != 1) {
+            throw GradleException("Unsupported QNN package lock schema.")
+        }
+        val qairtVersion = lock["qairtVersion"] as? String
+            ?: throw GradleException("QNN package lock is missing qairtVersion.")
+        if (!Regex("2\\.46\\.[0-9]+").matches(qairtVersion)) {
+            throw GradleException("QAIRT package must use the approved 2.46.x toolchain.")
+        }
+        @Suppress("UNCHECKED_CAST")
+        val artifacts = lock["artifacts"] as? List<Map<String, Any?>>
+            ?: throw GradleException("QNN package lock is missing artifacts.")
+        if (artifacts.isEmpty()) {
+            throw GradleException("QNN package lock cannot have an empty artifact list.")
+        }
+        val seenPaths = mutableSetOf<String>()
+        artifacts.forEach { artifact ->
+            val relativePath = artifact["path"] as? String
+                ?: throw GradleException("QNN artifact path must be a string.")
+            val expectedSha256 = artifact["sha256"] as? String
+                ?: throw GradleException("QNN artifact sha256 must be a string.")
+            if (!Regex("[0-9a-f]{64}").matches(expectedSha256)) {
+                throw GradleException("QNN artifact hash must be lowercase SHA-256: $relativePath")
+            }
+            val normalizedPath = relativePath.replace('\\', '/')
+            val allowed = normalizedPath.startsWith("jniLibs/arm64-v8a/") ||
+                normalizedPath.startsWith("assets/qnn/")
+            if (!allowed || normalizedPath.startsWith("/") || ".." in normalizedPath.split('/')) {
+                throw GradleException("QNN artifact path escapes approved package roots: $relativePath")
+            }
+            if (!seenPaths.add(normalizedPath)) {
+                throw GradleException("Duplicate QNN artifact path: $relativePath")
+            }
+            val artifactFile = packageRoot.resolve(normalizedPath).canonicalFile
+            if (!artifactFile.toPath().startsWith(packageRoot.toPath()) || !artifactFile.isFile) {
+                throw GradleException("Missing or escaped QNN artifact: $relativePath")
+            }
+            val actualSha256 = MessageDigest.getInstance("SHA-256")
+                .digest(artifactFile.readBytes())
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+            if (actualSha256 != expectedSha256) {
+                throw GradleException("QNN artifact hash mismatch: $relativePath")
+            }
+        }
+        val requiredFiles = setOf(
+            "jniLibs/arm64-v8a/liblumasr_qnn_adapter.so",
+            "jniLibs/arm64-v8a/libQnnSystem.so",
+            "jniLibs/arm64-v8a/libQnnHtp.so",
+            "assets/qnn/graph-manifest.json"
+        )
+        val missing = requiredFiles - seenPaths
+        if (missing.isNotEmpty()) {
+            throw GradleException("QNN package is missing required artifacts: ${missing.sorted()}")
+        }
+        if (seenPaths.any { it.contains("calibration", ignoreCase = true) }) {
+            throw GradleException("Calibration corpus files must never be packaged in the APK.")
+        }
+        val packagedFiles = listOf("jniLibs", "assets")
+            .flatMap { directoryName ->
+                val directory = packageRoot.resolve(directoryName)
+                if (!directory.isDirectory) emptyList() else directory.walkTopDown()
+                    .filter(File::isFile)
+                    .map { file ->
+                        packageRoot.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+                    }
+                    .toList()
+            }
+            .toSet()
+        if (packagedFiles != seenPaths) {
+            val unlocked = (packagedFiles - seenPaths).sorted()
+            val missingFiles = (seenPaths - packagedFiles).sorted()
+            throw GradleException(
+                "QNN package contents do not exactly match the lock. " +
+                    "unlocked=$unlocked missing=$missingFiles"
+            )
+        }
+        val graphManifestFile = packageRoot.resolve("assets/qnn/graph-manifest.json")
+        @Suppress("UNCHECKED_CAST")
+        val graphManifest = JsonSlurper().parse(graphManifestFile) as? Map<String, Any?>
+            ?: throw GradleException("QNN graph manifest must be a JSON object.")
+        if ((graphManifest["schemaVersion"] as? Number)?.toInt() != 1) {
+            throw GradleException("Unsupported QNN graph manifest schema.")
+        }
+        @Suppress("UNCHECKED_CAST")
+        val graphs = graphManifest["graphs"] as? List<Map<String, Any?>>
+            ?: throw GradleException("QNN graph manifest is missing graphs.")
+        if (graphs.isEmpty()) throw GradleException("QNN graph manifest cannot be empty.")
+        graphs.forEach { graph ->
+            val graphKey = graph["graphKey"] as? String
+                ?: throw GradleException("QNN graph key must be a string.")
+            if (!Regex("[a-z0-9][a-z0-9._-]{0,127}").matches(graphKey)) {
+                throw GradleException("Invalid QNN graph key: $graphKey")
+            }
+            val artifactPath = (graph["artifactPath"] as? String)?.replace('\\', '/')
+                ?: throw GradleException("QNN graph artifactPath must be a string.")
+            if (!artifactPath.startsWith("assets/qnn/") || artifactPath !in seenPaths) {
+                throw GradleException("QNN graph artifact is not locked: $artifactPath")
+            }
+            val precision = graph["precision"] as? String
+            if (precision !in setOf("FP16", "A16W8")) {
+                throw GradleException("Unsupported QNN graph precision: $precision")
+            }
+            val tileSize = (graph["tileSize"] as? Number)?.toInt()
+            if (tileSize !in setOf(128, 256)) {
+                throw GradleException("Unsupported QNN graph tile size: $tileSize")
+            }
+            if ((graph["cpuPartitions"] as? Number)?.toInt() != 0) {
+                throw GradleException("QNN graph contains a CPU partition: $graphKey")
+            }
+            @Suppress("UNCHECKED_CAST")
+            val unsupportedOperators = graph["unsupportedOperators"] as? List<Any?>
+                ?: throw GradleException("QNN graph must declare unsupportedOperators.")
+            if (unsupportedOperators.isNotEmpty()) {
+                throw GradleException("QNN graph has unsupported operators: $graphKey")
+            }
+        }
+    }
+}
+
+tasks.matching { task -> task.name.startsWith("pre") && task.name.endsWith("Build") }
+    .configureEach { dependsOn(verifyQnnPackage) }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.02.00"))

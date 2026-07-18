@@ -12,6 +12,82 @@ import org.junit.Test
 
 class InferenceExecutionProfileResolverTest {
     @Test
+    fun resolverPublishesEligibleQnnProfileForMatchingResolutionTier() = runBlocking {
+        val qnnDevice = device().copy(
+            qnnCapabilities = QnnCapabilitySnapshot(
+                isAvailable = true,
+                sdkInt = 35,
+                isArm64 = true,
+                providerBuildId = "2.46.0",
+                htpArchitecture = "v73",
+                supportsFp16 = true,
+                supportsA16W8 = false
+            )
+        )
+        val base = params().copy(accelerationMode = AccelerationMode.AUTO)
+        val identity = BenchmarkIdentityFactory.create(
+            modelId = "model-a",
+            engine = base.engine,
+            modelArtifactHash = ModelArtifactIdentityFactory.create(model()),
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            device = qnnDevice,
+            rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
+        )
+        val qnn = CalibratedQnnProfile(
+            resolutionTier = ResolutionTier.LARGE,
+            graphKey = "waifu2x-fp16-v73",
+            precision = QnnPrecision.FP16,
+            tileSize = 256,
+            maxPipelineDepth = 2,
+            performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE,
+            quality = Fp16QualityMetrics(0.999, 48.0, 1),
+            ncnnMedianDurationNanos = 2_000L,
+            qnnMedianDurationNanos = 1_600L,
+            ncnnP95DurationNanos = 2_400L,
+            qnnP95DurationNanos = 2_000L,
+            sampleCount = 30,
+            measurementDurationMs = 60_000L
+        )
+        val resolver = resolver(
+            repository = FakeBenchmarkRepository(benchmark(identity, qnnProfiles = listOf(qnn))),
+            device = qnnDevice
+        )
+
+        val resolved = resolver.resolve(
+            "model-a",
+            base,
+            nowEpochMs = 1_500L,
+            outputPixels = 24_000_001L
+        )
+
+        assertEquals(InferenceRuntimeBackend.QNN_HTP, resolved.runtimeBackend)
+        assertEquals(qnn.toExecutionConfig(), resolved.qnnExecutionConfig)
+    }
+
+    @Test
+    fun mapperPersistsQnnRuntimeSelectionWithoutChangingNcnnControls() {
+        val base = params()
+        val qnn = QnnExecutionConfig(
+            graphKey = "realcugan-x4-fp16-v73",
+            precision = QnnPrecision.FP16,
+            tileSize = 256,
+            maxPipelineDepth = 2,
+            performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE
+        )
+        val profile = InferenceExecutionProfileMapper.from(base).copy(
+            accelerationMode = AccelerationMode.QNN_HTP,
+            runtimeBackend = InferenceRuntimeBackend.QNN_HTP,
+            qnnConfig = qnn
+        )
+
+        val resolved = InferenceExecutionProfileMapper.apply(base, profile)
+
+        assertEquals(InferenceRuntimeBackend.QNN_HTP, resolved.runtimeBackend)
+        assertEquals(qnn, resolved.qnnExecutionConfig)
+        assertEquals(profile, InferenceExecutionProfileMapper.from(resolved))
+    }
+
+    @Test
     fun mapperPersistsNativeExecutionControls() {
         val base = params()
         val tuning = VulkanExecutionTuning(
@@ -644,7 +720,8 @@ class InferenceExecutionProfileResolverTest {
         validUntil: Long = 2_000L,
         profiles: List<CalibratedVulkanProfile> = emptyList(),
         cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
-        ttaProfiles: List<CalibratedTtaProfile> = emptyList()
+        ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
+        qnnProfiles: List<CalibratedQnnProfile> = emptyList()
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
@@ -653,7 +730,8 @@ class InferenceExecutionProfileResolverTest {
         validUntilEpochMs = validUntil,
         vulkanProfiles = profiles,
         cpuProfiles = cpuProfiles,
-        ttaProfiles = ttaProfiles
+        ttaProfiles = ttaProfiles,
+        qnnProfiles = qnnProfiles
     )
 
     private fun ttaProfile(params: UpscaleParams) = CalibratedTtaProfile(

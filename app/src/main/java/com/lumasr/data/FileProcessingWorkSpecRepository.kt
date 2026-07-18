@@ -3,11 +3,15 @@ package com.lumasr.data
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
 import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceRuntimeBackend
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.ProcessingWorkSpecRepository
+import com.lumasr.domain.QnnExecutionConfig
+import com.lumasr.domain.QnnPerformanceMode
+import com.lumasr.domain.QnnPrecision
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import java.io.File
@@ -137,7 +141,8 @@ class FileProcessingWorkSpecRepository(
 }
 
 private object ProcessingWorkSpecJson {
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
+    private const val LEGACY_SCHEMA_VERSION = 1
     private val json = Json
 
     fun encode(workSpec: ProcessingWorkSpec): String = buildJsonObject {
@@ -149,10 +154,13 @@ private object ProcessingWorkSpecJson {
 
     fun decode(value: String): ProcessingWorkSpec {
         val record = json.parseToJsonElement(value).jsonObject
-        check(record.requiredInt("schemaVersion") == SCHEMA_VERSION) { "Unsupported work spec schema" }
+        val schemaVersion = record.requiredInt("schemaVersion")
+        check(schemaVersion == SCHEMA_VERSION || schemaVersion == LEGACY_SCHEMA_VERSION) {
+            "Unsupported work spec schema"
+        }
         return ProcessingWorkSpec.fromParams(
             modelId = record.requiredString("modelId"),
-            params = decodeParams(record.getValue("params").jsonObject),
+            params = decodeParams(record.getValue("params").jsonObject, schemaVersion),
             outputPixels = record.optionalLong("outputPixels")
         )
     }
@@ -191,9 +199,19 @@ private object ProcessingWorkSpecJson {
         put("commandBatchSize", params.commandBatchSize)
         put("modelCacheCapacity", params.modelCacheCapacity)
         put("maxPipelineDepth", params.maxPipelineDepth)
+        put("runtimeBackend", params.runtimeBackend.name)
+        put("qnnExecutionConfig", params.qnnExecutionConfig?.let(::encodeQnnConfig) ?: JsonNull)
     }
 
-    private fun decodeParams(record: JsonObject): UpscaleParams = UpscaleParams(
+    private fun encodeQnnConfig(config: QnnExecutionConfig): JsonObject = buildJsonObject {
+        put("graphKey", config.graphKey)
+        put("precision", config.precision.name)
+        put("tileSize", config.tileSize)
+        put("maxPipelineDepth", config.maxPipelineDepth)
+        put("performanceMode", config.performanceMode.name)
+    }
+
+    private fun decodeParams(record: JsonObject, schemaVersion: Int): UpscaleParams = UpscaleParams(
         taskId = record.requiredString("taskId"),
         inputPath = record.requiredString("inputPath"),
         outputPath = record.requiredString("outputPath"),
@@ -217,7 +235,9 @@ private object ProcessingWorkSpecJson {
         outputCropHeight = record.requiredInt("outputCropHeight"),
         retryCount = record.requiredInt("retryCount"),
         regionIndex = record.requiredInt("regionIndex"),
-        pipelinePasses = record.requiredArray("pipelinePasses").map { decodeParams(it.jsonObject) },
+        pipelinePasses = record.requiredArray("pipelinePasses").map {
+            decodeParams(it.jsonObject, schemaVersion)
+        },
         pipelineLabel = record.optionalString("pipelineLabel"),
         nativeBackend = NativeBackend.valueOf(record.requiredString("nativeBackend")),
         inferencePrecision = InferencePrecision.valueOf(record.requiredString("inferencePrecision")),
@@ -226,7 +246,28 @@ private object ProcessingWorkSpecJson {
         postprocessThreads = record.optionalInt("postprocessThreads") ?: 1,
         commandBatchSize = record.requiredInt("commandBatchSize"),
         modelCacheCapacity = record.requiredInt("modelCacheCapacity"),
-        maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1
+        maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1,
+        runtimeBackend = if (schemaVersion >= SCHEMA_VERSION) {
+            InferenceRuntimeBackend.valueOf(record.requiredString("runtimeBackend"))
+        } else {
+            InferenceRuntimeBackend.NCNN
+        },
+        qnnExecutionConfig = if (schemaVersion >= SCHEMA_VERSION) {
+            record["qnnExecutionConfig"]
+                ?.takeUnless { it is JsonNull }
+                ?.jsonObject
+                ?.let(::decodeQnnConfig)
+        } else {
+            null
+        }
+    )
+
+    private fun decodeQnnConfig(record: JsonObject): QnnExecutionConfig = QnnExecutionConfig(
+        graphKey = record.requiredString("graphKey"),
+        precision = QnnPrecision.valueOf(record.requiredString("precision")),
+        tileSize = record.requiredInt("tileSize"),
+        maxPipelineDepth = record.requiredInt("maxPipelineDepth"),
+        performanceMode = QnnPerformanceMode.valueOf(record.requiredString("performanceMode"))
     )
 
     private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive.content

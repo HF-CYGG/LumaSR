@@ -232,6 +232,33 @@ class RuntimePipelineDepthPolicyTest {
         return candidate
     }
 
+    @Test
+    fun qnnDepthTwoUsesRamAndHardLimitsWithoutRequiringVulkanHeap() {
+        val policy = approvedPolicy(
+            RuntimePipelineSlotEstimator { syntheticEstimate(64L * 1_024L * 1_024L) }
+        )
+        val qnn = params().copy(
+            nativeBackend = NativeBackend.LEGACY_SAFE,
+            accelerationMode = AccelerationMode.QNN_HTP,
+            runtimeBackend = InferenceRuntimeBackend.QNN_HTP,
+            qnnExecutionConfig = QnnExecutionConfig(
+                graphKey = "waifu2x-fp16-v73",
+                precision = QnnPrecision.FP16,
+                tileSize = 256,
+                maxPipelineDepth = 2,
+                performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE
+            )
+        )
+        val resources = RuntimePipelineResources(
+            availableRamBytes = 1_024L * 1_024L * 1_024L,
+            gpuHeapBudgetBytes = null,
+            isLowRamDevice = false
+        )
+
+        assertEquals(2, policy.decide(qnn, ThermalLevel.NORMAL, resources).maxPipelineDepth)
+        assertEquals(1, policy.decide(qnn, ThermalLevel.MODERATE, resources).maxPipelineDepth)
+    }
+
     private fun approvedPolicy(
         estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
     ) = RuntimePipelineDepthPolicy(estimator)

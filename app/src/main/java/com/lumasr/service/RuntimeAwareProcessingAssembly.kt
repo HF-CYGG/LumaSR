@@ -6,15 +6,18 @@ import com.lumasr.domain.RuntimePipelineResourceProvider
 import com.lumasr.domain.SuperResProcessor
 import com.lumasr.domain.ThermalLevel
 import com.lumasr.processor.ExtremeResourceProfileProvider
+import com.lumasr.processor.AdpfHintSessionFactory
+import com.lumasr.processor.AdpfPerformanceHintController
 import com.lumasr.processor.HybridSuperResProcessor
+import com.lumasr.processor.QnnNativeSuperResProcessor
 import com.lumasr.processor.RuntimePipelineExtremeResourceProfileProvider
 
 internal fun createRuntimeAwareTaskRunner(
     thermalLevelProvider: () -> ThermalLevel?,
     runtimeResourceProvider: RuntimePipelineResourceProvider,
     executionProfileResolver: ProcessingExecutionProfileResolver?,
-    processorFactory: (ExtremeResourceProfileProvider) -> SuperResProcessor =
-        DEFAULT_RUNTIME_AWARE_PROCESSOR_FACTORY,
+    adpfHintSessionFactory: AdpfHintSessionFactory? = null,
+    processorFactory: ((ExtremeResourceProfileProvider) -> SuperResProcessor)? = null,
     runnerFactory: (
         SuperResProcessor,
         () -> ThermalLevel?,
@@ -24,23 +27,26 @@ internal fun createRuntimeAwareTaskRunner(
 ): ProcessingTaskRunner {
     val extremeResourceProfileProvider =
         RuntimePipelineExtremeResourceProfileProvider(runtimeResourceProvider)
+    val effectiveProcessorFactory = processorFactory ?: { resourceProfileProvider ->
+        HybridSuperResProcessor(
+            extremeResourceProfileProvider = resourceProfileProvider,
+            rgbTransportBudgetProvider =
+                resourceProfileProvider as? com.lumasr.processor.RgbTransportBudgetProvider
+                    ?: com.lumasr.processor.RgbTransportBudgetProvider {
+                        com.lumasr.domain.RuntimeRgbTransportBudgetPolicy().decide(null)
+                    },
+            qnnProcessor = QnnNativeSuperResProcessor(
+                performanceHintController = adpfHintSessionFactory?.let {
+                    AdpfPerformanceHintController(it)
+                }
+            )
+        )
+    }
     return runnerFactory(
-        processorFactory(extremeResourceProfileProvider),
+        effectiveProcessorFactory(extremeResourceProfileProvider),
         thermalLevelProvider,
         runtimeResourceProvider,
         executionProfileResolver
-    )
-}
-
-private val DEFAULT_RUNTIME_AWARE_PROCESSOR_FACTORY:
-    (ExtremeResourceProfileProvider) -> SuperResProcessor = { resourceProfileProvider ->
-    HybridSuperResProcessor(
-        extremeResourceProfileProvider = resourceProfileProvider,
-        rgbTransportBudgetProvider =
-            resourceProfileProvider as? com.lumasr.processor.RgbTransportBudgetProvider
-                ?: com.lumasr.processor.RgbTransportBudgetProvider {
-                    com.lumasr.domain.RuntimeRgbTransportBudgetPolicy().decide(null)
-                }
     )
 }
 

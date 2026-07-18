@@ -121,6 +121,7 @@ enum class RuntimePipelineDepthReason {
     TTA_NOT_ELIGIBLE,
     THERMAL_NOT_ELIGIBLE,
     DEVICE_BENCHMARK_NOT_APPROVED,
+    QNN_CONFIG_MISSING,
     LOW_RAM_DEVICE,
     RESOURCE_UNKNOWN,
     ESTIMATE_OVERFLOW,
@@ -144,11 +145,17 @@ class RuntimePipelineDepthPolicy(
         thermalLevel: ThermalLevel,
         resources: RuntimePipelineResources?
     ): RuntimePipelineDepthDecision {
-        if (params.nativeBackend != NativeBackend.OPTIMIZED) {
+        val isQnn = params.runtimeBackend == InferenceRuntimeBackend.QNN_HTP
+        if (!isQnn && params.nativeBackend != NativeBackend.OPTIMIZED) {
             return depthOne(RuntimePipelineDepthReason.BACKEND_NOT_OPTIMIZED)
         }
-        if (params.accelerationMode != AccelerationMode.VULKAN) {
+        if (!isQnn && params.accelerationMode != AccelerationMode.VULKAN) {
             return depthOne(RuntimePipelineDepthReason.ACCELERATION_NOT_EXPLICIT_VULKAN)
+        }
+        if (isQnn && (params.accelerationMode != AccelerationMode.QNN_HTP ||
+                params.qnnExecutionConfig == null)
+        ) {
+            return depthOne(RuntimePipelineDepthReason.QNN_CONFIG_MISSING)
         }
         if (params.tta) {
             return depthOne(RuntimePipelineDepthReason.TTA_NOT_ELIGIBLE)
@@ -161,7 +168,7 @@ class RuntimePipelineDepthPolicy(
         }
         val availableRamBytes = resources?.availableRamBytes?.takeIf { it > 0L }
         val gpuHeapBudgetBytes = resources?.gpuHeapBudgetBytes?.takeIf { it > 0L }
-        if (availableRamBytes == null || gpuHeapBudgetBytes == null) {
+        if (availableRamBytes == null || (!isQnn && gpuHeapBudgetBytes == null)) {
             return depthOne(RuntimePipelineDepthReason.RESOURCE_UNKNOWN)
         }
         val estimate = estimator.estimate(params)
@@ -169,7 +176,7 @@ class RuntimePipelineDepthPolicy(
         if (estimate.twoSlotBytes > MAX_TWO_SLOT_BYTES) {
             return depthOne(RuntimePipelineDepthReason.HARD_LIMIT_EXCEEDED, estimate.twoSlotBytes)
         }
-        if (estimate.twoSlotBytes > percentBudget(gpuHeapBudgetBytes, GPU_HEAP_PERCENT)) {
+        if (!isQnn && estimate.twoSlotBytes > percentBudget(requireNotNull(gpuHeapBudgetBytes), GPU_HEAP_PERCENT)) {
             return depthOne(RuntimePipelineDepthReason.GPU_BUDGET_EXCEEDED, estimate.twoSlotBytes)
         }
         if (estimate.twoSlotBytes > percentBudget(availableRamBytes, AVAILABLE_RAM_PERCENT)) {
@@ -178,7 +185,12 @@ class RuntimePipelineDepthPolicy(
                 estimate.twoSlotBytes
             )
         }
-        if (params.maxPipelineDepth.coerceIn(1, 2) < 2) {
+        val approvedDepth = if (isQnn) {
+            minOf(params.maxPipelineDepth, requireNotNull(params.qnnExecutionConfig).maxPipelineDepth)
+        } else {
+            params.maxPipelineDepth
+        }
+        if (approvedDepth.coerceIn(1, 2) < 2) {
             return depthOne(
                 RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED,
                 estimate.twoSlotBytes

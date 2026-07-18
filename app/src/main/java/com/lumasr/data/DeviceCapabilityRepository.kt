@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import com.lumasr.domain.DeviceCapabilityProfile
+import com.lumasr.domain.QnnCapabilitySnapshot
 import com.lumasr.domain.VulkanDeviceCapabilities
 import com.lumasr.domain.VulkanDriverQuirks
 import java.security.MessageDigest
@@ -45,6 +46,28 @@ data class NativeCapabilitySnapshot(
 
 fun interface NativeCapabilityProbe {
     fun snapshot(): NativeCapabilitySnapshot
+}
+
+fun interface QnnCapabilityProbe {
+    fun snapshot(): QnnCapabilitySnapshot
+}
+
+class DisabledQnnCapabilityProbe(
+    private val sdkIntProvider: () -> Int = { Build.VERSION.SDK_INT },
+    private val isArm64Provider: () -> Boolean = {
+        Build.SUPPORTED_ABIS.any { it.equals("arm64-v8a", ignoreCase = true) }
+    }
+) : QnnCapabilityProbe {
+    override fun snapshot(): QnnCapabilitySnapshot = QnnCapabilitySnapshot(
+        isAvailable = false,
+        sdkInt = sdkIntProvider().coerceAtLeast(0),
+        isArm64 = isArm64Provider(),
+        providerBuildId = null,
+        htpArchitecture = null,
+        supportsFp16 = false,
+        supportsA16W8 = false,
+        unavailableReason = "QNN runtime not packaged"
+    )
 }
 
 class AndroidNativeCapabilityProbe(
@@ -134,19 +157,34 @@ class AndroidDeviceCapabilitySource(context: Context) : AndroidCapabilitySource 
 
 class DeviceCapabilityRepository(
     private val androidSource: AndroidCapabilitySource,
-    private val nativeProbe: NativeCapabilityProbe = AndroidNativeCapabilityProbe()
+    private val nativeProbe: NativeCapabilityProbe = AndroidNativeCapabilityProbe(),
+    private val qnnProbe: QnnCapabilityProbe = AndroidQnnCapabilityProbe()
 ) {
     constructor(
         context: Context,
-        nativeProbe: NativeCapabilityProbe = AndroidNativeCapabilityProbe()
+        nativeProbe: NativeCapabilityProbe = AndroidNativeCapabilityProbe(),
+        qnnProbe: QnnCapabilityProbe = AndroidQnnCapabilityProbe()
     ) : this(
         androidSource = AndroidDeviceCapabilitySource(context),
-        nativeProbe = nativeProbe
+        nativeProbe = nativeProbe,
+        qnnProbe = qnnProbe
     )
 
     fun loadProfile(): DeviceCapabilityProfile {
         val android = androidSource.snapshot()
         val native = nativeProbe.snapshot()
+        val qnn = runCatching(qnnProbe::snapshot).getOrElse {
+            QnnCapabilitySnapshot(
+                isAvailable = false,
+                sdkInt = android.sdkInt,
+                isArm64 = false,
+                providerBuildId = null,
+                htpArchitecture = null,
+                supportsFp16 = false,
+                supportsA16W8 = false,
+                unavailableReason = "QNN capability probe failed"
+            )
+        }
         val nativePhysicalCoreCount = native.physicalCoreCount?.takeIf { it > 0 }
         val physicalCoreCount = nativePhysicalCoreCount
             ?: android.runtimeCoreCount.coerceAtLeast(1)
@@ -177,7 +215,8 @@ class DeviceCapabilityRepository(
             gpuRoughScore = gpuRoughScore,
             supportsVulkan = native.supportsVulkan,
             supportsFp16Storage = native.supportsFp16Storage,
-            supportsFp16Arithmetic = native.supportsFp16Arithmetic
+            supportsFp16Arithmetic = native.supportsFp16Arithmetic,
+            qnnCapabilities = qnn
         )
 
         return DeviceCapabilityProfile(
@@ -197,7 +236,8 @@ class DeviceCapabilityRepository(
             supportsFp16Storage = native.supportsFp16Storage,
             supportsFp16Arithmetic = native.supportsFp16Arithmetic,
             vulkanCapabilities = vulkanCapabilities,
-            acceleratorCalibrationKey = acceleratorCalibrationKey
+            acceleratorCalibrationKey = acceleratorCalibrationKey,
+            qnnCapabilities = qnn
         )
     }
 
@@ -233,7 +273,7 @@ class DeviceCapabilityRepository(
     }
 
     private fun adrenoCalibrationKey(capabilities: VulkanDeviceCapabilities): String {
-        val values = listOf(
+        val values = mutableListOf<Any?>(
             ADRENO_SCHEMA_KEY,
             capabilities.vendorId,
             capabilities.deviceId,
@@ -270,9 +310,10 @@ class DeviceCapabilityRepository(
         gpuRoughScore: Int?,
         supportsVulkan: Boolean,
         supportsFp16Storage: Boolean,
-        supportsFp16Arithmetic: Boolean
+        supportsFp16Arithmetic: Boolean,
+        qnnCapabilities: QnnCapabilitySnapshot
     ): String {
-        val values = listOf(
+        val values = mutableListOf<String?>(
             SCHEMA_KEY,
             android.sdkInt.toString(),
             android.fingerprint.normalizedIdentity(MAX_IDENTITY_STRING_LENGTH),
@@ -289,6 +330,15 @@ class DeviceCapabilityRepository(
             supportsFp16Storage.toString(),
             supportsFp16Arithmetic.toString()
         )
+        if (qnnCapabilities.isAvailable) {
+            values.addAll(listOf(
+                "qnn-capability-v1",
+                qnnCapabilities.providerBuildId,
+                qnnCapabilities.htpArchitecture,
+                qnnCapabilities.supportsFp16.toString(),
+                qnnCapabilities.supportsA16W8.toString()
+            ))
+        }
         val encodedIdentity = values.joinToString(separator = "\n") { value ->
             if (value == null) "-1:" else "${value.length}:$value"
         }

@@ -3,6 +3,7 @@ package com.lumasr.data
 import com.lumasr.domain.BenchmarkIdentity
 import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
+import com.lumasr.domain.CalibratedQnnProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
@@ -10,6 +11,8 @@ import com.lumasr.domain.CalibrationMode
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
+import com.lumasr.domain.QnnPerformanceMode
+import com.lumasr.domain.QnnPrecision
 import com.lumasr.domain.ResolutionTier
 import com.lumasr.domain.VulkanCalibrationDecision
 import com.lumasr.domain.VulkanExecutionTuning
@@ -207,6 +210,9 @@ class FileInferenceBenchmarkRepository(
         result.ttaProfiles.forEach { profile ->
             validateQuality(profile.quality, "TTA")
         }
+        result.qnnProfiles.forEach { profile ->
+            validateQuality(profile.quality, "QNN")
+        }
     }
 
     private fun validateQuality(quality: Fp16QualityMetrics, label: String) {
@@ -325,8 +331,8 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 6
-    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4, 5)
+    private const val SCHEMA_VERSION = 7
+    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4, 5, 6)
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -379,6 +385,9 @@ private object BenchmarkResultJson {
         })
         put("ttaProfiles", buildJsonArray {
             result.ttaProfiles.forEach { add(encodeTtaProfile(it)) }
+        })
+        put("qnnProfiles", buildJsonArray {
+            result.qnnProfiles.forEach { add(encodeQnnProfile(it)) }
         })
         put("measuredAtEpochMs", result.measuredAtEpochMs)
         put("validUntilEpochMs", result.validUntilEpochMs)
@@ -434,6 +443,33 @@ private object BenchmarkResultJson {
         put("optimizedDurationNanos", profile.optimizedDurationNanos)
     }
 
+    private fun encodeQnnProfile(profile: CalibratedQnnProfile): JsonObject = buildJsonObject {
+        put("resolutionTier", profile.resolutionTier.name)
+        put("graphKey", profile.graphKey)
+        put("precision", profile.precision.name)
+        put("tileSize", profile.tileSize)
+        put("maxPipelineDepth", profile.maxPipelineDepth)
+        put("performanceMode", profile.performanceMode.name)
+        put("quality", buildJsonObject {
+            put("ssim", profile.quality.ssim)
+            put(
+                "psnrDb",
+                if (profile.quality.psnrDb == Double.POSITIVE_INFINITY) {
+                    JsonPrimitive(POSITIVE_INFINITY)
+                } else {
+                    JsonPrimitive(profile.quality.psnrDb)
+                }
+            )
+            put("p99ChannelError", profile.quality.p99ChannelError)
+        })
+        put("ncnnMedianDurationNanos", profile.ncnnMedianDurationNanos)
+        put("qnnMedianDurationNanos", profile.qnnMedianDurationNanos)
+        put("ncnnP95DurationNanos", profile.ncnnP95DurationNanos)
+        put("qnnP95DurationNanos", profile.qnnP95DurationNanos)
+        put("sampleCount", profile.sampleCount)
+        put("measurementDurationMs", profile.measurementDurationMs)
+    }
+
     fun decodeResult(encodedRecord: Pair<Int, JsonElement>): InferenceBenchmarkResult {
         val schemaVersion = encodedRecord.first
         val element = encodedRecord.second
@@ -479,9 +515,14 @@ private object BenchmarkResultJson {
             } else {
                 record.requiredArray("ttaProfiles").map { decodeTtaProfile(it.jsonObject) }
             },
+            qnnProfiles = if (schemaVersion >= 7) {
+                record.requiredArray("qnnProfiles").map { decodeQnnProfile(it.jsonObject) }
+            } else {
+                emptyList()
+            },
             measuredAtEpochMs = record.requiredLong("measuredAtEpochMs"),
             validUntilEpochMs = record.requiredLong("validUntilEpochMs"),
-            calibrationMode = if (schemaVersion >= SCHEMA_VERSION) {
+            calibrationMode = if (schemaVersion >= 6) {
                 CalibrationMode.valueOf(record.requiredString("calibrationMode"))
             } else {
                 CalibrationMode.LEGACY
@@ -539,6 +580,29 @@ private object BenchmarkResultJson {
             ),
             safeDurationNanos = record.requiredLong("safeDurationNanos"),
             optimizedDurationNanos = record.requiredLong("optimizedDurationNanos")
+        )
+    }
+
+    private fun decodeQnnProfile(record: JsonObject): CalibratedQnnProfile {
+        val quality = record.getValue("quality").jsonObject
+        return CalibratedQnnProfile(
+            resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
+            graphKey = record.requiredString("graphKey"),
+            precision = QnnPrecision.valueOf(record.requiredString("precision")),
+            tileSize = record.requiredInt("tileSize"),
+            maxPipelineDepth = record.requiredInt("maxPipelineDepth"),
+            performanceMode = QnnPerformanceMode.valueOf(record.requiredString("performanceMode")),
+            quality = Fp16QualityMetrics(
+                ssim = quality.requiredDouble("ssim"),
+                psnrDb = quality.requiredPsnr("psnrDb"),
+                p99ChannelError = quality.requiredInt("p99ChannelError")
+            ),
+            ncnnMedianDurationNanos = record.requiredLong("ncnnMedianDurationNanos"),
+            qnnMedianDurationNanos = record.requiredLong("qnnMedianDurationNanos"),
+            ncnnP95DurationNanos = record.requiredLong("ncnnP95DurationNanos"),
+            qnnP95DurationNanos = record.requiredLong("qnnP95DurationNanos"),
+            sampleCount = record.requiredInt("sampleCount"),
+            measurementDurationMs = record.requiredLong("measurementDurationMs")
         )
     }
 
