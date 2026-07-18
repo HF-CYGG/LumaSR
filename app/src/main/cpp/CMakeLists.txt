@@ -20,6 +20,7 @@ if(NOT ANDROID)
         superres_extreme_session.cpp
         superres_output_finalizer.cpp
         superres_pipeline_internal.cpp
+        superres_pipeline_cache_store.cpp
         superres_process_internal.cpp
         superres_rgb_image.cpp
         superres_rgb_output_target.cpp
@@ -32,6 +33,7 @@ if(NOT ANDROID)
         superres_rgb_output_target_checks.cpp
         superres_rgb_transport_checks.cpp
         superres_pipeline_internal_checks.cpp
+        superres_pipeline_cache_store_checks.cpp
         superres_execution_profile_checks.cpp
         superres_ncnn_stage_contract_checks.cpp
         superres_ordered_pipeline.cpp
@@ -75,7 +77,9 @@ add_library(localsr SHARED
     superres_rgb_output_target_checks.cpp
     superres_rgb_transport_checks.cpp
     superres_pipeline_internal.cpp
+    superres_pipeline_cache_store.cpp
     superres_pipeline_internal_checks.cpp
+    superres_pipeline_cache_store_checks.cpp
     superres_stbi_decode.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp

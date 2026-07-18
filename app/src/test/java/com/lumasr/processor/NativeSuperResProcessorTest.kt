@@ -204,7 +204,10 @@ class NativeSuperResProcessorTest {
             peakSlotBytes = 12_345,
             producerWaitMs = 7,
             consumerWaitMs = 8,
-            overlapMs = 9
+            overlapMs = 9,
+            pipelineCacheHit = true,
+            pipelineCacheBytes = 4096,
+            pipelineCacheRebuilt = false
         )
         val bridge = FakeNativeBridge(
             code = NativeProcessCode.OK,
@@ -292,7 +295,10 @@ class NativeSuperResProcessorTest {
             peakSlotBytes = 12_345,
             producerWaitMs = 7,
             consumerWaitMs = 8,
-            overlapMs = 9
+            overlapMs = 9,
+            pipelineCacheHit = true,
+            pipelineCacheBytes = 4096,
+            pipelineCacheRebuilt = false
         )
 
         val snapshot = events.single().performanceSnapshot!!
@@ -312,6 +318,9 @@ class NativeSuperResProcessorTest {
         assertEquals(7, snapshot.producerWaitMs)
         assertEquals(8, snapshot.consumerWaitMs)
         assertEquals(9, snapshot.overlapMs)
+        assertTrue(snapshot.pipelineCacheHit)
+        assertEquals(4096, snapshot.pipelineCacheBytes)
+        assertFalse(snapshot.pipelineCacheRebuilt)
     }
 
     @Test

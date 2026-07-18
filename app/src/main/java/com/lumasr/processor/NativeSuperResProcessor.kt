@@ -260,6 +260,13 @@ object JniNativeProcessBridge :
         clearCacheNative()
     }
 
+    internal fun configurePipelineCache(
+        configuration: NativePipelineCacheConfiguration
+    ): Boolean = configurePipelineCacheNative(
+        rootDirectory = configuration.directory.absolutePath,
+        enabled = configuration.enabled
+    )
+
     override fun processMemoryPipeline(
         request: NativeMemoryPipelineRequest,
         onProgress: (NativeProgressEvent) -> Unit,
@@ -454,6 +461,11 @@ object JniNativeProcessBridge :
 
     private external fun clearCacheNative()
 
+    private external fun configurePipelineCacheNative(
+        rootDirectory: String,
+        enabled: Boolean
+    ): Boolean
+
     private external fun mergeRawTilesToPngNative(
         outputPath: String,
         outputWidth: Int,
@@ -598,7 +610,10 @@ class NativeProgressSink(
         peakSlotBytes: Long,
         producerWaitMs: Long,
         consumerWaitMs: Long,
-        overlapMs: Long
+        overlapMs: Long,
+        pipelineCacheHit: Boolean = false,
+        pipelineCacheBytes: Long = 0,
+        pipelineCacheRebuilt: Boolean = false
     ) {
         val stage = UpscaleStage.entries.getOrElse(stageOrdinal) { UpscaleStage.PROCESSING_TILE }
         onProgress(
@@ -644,7 +659,10 @@ class NativeProgressSink(
                         peakSlotBytes = peakSlotBytes.coerceAtLeast(0),
                         producerWaitMs = producerWaitMs.coerceAtLeast(0),
                         consumerWaitMs = consumerWaitMs.coerceAtLeast(0),
-                        overlapMs = overlapMs.coerceAtLeast(0)
+                        overlapMs = overlapMs.coerceAtLeast(0),
+                        pipelineCacheHit = pipelineCacheHit,
+                        pipelineCacheBytes = pipelineCacheBytes.coerceAtLeast(0),
+                        pipelineCacheRebuilt = pipelineCacheRebuilt
                     )
                 } else {
                     null
@@ -1160,6 +1178,15 @@ class NativeSuperResProcessor(
 
         fun isAvailable(): Boolean = loaded
 
+        fun configurePersistentPipelineCache(
+            configuration: NativePipelineCacheConfiguration
+        ): Boolean {
+            if (!loaded) return false
+            return runCatching {
+                JniNativeProcessBridge.configurePipelineCache(configuration)
+            }.getOrDefault(false)
+        }
+
         private fun logPerformance(params: UpscaleParams, snapshot: NativePerformanceSnapshot) {
             Log.i(
                 LOG_TAG,
@@ -1177,7 +1204,9 @@ class NativeSuperResProcessor(
                     "pipelineDepth=${snapshot.effectivePipelineDepth} " +
                     "peakOccupiedSlots=${snapshot.peakOccupiedSlots} peakSlotBytes=${snapshot.peakSlotBytes} " +
                     "producerWaitMs=${snapshot.producerWaitMs} consumerWaitMs=${snapshot.consumerWaitMs} " +
-                    "overlapMs=${snapshot.overlapMs}"
+                    "overlapMs=${snapshot.overlapMs} pipelineCacheHit=${snapshot.pipelineCacheHit} " +
+                    "pipelineCacheBytes=${snapshot.pipelineCacheBytes} " +
+                    "pipelineCacheRebuilt=${snapshot.pipelineCacheRebuilt}"
             )
         }
     }

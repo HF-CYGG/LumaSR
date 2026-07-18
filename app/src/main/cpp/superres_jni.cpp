@@ -53,7 +53,7 @@ void emit_progress(
         method = env->GetMethodID(
             sink_class,
             "onProgress",
-            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIIIIIIJJJJ)V"
+            "(IIIFLjava/lang/String;ZJJJJJJJZIIIIIJJJJJJIIIIIIJJJJZJZ)V"
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {
@@ -108,7 +108,10 @@ void emit_progress(
             static_cast<jlong>(performance.peakPipelineSlotBytes),
             static_cast<jlong>(performance.producerWaitMs),
             static_cast<jlong>(performance.consumerWaitMs),
-            static_cast<jlong>(performance.pipelineOverlapMs)
+            static_cast<jlong>(performance.pipelineOverlapMs),
+            performance.pipelineCacheHit ? JNI_TRUE : JNI_FALSE,
+            static_cast<jlong>(performance.pipelineCacheBytes),
+            performance.pipelineCacheRebuilt ? JNI_TRUE : JNI_FALSE
         );
         throw_if_superres_jni_exception_pending(env);
     } catch (...) {
@@ -990,6 +993,23 @@ Java_com_lumasr_processor_JniNativeProcessBridge_clearCacheNative(
     jobject
 ) {
     clear_superres_cache();
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_lumasr_processor_JniNativeProcessBridge_configurePipelineCacheNative(
+    JNIEnv* env,
+    jobject,
+    jstring root_directory,
+    jboolean enabled
+) {
+    const int configured = run_superres_process_jni_boundary(env, [&]() -> int {
+        return configure_superres_pipeline_cache(
+            to_string(env, root_directory),
+            enabled == JNI_TRUE
+        ) ? 1 : 0;
+    });
+    return configured == 1 ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C"

@@ -155,7 +155,10 @@ data class NativePerformanceSnapshot(
     val peakSlotBytes: Long = 0,
     val producerWaitMs: Long = 0,
     val consumerWaitMs: Long = 0,
-    val overlapMs: Long = 0
+    val overlapMs: Long = 0,
+    val pipelineCacheHit: Boolean = false,
+    val pipelineCacheBytes: Long = 0,
+    val pipelineCacheRebuilt: Boolean = false
 )
 
 enum class NativeFallbackReason {

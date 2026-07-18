@@ -22,6 +22,7 @@ import com.lumasr.domain.ProcessingExecutionProfileResolver
 import com.lumasr.domain.VulkanCalibrationCandidates
 import com.lumasr.processor.NativeBitmapCalibrationProbe
 import com.lumasr.processor.NativeSuperResProcessor
+import com.lumasr.processor.NativePipelineCacheConfigurationFactory
 import java.io.File
 
 internal const val CALIBRATION_DIRECTORY_NAME = "inference-calibration"
@@ -30,6 +31,10 @@ internal fun createInferenceExecutionProfileResolver(
     context: Context
 ): ProcessingExecutionProfileResolver {
     val appContext = context.applicationContext
+    val device = DeviceCapabilityRepository(appContext).loadProfile()
+    NativeSuperResProcessor.configurePersistentPipelineCache(
+        NativePipelineCacheConfigurationFactory.create(appContext.noBackupFilesDir, device)
+    )
     return LazyProcessingExecutionProfileResolver(
         resolverFactory = {
             val modelArtifactIdentities = ModelManifestRepository(appContext)
@@ -40,7 +45,7 @@ internal fun createInferenceExecutionProfileResolver(
                 repository = FileInferenceBenchmarkRepository(
                     File(appContext.noBackupFilesDir, CALIBRATION_DIRECTORY_NAME)
                 ),
-                device = DeviceCapabilityRepository(appContext).loadProfile(),
+                device = device,
                 rawDeviceFingerprint = Build.FINGERPRINT.orEmpty(),
                 modelArtifactIdentities = modelArtifactIdentities,
                 runtimeBuildKey = inferenceRuntimeBuildKey()
@@ -54,6 +59,9 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     val directory = File(appContext.noBackupFilesDir, CALIBRATION_DIRECTORY_NAME)
     val repository = FileInferenceBenchmarkRepository(directory)
     val device = DeviceCapabilityRepository(appContext).loadProfile()
+    NativeSuperResProcessor.configurePersistentPipelineCache(
+        NativePipelineCacheConfigurationFactory.create(appContext.noBackupFilesDir, device)
+    )
     val nativeProcessor = NativeSuperResProcessor()
     val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
     val runtimeResources = AndroidRuntimeResourceSource(appContext)

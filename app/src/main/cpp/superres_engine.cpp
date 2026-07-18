@@ -7,6 +7,7 @@
 #include "superres_output_finalizer.h"
 #include "superres_pixel_io.h"
 #include "superres_pipeline_internal.h"
+#include "superres_pipeline_cache_store.h"
 #include "superres_process_internal.h"
 #include "superres_rgb_image_checks.h"
 #include "superres_rgb_output_target.h"
@@ -36,6 +37,7 @@
 #include <vector>
 
 #include "net.h"
+#include "pipelinecache.h"
 #include "command.h"
 #include "cpu.h"
 #include "gpu.h"
@@ -58,6 +60,7 @@ constexpr int kNativeOutputRawCroppedRgbTile = 1;
 
 std::mutex gpu_mutex;
 std::mutex net_cache_mutex;
+std::mutex pipeline_cache_store_mutex;
 SuperResTaskRegistry task_registry;
 SuperResExtremeSessionHandleRegistry extreme_session_registry;
 SuperResGpuInitState gpu_init_state = SuperResGpuInitState::Uninitialized;
@@ -71,12 +74,18 @@ struct ModelFiles {
 
 struct NetCacheEntry {
     std::string key;
+    std::shared_ptr<ncnn::PipelineCache> pipelineCache;
     std::shared_ptr<ncnn::Net> net;
+    bool pipelineCacheHit = false;
+    std::size_t pipelineCacheBytes = 0u;
 };
 
 struct LoadedNet {
+    std::shared_ptr<ncnn::PipelineCache> pipelineCache;
     std::shared_ptr<ncnn::Net> net;
     bool cacheHit = false;
+    bool pipelineCacheHit = false;
+    std::size_t pipelineCacheBytes = 0u;
 };
 
 class InvocationVulkanAllocators {
@@ -220,6 +229,7 @@ struct OptimizedVulkanPipelineSlot {
 
 NetCacheEntry net_cache;
 std::vector<NetCacheEntry> net_cache_entries;
+std::shared_ptr<SuperResPipelineCacheStore> pipeline_cache_store;
 
 long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -310,6 +320,34 @@ std::string make_net_cache_key(
         serialize_execution_cache_identity(useVulkan, profile);
 }
 
+std::string make_pipeline_cache_key(
+    const ModelFiles& files,
+    bool useVulkan,
+    const SuperResExecutionProfile& profile,
+    const ncnn::GpuInfo& gpuInfo
+) {
+    std::error_code error;
+    const auto paramBytes = std::filesystem::file_size(files.paramPath, error);
+    const auto safeParamBytes = error ? 0u : paramBytes;
+    error.clear();
+    const auto modelBytes = std::filesystem::file_size(files.binPath, error);
+    const auto safeModelBytes = error ? 0u : modelBytes;
+    return superres_sha256_hex(
+        std::string(NCNN_VERSION_STRING) + "\n" + files.paramPath + "\n" + files.binPath +
+        "\n" + std::to_string(safeParamBytes) + "\n" + std::to_string(safeModelBytes) +
+        "\n" + std::to_string(gpuInfo.vendor_id()) + "\n" +
+        std::to_string(gpuInfo.device_id()) + "\n" + std::to_string(gpuInfo.driver_id()) +
+        "\n" + std::to_string(gpuInfo.driver_version()) + "\n" +
+        pipeline_cache_uuid_hex(gpuInfo.pipeline_cache_uuid()) + "\n" +
+        serialize_execution_cache_identity(useVulkan, profile)
+    );
+}
+
+std::shared_ptr<SuperResPipelineCacheStore> current_pipeline_cache_store() {
+    std::lock_guard<std::mutex> lock(pipeline_cache_store_mutex);
+    return pipeline_cache_store;
+}
+
 void trim_cached_nets_locked(int requestedCapacity) {
     const std::size_t trimCount = cache_entries_to_trim(net_cache_entries.size(), requestedCapacity);
     if (trimCount > 0) {
@@ -334,26 +372,68 @@ LoadedNet load_cached_net(
                 auto cached = *it;
                 net_cache_entries.erase(it);
                 net_cache_entries.push_back(cached);
-                return LoadedNet{cached.net, true};
+                return LoadedNet{
+                    cached.pipelineCache,
+                    cached.net,
+                    true,
+                    cached.pipelineCacheHit,
+                    cached.pipelineCacheBytes
+                };
             }
         }
     }
 
     auto net = std::make_shared<ncnn::Net>();
+    std::shared_ptr<ncnn::PipelineCache> persistentPipelineCache;
+    std::shared_ptr<SuperResPipelineCacheStore> persistentStore;
+    std::string persistentCacheKey;
+    bool persistentCacheHit = false;
+    std::size_t persistentCacheBytes = 0u;
     net->opt.num_threads = profile.cpuThreads;
     net->opt.openmp_blocktime = profile.openmpBlocktimeMs;
     net->opt.use_packing_layout = true;
     net->opt.use_vulkan_compute = useVulkan;
     if (useVulkan) {
+        const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(ncnn::get_default_gpu_index());
         net->opt.use_fp16_packed = true;
         net->opt.use_fp16_storage = true;
         // Legacy-safe remains on FP32 arithmetic; optimized FP16 is gated by the GPU capability check.
         net->opt.use_fp16_arithmetic =
             profile.effectivePrecision == SuperResInferencePrecision::Fp16;
+        if (is_qualcomm_vulkan_vendor(gpuInfo.vendor_id())) {
+            net->opt.use_cooperative_matrix = false;
+            net->opt.use_mapped_model_loading =
+                is_regular_file(files.paramPath) && is_regular_file(files.binPath);
+        }
         net->set_vulkan_device(ncnn::get_default_gpu_index());
+        persistentStore = !gpuInfo.bug_corrupted_online_pipeline_cache()
+            ? current_pipeline_cache_store()
+            : nullptr;
+        const ncnn::VulkanDevice* device = net->vulkan_device();
+        if (persistentStore && device != nullptr) {
+            persistentCacheKey = make_pipeline_cache_key(files, useVulkan, profile, gpuInfo);
+            persistentPipelineCache = std::make_shared<ncnn::PipelineCache>(device);
+            const std::vector<unsigned char> cachedBytes = persistentStore->load(persistentCacheKey);
+            if (!cachedBytes.empty()) {
+                if (persistentPipelineCache->load_cache(cachedBytes) == 0) {
+                    persistentCacheHit = true;
+                    persistentCacheBytes = cachedBytes.size();
+                } else {
+                    persistentStore->remove(persistentCacheKey);
+                }
+            }
+            net->opt.pipeline_cache = persistentPipelineCache.get();
+        }
     }
     if (net->load_param(files.paramPath.c_str()) != 0 || net->load_model(files.binPath.c_str()) != 0) {
         return LoadedNet{};
+    }
+    if (persistentPipelineCache && persistentStore && !persistentCacheHit) {
+        std::vector<unsigned char> generatedCache;
+        if (persistentPipelineCache->save_cache(generatedCache) == 0 &&
+            persistentStore->save(persistentCacheKey, generatedCache)) {
+            persistentCacheBytes = generatedCache.size();
+        }
     }
 
     std::lock_guard<std::mutex> lock(net_cache_mutex);
@@ -369,8 +449,21 @@ LoadedNet load_cached_net(
     if (net_cache_entries.size() >= static_cast<std::size_t>(profile.modelCacheCapacity)) {
         net_cache_entries.erase(net_cache_entries.begin());
     }
-    net_cache_entries.push_back(NetCacheEntry{key, net});
-    return LoadedNet{net_cache_entries.back().net, false};
+    net_cache_entries.push_back(NetCacheEntry{
+        key,
+        persistentPipelineCache,
+        net,
+        persistentCacheHit,
+        persistentCacheBytes
+    });
+    const NetCacheEntry& stored = net_cache_entries.back();
+    return LoadedNet{
+        stored.pipelineCache,
+        stored.net,
+        false,
+        stored.pipelineCacheHit,
+        stored.pipelineCacheBytes
+    };
 }
 
 void clear_cached_net() {
@@ -465,7 +558,7 @@ void log_native_performance_sample(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=%s finalPublishPending=%d",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d pipelineCacheHit=%d pipelineCacheBytes=%lld pipelineCacheRebuilt=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=%s finalPublishPending=%d",
         params.taskId.c_str(),
         modelKey.c_str(),
         modelKey.c_str(),
@@ -489,6 +582,9 @@ void log_native_performance_sample(
         executionProfile.modelCacheCapacity,
         performance.cacheHit ? 1 : 0,
         performance.cacheSize,
+        performance.pipelineCacheHit ? 1 : 0,
+        performance.pipelineCacheBytes,
+        performance.pipelineCacheRebuilt ? 1 : 0,
         performance.retryCount,
         performance.regionIndex,
         performance.tileSize,
@@ -2515,6 +2611,10 @@ SuperResNativeCode run_ncnn_image_to_extreme_target_attempt(
     LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
+    performance.pipelineCacheHit = loadedNet.pipelineCacheHit;
+    performance.pipelineCacheBytes = static_cast<long long>(loadedNet.pipelineCacheBytes);
+    performance.pipelineCacheRebuilt =
+        !loadedNet.pipelineCacheHit && loadedNet.pipelineCacheBytes > 0u;
     performance.cacheSize = cached_net_count();
     if (!loadedNet.net) {
         return SuperResNativeCode::ModelMissing;
@@ -2687,6 +2787,10 @@ SuperResRgbPipelineStageAttempt run_ncnn_image_to_memory_attempt(
     LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
+    performance.pipelineCacheHit = loadedNet.pipelineCacheHit;
+    performance.pipelineCacheBytes = static_cast<long long>(loadedNet.pipelineCacheBytes);
+    performance.pipelineCacheRebuilt =
+        !loadedNet.pipelineCacheHit && loadedNet.pipelineCacheBytes > 0u;
     performance.cacheSize = cached_net_count();
     performance.retryCount = params.retryCount;
     performance.regionIndex = params.regionIndex;
@@ -2882,6 +2986,10 @@ SuperResNativeCode run_ncnn_image_attempt(
     LoadedNet loadedNet = load_cached_net(files, useVulkan, executionProfile);
     performance.modelLoadMs = elapsed_ms(modelLoadStart);
     performance.cacheHit = loadedNet.cacheHit;
+    performance.pipelineCacheHit = loadedNet.pipelineCacheHit;
+    performance.pipelineCacheBytes = static_cast<long long>(loadedNet.pipelineCacheBytes);
+    performance.pipelineCacheRebuilt =
+        !loadedNet.pipelineCacheHit && loadedNet.pipelineCacheBytes > 0u;
     performance.cacheSize = cached_net_count();
     performance.retryCount = params.retryCount;
     performance.regionIndex = params.regionIndex;
@@ -3627,6 +3735,25 @@ void abort_extreme_png_session(uint64_t handle) {
 
 void cancel_superres(const std::string& taskId) {
     task_registry.cancel(taskId);
+}
+
+bool configure_superres_pipeline_cache(const std::string& rootDirectory, bool enabled) {
+    std::lock_guard<std::mutex> gpuLock(gpu_mutex);
+    std::shared_ptr<SuperResPipelineCacheStore> configuredStore;
+    if (enabled) {
+        configuredStore = std::make_shared<SuperResPipelineCacheStore>(
+            std::filesystem::path(rootDirectory)
+        );
+        if (!configuredStore->configured()) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> storeLock(pipeline_cache_store_mutex);
+        pipeline_cache_store = std::move(configuredStore);
+    }
+    clear_cached_net();
+    return true;
 }
 
 void clear_superres_cache() {

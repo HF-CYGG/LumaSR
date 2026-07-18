@@ -114,6 +114,9 @@ struct SuperResNativePerformance {
     long long consumerWaitMs = 0;
     long long pipelineOverlapMs = 0;
     long long peakPipelineSlotBytes = 0;
+    bool pipelineCacheHit = false;
+    long long pipelineCacheBytes = 0;
+    bool pipelineCacheRebuilt = false;
 };
 
 using SuperResProgressCallback = std::function<void(
@@ -159,6 +162,7 @@ SuperResNativeCode process_superres_rgb(
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();
+bool configure_superres_pipeline_cache(const std::string& rootDirectory, bool enabled);
 SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot();
 SuperResNativeCode merge_raw_tiles_to_png(
     const std::string& outputPath,
