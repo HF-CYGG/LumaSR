@@ -67,6 +67,12 @@ interface InferenceCalibrationProbe {
             )
         }
 
+    suspend fun measure(
+        input: RgbImage,
+        params: UpscaleParams,
+        maxPipelineDepth: Int
+    ): CalibrationProbeMeasurement? = measure(input, params)
+
     fun cancel(taskId: String)
 }
 
@@ -209,7 +215,9 @@ class InferenceCalibrationRunner(
         SyntheticCalibrationPattern::generate,
     private val vulkanCalibrationCandidates: VulkanCalibrationCandidates =
         VulkanCalibrationCandidates(),
-    private val cpuCalibrationCandidates: CpuCalibrationCandidates? = CpuCalibrationCandidates()
+    private val cpuCalibrationCandidates: CpuCalibrationCandidates? = CpuCalibrationCandidates(),
+    private val runtimePipelineResourcesProvider: () -> RuntimePipelineResources? = { null },
+    private val runtimePipelineDepthPolicy: RuntimePipelineDepthPolicy = RuntimePipelineDepthPolicy()
 ) {
     init {
         require(timeoutMs > 0L) { "Calibration timeout must be positive" }
@@ -323,7 +331,8 @@ class InferenceCalibrationRunner(
                         val profile = CalibratedVulkanProfile(
                             resolutionTier = tier,
                             tileSize = result.candidate.tileSize,
-                            commandBatchSize = result.candidate.commandBatchSize
+                            commandBatchSize = result.candidate.commandBatchSize,
+                            maxPipelineDepth = result.candidate.maxPipelineDepth
                         )
                         vulkanTiers[tier] = CalibratedVulkanTier(
                             resolutionTier = tier,
@@ -436,6 +445,7 @@ class InferenceCalibrationRunner(
             inferencePrecision = InferencePrecision.FP32,
             commandBatchSize = 1,
             modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+            maxPipelineDepth = 1,
             tta = false,
             pipelinePasses = emptyList()
         )
@@ -1004,7 +1014,8 @@ class InferenceCalibrationRunner(
             nativeBackend = NativeBackend.OPTIMIZED,
             inferencePrecision = InferencePrecision.FP16,
             commandBatchSize = selected.commandBatchSize,
-            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+            maxPipelineDepth = 1
         )
         val selectedRecheck = measureSteadyState(
             pattern,
@@ -1038,12 +1049,87 @@ class InferenceCalibrationRunner(
                 )
             )
         }
+        val selectedDepth = calibratePipelineDepth(
+            tier = tier,
+            pattern = pattern,
+            params = selectedParams,
+            initialDepthOne = selected,
+            recheckedDepthOne = selectedRecheck,
+            initialReference = reference,
+            recheckedReference = referenceRecheck,
+            progress = progress
+        )
         return CandidateProbeResult.Ready(
             candidate = selected.copy(
+                maxPipelineDepth = selectedDepth,
                 durationNanos = maxOf(selected.durationNanos, selectedRecheck.durationNanos)
             ),
             baselineDurationNanos = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
         )
+    }
+
+    private suspend fun calibratePipelineDepth(
+        tier: ResolutionTier,
+        pattern: RgbImage,
+        params: UpscaleParams,
+        initialDepthOne: MeasuredVulkanCandidate,
+        recheckedDepthOne: CalibrationProbeMeasurement,
+        initialReference: CalibrationProbeMeasurement,
+        recheckedReference: CalibrationProbeMeasurement,
+        progress: CalibrationProgressSession
+    ): Int {
+        val resources = runCatching { runtimePipelineResourcesProvider() }.getOrNull()
+        val thermalLevel = runCatching { thermalLevelProvider() }.getOrNull()
+            ?: ThermalLevel.NORMAL
+        val depthTwoParams = params.copy(maxPipelineDepth = 2)
+        val decision = runtimePipelineDepthPolicy.decide(depthTwoParams, thermalLevel, resources)
+        if (decision.maxPipelineDepth < 2) return 1
+
+        val title = "$tier Vulkan depth=2"
+        val initialDepthTwo = measureSteadyState(
+            pattern,
+            depthTwoParams,
+            title,
+            progress,
+            maxPipelineDepth = 2
+        ) ?: return 1
+        if (!initialDepthTwo.hasSameShape(initialReference) ||
+            !initialDepthTwo.confirmedDepthTwo() ||
+            !AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos = initialDepthOne.durationNanos,
+                optimizedDurationNanos = initialDepthTwo.durationNanos
+            ) ||
+            !isAtLeastFivePercentFaster(
+                initialDepthTwo.durationNanos,
+                initialReference.durationNanos
+            )
+        ) {
+            return 1
+        }
+
+        val recheckedDepthTwo = measureSteadyState(
+            pattern,
+            depthTwoParams,
+            "$title 复测",
+            progress,
+            maxPipelineDepth = 2
+        ) ?: return 1
+        return if (
+            recheckedDepthTwo.hasSameShape(recheckedReference) &&
+            recheckedDepthTwo.confirmedDepthTwo() &&
+            AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos = recheckedDepthOne.durationNanos,
+                optimizedDurationNanos = recheckedDepthTwo.durationNanos
+            ) &&
+            isAtLeastFivePercentFaster(
+                recheckedDepthTwo.durationNanos,
+                recheckedReference.durationNanos
+            )
+        ) {
+            2
+        } else {
+            1
+        }
     }
 
     private fun calibrationInputEdge(tier: ResolutionTier, scale: Int): Int {
@@ -1141,9 +1227,10 @@ class InferenceCalibrationRunner(
         input: RgbImage,
         params: UpscaleParams,
         title: String,
-        progress: CalibrationProgressSession
+        progress: CalibrationProgressSession,
+        maxPipelineDepth: Int = 1
     ): CalibrationProbeMeasurement? {
-        val first = probe.measure(input, params) ?: return null
+        val first = probe.measure(input, params, maxPipelineDepth) ?: return null
         if (first.telemetry?.cacheHit != false) return first
         progress.note(
             "$title 模型预热",
@@ -1151,7 +1238,7 @@ class InferenceCalibrationRunner(
         )
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
-        val retry = probe.measure(input, params) ?: return null
+        val retry = probe.measure(input, params, maxPipelineDepth) ?: return null
         if (retry.telemetry?.cacheHit == false) {
             progress.note(
                 "$title 缓存异常",
@@ -1315,6 +1402,9 @@ class InferenceCalibrationRunner(
         other: CalibrationProbeMeasurement
     ): Boolean = outputWidth == other.outputWidth && outputHeight == other.outputHeight
 
+    private fun CalibrationProbeMeasurement.confirmedDepthTwo(): Boolean =
+        telemetry?.requestedMaxPipelineDepth == 2 && telemetry.effectivePipelineDepth == 2
+
     private fun estimatedTileCount(image: RgbImage, tileSize: Int): Int {
         val safeTileSize = tileSize.coerceAtLeast(1)
         val columns = (image.width + safeTileSize - 1L) / safeTileSize
@@ -1431,7 +1521,8 @@ class InferenceCalibrationRunner(
         val tileSize: Int,
         val commandBatchSize: Int,
         val durationNanos: Long,
-        val quality: Fp16QualityMetrics
+        val quality: Fp16QualityMetrics,
+        val maxPipelineDepth: Int = 1
     )
 
     private data class MeasuredCpuCandidate(

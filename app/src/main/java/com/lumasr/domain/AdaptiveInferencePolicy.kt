@@ -39,7 +39,8 @@ data class InferenceExecutionProfile(
     val modelCacheCapacity: Int,
     val tta: Boolean,
     val openmpBlocktimeMs: Int = 20,
-    val postprocessThreads: Int = 1
+    val postprocessThreads: Int = 1,
+    val maxPipelineDepth: Int = 1
 )
 
 data class Fp16QualityMetrics(
@@ -298,7 +299,8 @@ object AdaptiveInferencePolicy {
                     commandBatchSize = measuredProfile.commandBatchSize,
                     gpuHeadroomPercent = 8,
                     modelCacheCapacity = 2,
-                    tta = false
+                    tta = false,
+                    maxPipelineDepth = measuredProfile.maxPipelineDepth
                 )
             } else {
                 InferenceExecutionProfile(

@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import com.lumasr.BuildConfig
 import com.lumasr.data.AndroidThermalSignalSource
+import com.lumasr.data.AndroidRuntimeResourceSource
 import com.lumasr.data.DeviceCapabilityRepository
 import com.lumasr.data.FileInferenceBenchmarkRepository
 import com.lumasr.data.ModelManifestRepository
@@ -54,6 +55,7 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     val device = DeviceCapabilityRepository(appContext).loadProfile()
     val nativeProcessor = NativeSuperResProcessor()
     val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
+    val runtimeResources = AndroidRuntimeResourceSource(appContext)
     val probe = NativeBitmapCalibrationProbe(
         processor = nativeProcessor,
         cancelNative = nativeProcessor::cancel,
@@ -67,7 +69,8 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
             InferenceCalibrationRunner.currentAvailableHeapBytes()
         },
         vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded(),
-        cpuCalibrationCandidates = CpuCalibrationCandidates.productionBounded()
+        cpuCalibrationCandidates = CpuCalibrationCandidates.productionBounded(),
+        runtimePipelineResourcesProvider = runtimeResources::snapshot
     )
     return OnDeviceCalibrationCoordinator(
         repository = repository,

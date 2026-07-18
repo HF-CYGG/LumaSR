@@ -42,7 +42,8 @@ class FileInferenceBenchmarkRepositoryTest {
         val enabledProfile = CalibratedVulkanProfile(
             resolutionTier = ResolutionTier.SMALL,
             tileSize = 128,
-            commandBatchSize = 2
+            commandBatchSize = 2,
+            maxPipelineDepth = 2
         )
         val expected = result(
             identity = identity(),
@@ -74,6 +75,7 @@ class FileInferenceBenchmarkRepositoryTest {
         val json = File(root, "inference-benchmarks.json").readText()
         assertTrue(json.contains("\"schemaVersion\":5"))
         assertTrue(json.contains("\"decision\":\"PERFORMANCE_REJECTED\""))
+        assertTrue(json.contains("\"maxPipelineDepth\":2"))
     }
 
     @Test

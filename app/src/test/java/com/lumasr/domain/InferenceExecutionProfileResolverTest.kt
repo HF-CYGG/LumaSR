@@ -191,7 +191,12 @@ class InferenceExecutionProfileResolverTest {
                 identity,
                 batchSize = 8,
                 profiles = listOf(
-                    CalibratedVulkanProfile(ResolutionTier.STANDARD, 512, 8)
+                    CalibratedVulkanProfile(
+                        ResolutionTier.STANDARD,
+                        512,
+                        8,
+                        maxPipelineDepth = 2
+                    )
                 ),
                 cpuProfiles = cpuResolutionProfiles()
             )
@@ -208,6 +213,7 @@ class InferenceExecutionProfileResolverTest {
         assertEquals(8, resolved.commandBatchSize)
         assertEquals(8, resolved.gpuHeadroomPercent)
         assertEquals(2, resolved.modelCacheCapacity)
+        assertEquals(2, resolved.maxPipelineDepth)
         assertFalse(resolved.tta)
     }
 
@@ -389,6 +395,7 @@ class InferenceExecutionProfileResolverTest {
             assertEquals(InferencePrecision.FP32, resolved.inferencePrecision)
             assertEquals(1, resolved.commandBatchSize)
             assertEquals(1, resolved.modelCacheCapacity)
+            assertEquals(1, resolved.maxPipelineDepth)
         }
         assertEquals(
             AccelerationMode.CPU,

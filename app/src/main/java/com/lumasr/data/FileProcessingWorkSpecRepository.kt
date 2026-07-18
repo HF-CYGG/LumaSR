@@ -190,6 +190,7 @@ private object ProcessingWorkSpecJson {
         put("postprocessThreads", params.postprocessThreads)
         put("commandBatchSize", params.commandBatchSize)
         put("modelCacheCapacity", params.modelCacheCapacity)
+        put("maxPipelineDepth", params.maxPipelineDepth)
     }
 
     private fun decodeParams(record: JsonObject): UpscaleParams = UpscaleParams(
@@ -224,7 +225,8 @@ private object ProcessingWorkSpecJson {
         openmpBlocktimeMs = record.requiredInt("openmpBlocktimeMs"),
         postprocessThreads = record.optionalInt("postprocessThreads") ?: 1,
         commandBatchSize = record.requiredInt("commandBatchSize"),
-        modelCacheCapacity = record.requiredInt("modelCacheCapacity")
+        modelCacheCapacity = record.requiredInt("modelCacheCapacity"),
+        maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1
     )
 
     private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive.content

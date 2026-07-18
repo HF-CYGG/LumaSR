@@ -130,6 +130,39 @@ class NativeBitmapCalibrationProbeTest {
     }
 
     @Test
+    fun forwardsRequestedPipelineDepthToNativeRuntimeControl() = runBlocking {
+        val root = temporaryFolder.newFolder("pipeline-depth")
+        var observedDepth = 0
+        val processor = object : NativeBitmapRegionProcessor {
+            override suspend fun processBitmapRegion(
+                params: UpscaleParams,
+                bitmap: Bitmap?,
+                onProgress: (UpscaleProgress) -> Unit,
+                runtimeControlProvider: RuntimeInferenceControlProvider?
+            ): UpscaleResult {
+                observedDepth = requireNotNull(runtimeControlProvider).current().maxPipelineDepth
+                File(params.outputPath).writeBytes(byteArrayOf(1, 2, 3))
+                return successful(params)
+            }
+        }
+        val probe = NativeBitmapCalibrationProbe(
+            processor = processor,
+            cancelNative = {},
+            directory = root,
+            bitmapFactory = { null },
+            outputBoundsDecoder = { 2 to 2 }
+        )
+
+        probe.measure(
+            RgbImage(1, 1, byteArrayOf(1, 2, 3)),
+            params(),
+            maxPipelineDepth = 2
+        )
+
+        assertEquals(2, observedDepth)
+    }
+
+    @Test
     fun decodesSuccessfulOutputAndDeletesTemporaryFile() = runBlocking {
         val root = temporaryFolder.newFolder("success")
         val expected = RgbImage(2, 2, ByteArray(12) { it.toByte() })

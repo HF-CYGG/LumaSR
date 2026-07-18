@@ -76,7 +76,8 @@ object InferenceExecutionProfileMapper {
         openmpBlocktimeMs = profile.openmpBlocktimeMs,
         postprocessThreads = profile.postprocessThreads,
         commandBatchSize = profile.commandBatchSize,
-        modelCacheCapacity = profile.modelCacheCapacity
+        modelCacheCapacity = profile.modelCacheCapacity,
+        maxPipelineDepth = profile.maxPipelineDepth.coerceIn(1, 2)
     )
 
     fun from(params: UpscaleParams): InferenceExecutionProfile = InferenceExecutionProfile(
@@ -92,7 +93,8 @@ object InferenceExecutionProfileMapper {
             params.gpuHeadroomPercent
         ),
         modelCacheCapacity = params.modelCacheCapacity.coerceIn(1, 2),
-        tta = params.tta
+        tta = params.tta,
+        maxPipelineDepth = params.maxPipelineDepth.coerceIn(1, 2)
     )
 }
 
@@ -165,6 +167,7 @@ class LazyProcessingExecutionProfileResolver(
         cpuThreads = params.cpuThreads.coerceAtLeast(1),
         commandBatchSize = 1,
         modelCacheCapacity = 1,
+        maxPipelineDepth = 1,
         pipelinePasses = params.pipelinePasses.map(::failClosed)
     )
 }

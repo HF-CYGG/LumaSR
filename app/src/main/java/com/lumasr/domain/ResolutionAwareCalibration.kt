@@ -24,7 +24,8 @@ enum class ResolutionTier {
 data class CalibratedVulkanProfile(
     val resolutionTier: ResolutionTier,
     val tileSize: Int,
-    val commandBatchSize: Int
+    val commandBatchSize: Int,
+    val maxPipelineDepth: Int = 1
 ) {
     init {
         require(tileSize in UpscaleParamsFactory.supportedTileSizes) {
@@ -32,6 +33,9 @@ data class CalibratedVulkanProfile(
         }
         require(commandBatchSize in SUPPORTED_COMMAND_BATCH_SIZES) {
             "Calibrated Vulkan command batch size is unsupported"
+        }
+        require(maxPipelineDepth in 1..2) {
+            "Calibrated Vulkan pipeline depth must be in [1, 2]"
         }
     }
 

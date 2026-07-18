@@ -812,6 +812,88 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
+    fun pipelineDepthTwoRequiresTwoStableTenPercentWinsAndCompleteResources() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val requestedDepths = mutableListOf<Int>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    1L
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams,
+                    maxPipelineDepth: Int
+                ): CalibrationProbeMeasurement {
+                    requestedDepths += maxPipelineDepth
+                    val duration = when {
+                        params.nativeBackend == NativeBackend.LEGACY_SAFE -> 1_000L
+                        maxPipelineDepth == 2 -> 700L
+                        else -> 800L
+                    }
+                    return CalibrationProbeMeasurement(
+                        outputWidth = input.width * params.scale,
+                        outputHeight = input.height * params.scale,
+                        durationNanos = duration,
+                        telemetry = CalibrationProbeTelemetry(
+                            cacheHit = true,
+                            modelLoadMs = 0L,
+                            requestedMaxPipelineDepth = maxPipelineDepth,
+                            effectivePipelineDepth = maxPipelineDepth,
+                            peakSlotBytes = 1L,
+                            producerWaitMs = 0L,
+                            consumerWaitMs = 0L,
+                            overlapMs = if (maxPipelineDepth == 2) 1L else 0L
+                        )
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            ),
+            runtimePipelineResourcesProvider = {
+                RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
+            }
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().vulkanProfiles.all { it.maxPipelineDepth == 2 })
+        assertEquals(6, requestedDepths.count { it == 2 })
+    }
+
+    @Test
+    fun pipelineDepthTwoStaysDisabledWhenItIsLessThanTenPercentFaster() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = depthAwareProbe(depthOneNanos = 800L, depthTwoNanos = 730L),
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            ),
+            runtimePipelineResourcesProvider = {
+                RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
+            }
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().vulkanProfiles.all { it.maxPipelineDepth == 1 })
+    }
+
+    @Test
     fun cacheMissPerformanceProbeIsRetriedBeforeItsTimingCanBeSelected() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val attemptsByIdentity = mutableMapOf<String, Int>()
@@ -2108,7 +2190,8 @@ class InferenceCalibrationRunnerTest {
         availableHeapBytesProvider: () -> Long? = { Long.MAX_VALUE },
         calibrationPatternFactory: (Int, Int, Long) -> RgbImage = SyntheticCalibrationPattern::generate,
         vulkanCalibrationCandidates: VulkanCalibrationCandidates = VulkanCalibrationCandidates(),
-        cpuCalibrationCandidates: CpuCalibrationCandidates? = null
+        cpuCalibrationCandidates: CpuCalibrationCandidates? = null,
+        runtimePipelineResourcesProvider: () -> RuntimePipelineResources? = { null }
     ): InferenceCalibrationRunner = InferenceCalibrationRunner(
         probe = probe,
         repository = repository,
@@ -2118,8 +2201,48 @@ class InferenceCalibrationRunnerTest {
         availableHeapBytesProvider = availableHeapBytesProvider,
         calibrationPatternFactory = calibrationPatternFactory,
         vulkanCalibrationCandidates = vulkanCalibrationCandidates,
-        cpuCalibrationCandidates = cpuCalibrationCandidates
+        cpuCalibrationCandidates = cpuCalibrationCandidates,
+        runtimePipelineResourcesProvider = runtimePipelineResourcesProvider
     )
+
+    private fun depthAwareProbe(
+        depthOneNanos: Long,
+        depthTwoNanos: Long
+    ) = object : InferenceCalibrationProbe {
+        override suspend fun run(
+            input: RgbImage,
+            params: UpscaleParams
+        ): CalibrationProbeOutput = CalibrationProbeOutput(
+            RgbImage(input.width, input.height, input.copyBytes()),
+            1L
+        )
+
+        override suspend fun measure(
+            input: RgbImage,
+            params: UpscaleParams,
+            maxPipelineDepth: Int
+        ): CalibrationProbeMeasurement = CalibrationProbeMeasurement(
+            outputWidth = input.width * params.scale,
+            outputHeight = input.height * params.scale,
+            durationNanos = when {
+                params.nativeBackend == NativeBackend.LEGACY_SAFE -> 1_000L
+                maxPipelineDepth == 2 -> depthTwoNanos
+                else -> depthOneNanos
+            },
+            telemetry = CalibrationProbeTelemetry(
+                cacheHit = true,
+                modelLoadMs = 0L,
+                requestedMaxPipelineDepth = maxPipelineDepth,
+                effectivePipelineDepth = maxPipelineDepth,
+                peakSlotBytes = 1L,
+                producerWaitMs = 0L,
+                consumerWaitMs = 0L,
+                overlapMs = 0L
+            )
+        )
+
+        override fun cancel(taskId: String) = Unit
+    }
 
     private fun successfulProbe(
         probeCount: AtomicInteger? = null,

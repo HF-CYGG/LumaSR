@@ -370,6 +370,7 @@ private object BenchmarkResultJson {
         put("resolutionTier", profile.resolutionTier.name)
         put("tileSize", profile.tileSize)
         put("commandBatchSize", profile.commandBatchSize)
+        put("maxPipelineDepth", profile.maxPipelineDepth)
     }
 
     private fun encodeCpuProfile(profile: CalibratedCpuProfile): JsonObject = buildJsonObject {
@@ -463,7 +464,8 @@ private object BenchmarkResultJson {
         CalibratedVulkanProfile(
             resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
             tileSize = record.requiredInt("tileSize"),
-            commandBatchSize = record.requiredInt("commandBatchSize")
+            commandBatchSize = record.requiredInt("commandBatchSize"),
+            maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1
         )
 
     private fun decodeCpuProfile(record: JsonObject): CalibratedCpuProfile =
@@ -546,5 +548,13 @@ private object BenchmarkResultJson {
         return value.jsonPrimitive
             .also { check(!it.isString) { "$key must be a JSON number or null" } }
             .long
+    }
+
+    private fun JsonObject.optionalInt(key: String): Int? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(!it.isString) { "$key must be a JSON number or null" } }
+            .int
     }
 }

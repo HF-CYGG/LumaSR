@@ -213,7 +213,7 @@ class SuperResProcessingTaskRunnerTest {
     }
 
     @Test
-    fun defaultRuntimeDepthPolicyRejectsDepthTwoWithAbundantResources() = runBlocking {
+    fun defaultRuntimeDepthPolicyUsesPersistedApprovalWithAbundantResources() = runBlocking {
         val processor = RecordingProcessor()
         val runner = SuperResProcessingTaskRunner(
             processor = processor,
@@ -224,10 +224,16 @@ class SuperResProcessingTaskRunnerTest {
 
         assertEquals(
             ProcessingRunResult.Completed,
-            runner.run(task("depth-default-gate"), spec("depth-default-gate")) {}
+            runner.run(
+                task("depth-default-gate"),
+                ProcessingWorkSpec.fromParams(
+                    "model",
+                    params("depth-default-gate").copy(tileSize = 128, commandBatchSize = 1)
+                )
+            ) {}
         )
 
-        assertEquals(1, processor.controls.single().maxPipelineDepth)
+        assertEquals(2, processor.controls.single().maxPipelineDepth)
     }
 
     @Test
@@ -433,7 +439,7 @@ class SuperResProcessingTaskRunnerTest {
         isLowRamDevice = false
     )
 
-    private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy.approvedForTesting(
+    private fun alwaysEligibleDepthPolicy() = RuntimePipelineDepthPolicy(
         estimator = RuntimePipelineSlotEstimator {
             RuntimePipelineSlotEstimate(
                 inputRgbBytes = 0L,
@@ -446,8 +452,7 @@ class SuperResProcessingTaskRunnerTest {
                 perSlotBytes = 1L,
                 twoSlotBytes = 2L
             )
-        },
-        depthTwoApproved = { true }
+        }
     )
 
     private fun params(id: String): UpscaleParams {
@@ -470,7 +475,8 @@ class SuperResProcessingTaskRunnerTest {
             inferencePrecision = InferencePrecision.FP16,
             cpuThreads = 4,
             commandBatchSize = 8,
-            modelCacheCapacity = 2
+            modelCacheCapacity = 2,
+            maxPipelineDepth = 2
         )
     }
 

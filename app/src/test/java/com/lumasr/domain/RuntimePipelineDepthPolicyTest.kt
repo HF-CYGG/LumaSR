@@ -7,38 +7,21 @@ import org.junit.Test
 
 class RuntimePipelineDepthPolicyTest {
     @Test
-    fun depthTwoRemainsDisabledUntilDeviceBenchmarkApprovalIsProvided() {
+    fun persistedBenchmarkApprovalControlsDepthTwoWithoutATestOnlySeam() {
         val resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
         val estimator = RuntimePipelineSlotEstimator { syntheticEstimate(1L) }
 
-        val defaultDecision = RuntimePipelineDepthPolicy(estimator)
-            .decide(params(), ThermalLevel.NORMAL, resources)
-        val approvedDecision = RuntimePipelineDepthPolicy.approvedForTesting(
-            estimator = estimator,
-            depthTwoApproved = { true }
-        ).decide(params(), ThermalLevel.NORMAL, resources)
+        val disabledDecision = RuntimePipelineDepthPolicy(estimator)
+            .decide(params().copy(maxPipelineDepth = 1), ThermalLevel.NORMAL, resources)
+        val approvedDecision = RuntimePipelineDepthPolicy(estimator)
+            .decide(params().copy(maxPipelineDepth = 2), ThermalLevel.NORMAL, resources)
 
-        assertEquals(1, defaultDecision.maxPipelineDepth)
+        assertEquals(1, disabledDecision.maxPipelineDepth)
         assertEquals(
             RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED,
-            defaultDecision.reason
+            disabledDecision.reason
         )
         assertEquals(2, approvedDecision.maxPipelineDepth)
-    }
-
-    @Test
-    fun benchmarkApprovalFailureKeepsDepthTwoDisabled() {
-        val decision = RuntimePipelineDepthPolicy.approvedForTesting(
-            estimator = RuntimePipelineSlotEstimator { syntheticEstimate(1L) },
-            depthTwoApproved = { error("benchmark evidence unavailable") }
-        ).decide(
-            params = params(),
-            thermalLevel = ThermalLevel.NORMAL,
-            resources = RuntimePipelineResources(Long.MAX_VALUE, Long.MAX_VALUE, false)
-        )
-
-        assertEquals(1, decision.maxPipelineDepth)
-        assertEquals(RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED, decision.reason)
     }
 
     @Test
@@ -251,10 +234,7 @@ class RuntimePipelineDepthPolicyTest {
 
     private fun approvedPolicy(
         estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
-    ) = RuntimePipelineDepthPolicy.approvedForTesting(
-        estimator = estimator,
-        depthTwoApproved = { true }
-    )
+    ) = RuntimePipelineDepthPolicy(estimator)
 
     private fun syntheticEstimate(twoSlotBytes: Long) = RuntimePipelineSlotEstimate(
         inputRgbBytes = 0L,
@@ -282,6 +262,7 @@ class RuntimePipelineDepthPolicyTest {
         tta = false,
         outputFormat = OutputFormat.PNG,
         nativeBackend = NativeBackend.OPTIMIZED,
-        inferencePrecision = InferencePrecision.FP16
+        inferencePrecision = InferencePrecision.FP16,
+        maxPipelineDepth = 2
     )
 }

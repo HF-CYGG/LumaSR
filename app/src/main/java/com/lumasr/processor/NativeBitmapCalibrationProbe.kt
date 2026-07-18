@@ -8,6 +8,8 @@ import com.lumasr.domain.CalibrationProbeOutput
 import com.lumasr.domain.InferenceCalibrationProbe
 import com.lumasr.domain.RgbImage
 import com.lumasr.domain.NativePerformanceSnapshot
+import com.lumasr.domain.RuntimeInferenceControl
+import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.UpscaleParams
 import java.io.File
 
@@ -30,8 +32,14 @@ class NativeBitmapCalibrationProbe(
     override suspend fun measure(
         input: RgbImage,
         params: UpscaleParams
+    ): CalibrationProbeMeasurement? = measure(input, params, maxPipelineDepth = 1)
+
+    override suspend fun measure(
+        input: RgbImage,
+        params: UpscaleParams,
+        maxPipelineDepth: Int
     ): CalibrationProbeMeasurement? {
-        return execute(input, params) { output, durationNanos, telemetry ->
+        return execute(input, params, maxPipelineDepth) { output, durationNanos, telemetry ->
             val (width, height) = outputBoundsDecoder(output) ?: return@execute null
             if (width <= 0 || height <= 0) return@execute null
             CalibrationProbeMeasurement(width, height, durationNanos, telemetry)
@@ -41,6 +49,7 @@ class NativeBitmapCalibrationProbe(
     private suspend fun <T> execute(
         input: RgbImage,
         params: UpscaleParams,
+        maxPipelineDepth: Int = 1,
         decodeOutput: (File, Long, CalibrationProbeTelemetry?) -> T?
     ): T? {
         check(directory.isDirectory || directory.mkdirs()) {
@@ -57,6 +66,14 @@ class NativeBitmapCalibrationProbe(
                 bitmap = bitmap,
                 onProgress = { progress ->
                     progress.performanceSnapshot?.let { performanceSnapshot = it }
+                },
+                runtimeControlProvider = RuntimeInferenceControlProvider {
+                    RuntimeInferenceControl(
+                        commandBatchSize = params.commandBatchSize,
+                        thermalHeadroomPercent = 0,
+                        shouldPause = false,
+                        maxPipelineDepth = maxPipelineDepth.coerceIn(1, 2)
+                    )
                 }
             )
             val durationNanos = (nanoTime() - startedAt).coerceAtLeast(1L)

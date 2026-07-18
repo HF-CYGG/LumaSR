@@ -135,13 +135,9 @@ data class RuntimePipelineDepthDecision(
     val twoSlotBytes: Long? = null
 )
 
-class RuntimePipelineDepthPolicy private constructor(
-    private val estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator,
-    private val depthTwoApproved: (UpscaleParams) -> Boolean = { false }
+class RuntimePipelineDepthPolicy(
+    private val estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
 ) {
-    constructor(
-        estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator
-    ) : this(estimator, { false })
 
     fun decide(
         params: UpscaleParams,
@@ -182,7 +178,7 @@ class RuntimePipelineDepthPolicy private constructor(
                 estimate.twoSlotBytes
             )
         }
-        if (!runCatching { depthTwoApproved(params) }.getOrDefault(false)) {
+        if (params.maxPipelineDepth.coerceIn(1, 2) < 2) {
             return depthOne(
                 RuntimePipelineDepthReason.DEVICE_BENCHMARK_NOT_APPROVED,
                 estimate.twoSlotBytes
@@ -204,12 +200,6 @@ class RuntimePipelineDepthPolicy private constructor(
         const val MAX_TWO_SLOT_BYTES = 128L * 1024L * 1024L
         const val GPU_HEAP_PERCENT = 25
         const val AVAILABLE_RAM_PERCENT = 15
-
-        // Test-only seam. Production enablement must be wired to persisted device benchmark evidence.
-        internal fun approvedForTesting(
-            estimator: RuntimePipelineSlotEstimator = CheckedRuntimePipelineSlotEstimator,
-            depthTwoApproved: (UpscaleParams) -> Boolean
-        ) = RuntimePipelineDepthPolicy(estimator, depthTwoApproved)
 
         internal fun percentBudget(resourceBytes: Long, percent: Int): Long {
             if (resourceBytes <= 0L || percent <= 0) return 0L

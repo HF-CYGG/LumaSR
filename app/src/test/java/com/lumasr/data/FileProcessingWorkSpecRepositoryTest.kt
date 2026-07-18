@@ -82,6 +82,24 @@ class FileProcessingWorkSpecRepositoryTest {
     }
 
     @Test
+    fun readsLegacyWorkSpecWithoutPipelineDepthUsingSafeDefault() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-pipeline-depth")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText().replace(",\"maxPipelineDepth\":2", "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(1, restored?.params?.maxPipelineDepth)
+        assertTrue(restored?.params?.pipelinePasses.orEmpty().all { it.maxPipelineDepth == 1 })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
     fun corruptSidecarIsQuarantinedWithoutAffectingTaskRecords() = runBlocking {
         val root = temporaryFolder.newFolder("corrupt")
         val taskRepository = FileProcessingTaskRepository(root)
@@ -142,7 +160,8 @@ class FileProcessingWorkSpecRepositoryTest {
             openmpBlocktimeMs = 31,
             postprocessThreads = 3,
             commandBatchSize = 2,
-            modelCacheCapacity = 2
+            modelCacheCapacity = 2,
+            maxPipelineDepth = 2
         )
         val params = UpscaleParams(
             taskId = "task-1",
@@ -176,7 +195,8 @@ class FileProcessingWorkSpecRepositoryTest {
             openmpBlocktimeMs = 45,
             postprocessThreads = 5,
             commandBatchSize = 4,
-            modelCacheCapacity = 3
+            modelCacheCapacity = 3,
+            maxPipelineDepth = 2
         )
         return ProcessingWorkSpec.fromParams(
             modelId = "realesrgan-x4plus",
