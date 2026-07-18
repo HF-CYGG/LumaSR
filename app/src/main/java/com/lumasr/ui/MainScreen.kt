@@ -202,7 +202,7 @@ fun MainScreen(viewModel: LumaViewModel) {
             onDismissRequest = viewModel::skipCalibrationPrompt,
             title = { Text("启用安全高性能模式") },
             text = {
-                Text("可选的本机校准仅使用应用生成的测试图，约 40 秒；不会读取或上传你的照片。")
+                Text("可选的本机校准仅使用应用生成的测试图，耗时取决于设备与模型；不会读取或上传你的照片。")
             },
             confirmButton = {
                 TextButton(onClick = viewModel::runCalibration) { Text("开始校准") }
@@ -210,6 +210,12 @@ fun MainScreen(viewModel: LumaViewModel) {
             dismissButton = {
                 TextButton(onClick = viewModel::skipCalibrationPrompt) { Text("暂不校准") }
             }
+        )
+    }
+    state.calibrationDialog?.let { dialogState ->
+        CalibrationProgressDialog(
+            state = dialogState,
+            onDismiss = viewModel::dismissCalibrationDialog
         )
     }
 }
