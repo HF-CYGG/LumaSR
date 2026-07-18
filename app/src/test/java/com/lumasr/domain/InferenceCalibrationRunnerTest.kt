@@ -33,6 +33,7 @@ class InferenceCalibrationRunnerTest {
     fun productionCandidateBudgetMeasuresEveryRealTierWithoutExpandingSearchGrid() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val measured = mutableListOf<RecordedProbeRequest>()
+        val progressEvents = mutableListOf<CalibrationProgressEvent>()
         val outputEdges = mapOf(
             ResolutionTier.SMALL to 2_048,
             ResolutionTier.STANDARD to 3_072,
@@ -75,7 +76,10 @@ class InferenceCalibrationRunnerTest {
             cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
         )
 
-        val result = runner.run(request(outputScale = 2))
+        val result = runner.run(
+            request(outputScale = 2),
+            CalibrationProgressReporter(progressEvents::add)
+        )
 
         assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(9, measured.size)
@@ -89,6 +93,62 @@ class InferenceCalibrationRunnerTest {
         }
         assertEquals(3, repository.saved.single().vulkanProfiles.size)
         assertEquals(3, repository.saved.single().cpuProfiles.size)
+        val startedSteps = progressEvents.filter {
+            it.type == CalibrationProgressEventType.STEP_STARTED
+        }
+        assertEquals(11, startedSteps.size)
+        assertTrue(progressEvents.all { it.totalSteps == 11 })
+        assertEquals(
+            listOf(
+                "FP32 质量基准",
+                "FP16 质量候选",
+                "SMALL Vulkan FP32",
+                "SMALL Vulkan FP16",
+                "SMALL CPU FP32",
+                "STANDARD Vulkan FP32",
+                "STANDARD Vulkan FP16",
+                "STANDARD CPU FP32",
+                "LARGE Vulkan FP32",
+                "LARGE Vulkan FP16",
+                "LARGE CPU FP32"
+            ),
+            startedSteps.map { it.title }
+        )
+        assertTrue(progressEvents.any { it.logMessage.contains("tile=128") })
+        assertTrue(progressEvents.any { it.logMessage.contains("batch=1") })
+        assertTrue(progressEvents.any { it.logMessage.contains("输出 2048×2048") })
+        assertTrue(progressEvents.any { it.logMessage.contains("已选择 SMALL") })
+        assertTrue(progressEvents.last().logMessage.contains("校准结果已发布"))
+    }
+
+    @Test
+    fun progressReportsProbeFailureWithoutClaimingPublication() = runBlocking {
+        val events = mutableListOf<CalibrationProgressEvent>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput? = null
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = RecordingBenchmarkRepository(),
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates.productionBounded(),
+            cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        )
+
+        val result = runner.run(
+            request(outputScale = 2),
+            CalibrationProgressReporter(events::add)
+        )
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED),
+            result
+        )
+        assertTrue(events.any { it.logMessage.contains("探针失败") })
+        assertFalse(events.any { it.logMessage.contains("校准结果已发布") })
     }
 
     @Test
