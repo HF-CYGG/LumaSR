@@ -5,6 +5,18 @@
 #include <algorithm>
 #include <cstdint>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+inline constexpr int superres_pixel_io_simd_lane_count() {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    return 16;
+#else
+    return 1;
+#endif
+}
+
 inline float superres_clamp01(float value) {
     if (value < 0.0f) {
         return 0.0f;
@@ -32,6 +44,36 @@ inline void copy_rgb8_pixel_to_planar(
     green[destinationX] = static_cast<float>(pixel[1]) / 255.0f;
     blue[destinationX] = static_cast<float>(pixel[2]) / 255.0f;
 }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+inline void store_rgb8_u16x8_as_normalized_float(uint16x8_t values, float* destination) {
+    const float32x4_t divisor = vdupq_n_f32(255.0f);
+    const uint32x4_t low = vmovl_u16(vget_low_u16(values));
+    const uint32x4_t high = vmovl_u16(vget_high_u16(values));
+    vst1q_f32(destination, vdivq_f32(vcvtq_f32_u32(low), divisor));
+    vst1q_f32(destination + 4, vdivq_f32(vcvtq_f32_u32(high), divisor));
+}
+
+inline int copy_contiguous_rgb8_to_planar_neon(
+    const unsigned char* sourceRgb,
+    int pixelCount,
+    float* red,
+    float* green,
+    float* blue
+) {
+    int x = 0;
+    for (; x <= pixelCount - superres_pixel_io_simd_lane_count(); x += 16) {
+        const uint8x16x3_t pixels = vld3q_u8(sourceRgb + static_cast<size_t>(x) * 3);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_low_u8(pixels.val[0])), red + x);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_high_u8(pixels.val[0])), red + x + 8);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_low_u8(pixels.val[1])), green + x);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_high_u8(pixels.val[1])), green + x + 8);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_low_u8(pixels.val[2])), blue + x);
+        store_rgb8_u16x8_as_normalized_float(vmovl_u8(vget_high_u8(pixels.val[2])), blue + x + 8);
+    }
+    return x;
+}
+#endif
 
 inline bool copy_clamped_rgb8_row_to_planar(
     const unsigned char* sourceRgb,
@@ -69,7 +111,19 @@ inline bool copy_clamped_rgb8_row_to_planar(
     if (interiorBegin < interiorEnd) {
         const int sourceInteriorX = sourceX + interiorBegin;
         const unsigned char* sourcePixel = sourceRgb + static_cast<size_t>(sourceInteriorX) * 3;
-        for (int x = interiorBegin; x < interiorEnd; ++x) {
+        int x = interiorBegin;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const int converted = copy_contiguous_rgb8_to_planar_neon(
+            sourcePixel,
+            interiorEnd - interiorBegin,
+            red + interiorBegin,
+            green + interiorBegin,
+            blue + interiorBegin
+        );
+        x += converted;
+        sourcePixel += static_cast<size_t>(converted) * 3;
+#endif
+        for (; x < interiorEnd; ++x) {
             copy_rgb8_pixel_to_planar(sourcePixel, x, red, green, blue);
             sourcePixel += 3;
         }
