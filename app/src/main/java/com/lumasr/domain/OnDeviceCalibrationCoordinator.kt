@@ -32,10 +32,7 @@ class OnDeviceCalibrationCoordinator(
             device.physicalCoreCount > 0 &&
             device.supportsVulkan &&
             device.supportsFp16Storage &&
-            device.supportsFp16Arithmetic &&
-            device.gpuRoughScore?.let {
-                it >= AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE
-            } == true
+            device.supportsFp16Arithmetic
 
     override suspend fun run(
         model: ModelPack,

@@ -98,6 +98,31 @@ class OnDeviceCalibrationCoordinatorTest {
     }
 
     @Test
+    fun lowGpuRoughScoreDoesNotPreemptSafetyCalibration() = runBlocking {
+        var invoked = false
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = CalibrationRequestExecutor {
+                invoked = true
+                CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+            },
+            device = device().copy(gpuRoughScore = 21),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+
+        val result = coordinator.run(model(), File("build/models").absolutePath)
+
+        assertTrue(coordinator.isSupported)
+        assertTrue(invoked)
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED),
+            result
+        )
+    }
+
+    @Test
     fun unknownGpuOrDeviceFingerprintCannotRunCalibration() = runBlocking {
         val unknownDevices = listOf(
             device().copy(gpuVendor = null),

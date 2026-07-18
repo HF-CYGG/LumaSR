@@ -195,10 +195,14 @@ class InferenceCalibrationRunner(
         request: InferenceCalibrationRequest,
         taskId: String
     ): CalibrationPreparation {
+        val fp16Quality = when (val result = calibrateFp16Quality(request, taskId)) {
+            is QualityProbeResult.Ready -> result.quality
+            is QualityProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+        }
         val selectedByTier = linkedMapOf<ResolutionTier, MeasuredVulkanCandidate>()
         val selectedCpuByTier = linkedMapOf<ResolutionTier, MeasuredCpuCandidate>()
         for (tier in ResolutionTier.entries) {
-            when (val result = calibrateTier(request, taskId, tier)) {
+            when (val result = calibrateTier(request, taskId, tier, fp16Quality)) {
                 is CandidateProbeResult.Ready -> selectedByTier[tier] = result.candidate
                 is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
             }
@@ -227,7 +231,7 @@ class InferenceCalibrationRunner(
         val standard = selectedByTier.getValue(ResolutionTier.STANDARD)
         val benchmark = InferenceBenchmarkResult(
             identity = request.identity,
-            fp16Quality = standard.quality,
+            fp16Quality = fp16Quality,
             recommendedCommandBatchSize = standard.commandBatchSize,
             measuredAtEpochMs = request.measuredAtEpochMs,
             validUntilEpochMs = request.measuredAtEpochMs + VALIDITY_MS,
@@ -252,6 +256,58 @@ class InferenceCalibrationRunner(
         return CalibrationPreparation.Ready(benchmark)
     }
 
+    private suspend fun calibrateFp16Quality(
+        request: InferenceCalibrationRequest,
+        taskId: String
+    ): QualityProbeResult {
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!hasSufficientHeapFor(ResolutionTier.SMALL)) {
+            return QualityProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val inputEdge = (QUALITY_OUTPUT_EDGE / request.baseParams.scale).coerceAtLeast(1)
+        val pattern = calibrationPatternFactory(inputEdge, inputEdge, QUALITY_PATTERN_SEED)
+        val safeParams = request.baseParams.copy(
+            taskId = taskId,
+            tileSize = UpscaleParamsFactory.sanitizeTileSize(request.baseParams.tileSize),
+            accelerationMode = AccelerationMode.VULKAN,
+            nativeBackend = NativeBackend.LEGACY_SAFE,
+            inferencePrecision = InferencePrecision.FP32,
+            commandBatchSize = 1,
+            modelCacheCapacity = 1,
+            tta = false,
+            pipelinePasses = emptyList()
+        )
+        val safeOutput = probe.run(pattern, safeParams)
+            ?: return QualityProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!safeOutput.hasExpectedShape(pattern, safeParams.scale) ||
+            safeOutput.durationNanos <= 0L
+        ) {
+            return QualityProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val optimizedParams = safeParams.copy(
+            nativeBackend = NativeBackend.OPTIMIZED,
+            inferencePrecision = InferencePrecision.FP16,
+            modelCacheCapacity = 2
+        )
+        val optimizedOutput = probe.run(pattern, optimizedParams)
+            ?: return QualityProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!optimizedOutput.hasSameShape(safeOutput) || optimizedOutput.durationNanos <= 0L) {
+            return QualityProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val quality = RgbQualityEvaluator.evaluate(safeOutput.image, optimizedOutput.image)
+            ?: return QualityProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        return if (AdaptiveInferencePolicy.isFp16Eligible(request.device, quality)) {
+            QualityProbeResult.Ready(quality)
+        } else {
+            QualityProbeResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+        }
+    }
+
     private suspend fun calibrateTta(
         request: InferenceCalibrationRequest,
         taskId: String
@@ -261,8 +317,12 @@ class InferenceCalibrationRunner(
         if (!hasSufficientHeapFor(ResolutionTier.STANDARD)) {
             return TtaCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
         }
-        val inputEdge = calibrationInputEdge(ResolutionTier.STANDARD, request.baseParams.scale)
-        val pattern = calibrationPatternFactory(inputEdge, inputEdge, TTA_PATTERN_SEED)
+        val qualityInputEdge = (QUALITY_OUTPUT_EDGE / request.baseParams.scale).coerceAtLeast(1)
+        val qualityPattern = calibrationPatternFactory(
+            qualityInputEdge,
+            qualityInputEdge,
+            TTA_QUALITY_PATTERN_SEED
+        )
         val safeParams = request.baseParams.copy(
             taskId = taskId,
             tileSize = AdaptiveInferencePolicy.ttaExecutionTileSize(request.baseParams.tileSize),
@@ -274,17 +334,14 @@ class InferenceCalibrationRunner(
             tta = true,
             pipelinePasses = emptyList()
         )
-        val safeOutput = probe.run(pattern, safeParams)
+        val safeOutput = probe.run(qualityPattern, safeParams)
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
-        if (!safeOutput.hasExpectedShape(pattern, safeParams.scale) ||
+        if (!safeOutput.hasExpectedShape(qualityPattern, safeParams.scale) ||
             safeOutput.durationNanos <= 0L
         ) {
             return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
-        }
-        if (!hasSufficientHeapFor(ResolutionTier.STANDARD)) {
-            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
         }
         val optimizedParams = safeParams.copy(
             nativeBackend = NativeBackend.OPTIMIZED,
@@ -292,7 +349,7 @@ class InferenceCalibrationRunner(
             commandBatchSize = CalibratedTtaProfile.OPTIMIZED_TTA_PASS_BATCH_SIZE,
             modelCacheCapacity = 2
         )
-        val optimizedOutput = probe.run(pattern, optimizedParams)
+        val optimizedOutput = probe.run(qualityPattern, optimizedParams)
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
@@ -301,14 +358,45 @@ class InferenceCalibrationRunner(
         }
         val quality = RgbQualityEvaluator.evaluate(safeOutput.image, optimizedOutput.image)
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        if (!AdaptiveInferencePolicy.isFp16Eligible(request.device, quality)) {
+            return TtaCandidateProbeResult.Ready(null)
+        }
+
+        if (!hasSufficientHeapFor(ResolutionTier.STANDARD)) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val inputEdge = calibrationInputEdge(ResolutionTier.STANDARD, request.baseParams.scale)
+        val performancePattern = calibrationPatternFactory(
+            inputEdge,
+            inputEdge,
+            TTA_PERFORMANCE_PATTERN_SEED
+        )
+        val safeMeasurement = probe.measure(performancePattern, safeParams)
+            ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!safeMeasurement.hasExpectedShape(performancePattern, safeParams.scale) ||
+            safeMeasurement.durationNanos <= 0L
+        ) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val optimizedMeasurement = probe.measure(performancePattern, optimizedParams)
+            ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        currentCoroutineContext().ensureActive()
+        ensureCalibrationThermallySafe()
+        if (!optimizedMeasurement.hasSameShape(safeMeasurement) ||
+            optimizedMeasurement.durationNanos <= 0L
+        ) {
+            return TtaCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
         val profile = CalibratedTtaProfile(
             scale = safeParams.scale,
             noise = safeParams.noise,
             tileSize = safeParams.tileSize,
             passBatchSize = optimizedParams.commandBatchSize,
             quality = quality,
-            safeDurationNanos = safeOutput.durationNanos,
-            optimizedDurationNanos = optimizedOutput.durationNanos
+            safeDurationNanos = safeMeasurement.durationNanos,
+            optimizedDurationNanos = optimizedMeasurement.durationNanos
         )
         return TtaCandidateProbeResult.Ready(
             profile.takeIf { AdaptiveInferencePolicy.isTtaProfileEligible(request.device, it) }
@@ -351,11 +439,7 @@ class InferenceCalibrationRunner(
             tta = false,
             pipelinePasses = emptyList()
         )
-        ensureCalibrationThermallySafe()
-        if (!hasSufficientHeapFor(tier)) {
-            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
-        }
-        val baselineOutput = probe.run(pattern, baselineParams)
+        val baselineOutput = probe.measure(pattern, baselineParams)
             ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
@@ -372,14 +456,12 @@ class InferenceCalibrationRunner(
 
         return try {
             selected = searchCpuStage(
-                tier = tier,
                 pattern = pattern,
                 reference = baselineOutput,
                 baselineParams = selected.applyTo(baselineParams),
                 candidateValues = candidates.tileSizes.sorted(),
                 applyValue = { params, value -> params.copy(tileSize = value) },
-                selected = selected,
-                device = request.device
+                selected = selected
             )
             val topologyThreads = if (candidates.includeDeviceTopologyThreads) {
                 listOfNotNull(request.device.bigCoreCount, request.device.physicalCoreCount)
@@ -387,7 +469,6 @@ class InferenceCalibrationRunner(
                 emptyList()
             }
             selected = searchCpuStage(
-                tier = tier,
                 pattern = pattern,
                 reference = baselineOutput,
                 baselineParams = selected.applyTo(baselineParams),
@@ -396,21 +477,17 @@ class InferenceCalibrationRunner(
                     .distinct()
                     .sorted(),
                 applyValue = { params, value -> params.copy(cpuThreads = value) },
-                selected = selected,
-                device = request.device
+                selected = selected
             )
             selected = searchCpuStage(
-                tier = tier,
                 pattern = pattern,
                 reference = baselineOutput,
                 baselineParams = selected.applyTo(baselineParams),
                 candidateValues = candidates.openmpBlocktimeMs.sorted(),
                 applyValue = { params, value -> params.copy(openmpBlocktimeMs = value) },
-                selected = selected,
-                device = request.device
+                selected = selected
             )
             selected = searchCpuStage(
-                tier = tier,
                 pattern = pattern,
                 reference = baselineOutput,
                 baselineParams = selected.applyTo(baselineParams),
@@ -418,8 +495,7 @@ class InferenceCalibrationRunner(
                     .filter { it <= physicalCoreLimit }
                     .sorted(),
                 applyValue = { params, value -> params.copy(postprocessThreads = value) },
-                selected = selected,
-                device = request.device
+                selected = selected
             )
             CpuCandidateProbeResult.Ready(selected)
         } catch (failure: CpuCalibrationFailureException) {
@@ -428,14 +504,12 @@ class InferenceCalibrationRunner(
     }
 
     private suspend fun searchCpuStage(
-        tier: ResolutionTier,
         pattern: RgbImage,
-        reference: CalibrationProbeOutput,
+        reference: CalibrationProbeMeasurement,
         baselineParams: UpscaleParams,
         candidateValues: List<Int>,
         applyValue: (UpscaleParams, Int) -> UpscaleParams,
-        selected: MeasuredCpuCandidate,
-        device: DeviceCapabilityProfile
+        selected: MeasuredCpuCandidate
     ): MeasuredCpuCandidate {
         var current = selected
         candidateValues.forEach { value ->
@@ -450,14 +524,12 @@ class InferenceCalibrationRunner(
                 return@forEach
             }
             val measured = when (
-                val result = measureCpuCandidate(tier, pattern, reference, params)
+                val result = measureCpuCandidate(pattern, reference, params)
             ) {
                 is CpuCandidateProbeResult.Ready -> result.candidate
                 is CpuCandidateProbeResult.Failed -> throw CpuCalibrationFailureException(result.reason)
             }
-            if (AdaptiveInferencePolicy.isFp16Eligible(device, measured.quality) &&
-                isAtLeastFivePercentFaster(measured.durationNanos, current.durationNanos)
-            ) {
+            if (isAtLeastFivePercentFaster(measured.durationNanos, current.durationNanos)) {
                 current = measured
             }
         }
@@ -465,33 +537,28 @@ class InferenceCalibrationRunner(
     }
 
     private suspend fun measureCpuCandidate(
-        tier: ResolutionTier,
         pattern: RgbImage,
-        reference: CalibrationProbeOutput,
+        reference: CalibrationProbeMeasurement,
         params: UpscaleParams
     ): CpuCandidateProbeResult {
         ensureCalibrationThermallySafe()
-        if (!hasSufficientHeapFor(tier)) {
-            return CpuCandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
-        }
-        val output = probe.run(pattern, params)
+        val output = probe.measure(pattern, params)
             ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
         if (!output.hasSameShape(reference) || output.durationNanos <= 0L) {
             return CpuCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
-        val quality = RgbQualityEvaluator.evaluate(reference.image, output.image)
-            ?: return CpuCandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         return CpuCandidateProbeResult.Ready(
-            MeasuredCpuCandidate.from(params, output.durationNanos, quality)
+            MeasuredCpuCandidate.from(params, output.durationNanos, PERFECT_CPU_REFERENCE_QUALITY)
         )
     }
 
     private suspend fun calibrateTier(
         request: InferenceCalibrationRequest,
         taskId: String,
-        tier: ResolutionTier
+        tier: ResolutionTier,
+        quality: Fp16QualityMetrics
     ): CandidateProbeResult {
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
@@ -515,11 +582,7 @@ class InferenceCalibrationRunner(
             tta = false,
             pipelinePasses = emptyList()
         )
-        ensureCalibrationThermallySafe()
-        if (!hasSufficientHeapFor(tier)) {
-            return CandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
-        }
-        val reference = probe.run(pattern, referenceParams)
+        val reference = probe.measure(pattern, referenceParams)
             ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
@@ -531,9 +594,9 @@ class InferenceCalibrationRunner(
         for (tileSize in SUPPORTED_TILE_SIZES) {
             val measured = when (
                 val result = measureCandidate(
-                    tier = tier,
                     pattern = pattern,
                     reference = reference,
+                    quality = quality,
                     params = referenceParams.copy(
                         tileSize = tileSize,
                         nativeBackend = NativeBackend.OPTIMIZED,
@@ -559,9 +622,9 @@ class InferenceCalibrationRunner(
         for (batchSize in SUPPORTED_BATCH_SIZES.drop(1).filter { it <= measuredTileCount }) {
             val measured = when (
                 val result = measureCandidate(
-                    tier = tier,
                     pattern = pattern,
                     reference = reference,
+                    quality = quality,
                     params = referenceParams.copy(
                         tileSize = selectedTile.tileSize,
                         nativeBackend = NativeBackend.OPTIMIZED,
@@ -600,24 +663,19 @@ class InferenceCalibrationRunner(
     }
 
     private suspend fun measureCandidate(
-        tier: ResolutionTier,
         pattern: RgbImage,
-        reference: CalibrationProbeOutput,
+        reference: CalibrationProbeMeasurement,
+        quality: Fp16QualityMetrics,
         params: UpscaleParams
     ): CandidateProbeResult {
         ensureCalibrationThermallySafe()
-        if (!hasSufficientHeapFor(tier)) {
-            return CandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
-        }
-        val output = probe.run(pattern, params)
+        val output = probe.measure(pattern, params)
             ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
         if (!output.hasSameShape(reference) || output.durationNanos <= 0L) {
             return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
-        val quality = RgbQualityEvaluator.evaluate(reference.image, output.image)
-            ?: return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         return CandidateProbeResult.Ready(
             MeasuredVulkanCandidate(
                 tileSize = params.tileSize,
@@ -715,6 +773,23 @@ class InferenceCalibrationRunner(
     private fun CalibrationProbeOutput.hasSameShape(other: CalibrationProbeOutput): Boolean =
         image.width == other.image.width && image.height == other.image.height
 
+    private fun CalibrationProbeMeasurement.hasExpectedShape(
+        input: RgbImage,
+        scale: Int
+    ): Boolean {
+        if (scale <= 0) return false
+        val expectedWidth = input.width.toLong() * scale
+        val expectedHeight = input.height.toLong() * scale
+        return expectedWidth <= Int.MAX_VALUE &&
+            expectedHeight <= Int.MAX_VALUE &&
+            outputWidth == expectedWidth.toInt() &&
+            outputHeight == expectedHeight.toInt()
+    }
+
+    private fun CalibrationProbeMeasurement.hasSameShape(
+        other: CalibrationProbeMeasurement
+    ): Boolean = outputWidth == other.outputWidth && outputHeight == other.outputHeight
+
     private fun estimatedTileCount(image: RgbImage, tileSize: Int): Int {
         val safeTileSize = tileSize.coerceAtLeast(1)
         val columns = (image.width + safeTileSize - 1L) / safeTileSize
@@ -729,8 +804,11 @@ class InferenceCalibrationRunner(
         const val DEFAULT_TIMEOUT_MS = 5L * 60L * 1_000L
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
         private const val PATTERN_SEED = 0x4c756d615352L
+        private const val QUALITY_PATTERN_SEED = 0x465031364c756d61L
         private const val CPU_PATTERN_SEED = 0x4350554c756d61L
-        private const val TTA_PATTERN_SEED = 0x5454414c756d61L
+        private const val TTA_QUALITY_PATTERN_SEED = 0x54544151554c61L
+        private const val TTA_PERFORMANCE_PATTERN_SEED = 0x54544150455246L
+        private const val QUALITY_OUTPUT_EDGE = 512
         private const val MAX_UPGRADE_DURATION_RATIO = 0.95
         private const val DEFAULT_CPU_THREADS = 4
         private const val MEBIBYTE = 1_024L * 1_024L
@@ -747,11 +825,12 @@ class InferenceCalibrationRunner(
             ResolutionTier.LARGE to 5_120
         )
 
-        // Budgets cover simultaneous Java-side input, decoded reference and candidate buffers.
+        // Full output decoding is bounded to QUALITY_OUTPUT_EDGE. Tier budgets cover only the
+        // real-size RGB input, its Bitmap staging copy, a row buffer and bounded native scratch.
         internal fun requiredAvailableHeapBytes(tier: ResolutionTier): Long = when (tier) {
-            ResolutionTier.SMALL -> 128L * MEBIBYTE
-            ResolutionTier.STANDARD -> 256L * MEBIBYTE
-            ResolutionTier.LARGE -> 512L * MEBIBYTE
+            ResolutionTier.SMALL -> 64L * MEBIBYTE
+            ResolutionTier.STANDARD -> 96L * MEBIBYTE
+            ResolutionTier.LARGE -> 128L * MEBIBYTE
         }
 
         internal fun currentAvailableHeapBytes(): Long? = runCatching {
@@ -789,6 +868,12 @@ class InferenceCalibrationRunner(
         data class Ready(val candidate: MeasuredVulkanCandidate) : CandidateProbeResult
 
         data class Failed(val reason: CalibrationFailureReason) : CandidateProbeResult
+    }
+
+    private sealed interface QualityProbeResult {
+        data class Ready(val quality: Fp16QualityMetrics) : QualityProbeResult
+
+        data class Failed(val reason: CalibrationFailureReason) : QualityProbeResult
     }
 
     private sealed interface CpuCandidateProbeResult {
