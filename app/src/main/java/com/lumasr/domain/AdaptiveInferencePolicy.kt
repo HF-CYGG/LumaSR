@@ -103,6 +103,13 @@ data class InferenceBenchmarkResult(
     val measuredAtEpochMs: Long,
     val validUntilEpochMs: Long,
     val vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
+    val vulkanTiers: List<CalibratedVulkanTier> = vulkanProfiles.map { profile ->
+        CalibratedVulkanTier(
+            resolutionTier = profile.resolutionTier,
+            decision = VulkanCalibrationDecision.ENABLED,
+            profile = profile
+        )
+    },
     val cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
     val ttaProfiles: List<CalibratedTtaProfile> = emptyList()
 ) {
@@ -114,6 +121,15 @@ data class InferenceBenchmarkResult(
         require(vulkanProfiles.map(CalibratedVulkanProfile::resolutionTier).distinct().size == vulkanProfiles.size) {
             "Calibrated Vulkan resolution tiers must be unique"
         }
+        require(vulkanTiers.map(CalibratedVulkanTier::resolutionTier).distinct().size == vulkanTiers.size) {
+            "Calibrated Vulkan tier results must be unique"
+        }
+        require(
+            vulkanTiers
+                .filter { it.decision == VulkanCalibrationDecision.ENABLED }
+                .mapNotNull(CalibratedVulkanTier::profile)
+                .toSet() == vulkanProfiles.toSet()
+        ) { "Enabled Vulkan tier results must match calibrated Vulkan profiles" }
         require(cpuProfiles.map(CalibratedCpuProfile::resolutionTier).distinct().size == cpuProfiles.size) {
             "Calibrated CPU resolution tiers must be unique"
         }
@@ -124,6 +140,9 @@ data class InferenceBenchmarkResult(
                 .size == ttaProfiles.size
         ) { "Calibrated TTA keys must be unique" }
     }
+
+    val hasEnabledOptimizations: Boolean
+        get() = vulkanProfiles.isNotEmpty() || ttaProfiles.isNotEmpty()
 }
 
 enum class ThermalLevel {

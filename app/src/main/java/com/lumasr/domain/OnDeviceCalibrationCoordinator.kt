@@ -19,6 +19,8 @@ interface DeviceCalibrationCoordinator {
     ): CalibrationRunResult
 
     suspend fun hasValidCalibration(model: ModelPack): Boolean
+
+    suspend fun hasEnabledCalibration(model: ModelPack): Boolean = hasValidCalibration(model)
 }
 
 class OnDeviceCalibrationCoordinator(
@@ -69,7 +71,15 @@ class OnDeviceCalibrationCoordinator(
         if (now < 0L) return false
         val result = repository.findValid(identity(model), now) ?: return false
         return result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES &&
-            AdaptiveInferencePolicy.isFp16Eligible(device, result.fp16Quality)
+            result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier).toSet() ==
+            ResolutionTier.entries.toSet()
+    }
+
+    override suspend fun hasEnabledCalibration(model: ModelPack): Boolean {
+        if (!hasValidCalibration(model)) return false
+        val now = clock()
+        if (now < 0L) return false
+        return repository.findValid(identity(model), now)?.hasEnabledOptimizations == true
     }
 
     private fun identity(model: ModelPack): BenchmarkIdentity = BenchmarkIdentityFactory.create(

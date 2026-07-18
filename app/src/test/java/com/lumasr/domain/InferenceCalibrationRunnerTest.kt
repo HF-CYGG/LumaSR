@@ -1382,7 +1382,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun candidatesSlowerThanLegacyReferenceNeverEnableOptimizedPath() = runBlocking {
+    fun candidatesSlowerThanLegacyReferencePublishSafeNegativeEvidence() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val events = mutableListOf<CalibrationProgressEvent>()
         val runner = testRunner(
@@ -1404,14 +1404,19 @@ class InferenceCalibrationRunnerTest {
             CalibrationProgressReporter(events::add)
         )
 
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertTrue(saved.vulkanProfiles.isEmpty())
         assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.PERFORMANCE_REJECTED),
-            result
+            ResolutionTier.entries.map { VulkanCalibrationDecision.PERFORMANCE_REJECTED },
+            saved.vulkanTiers.map(CalibratedVulkanTier::decision)
         )
-        val rejection = events.single { it.logMessage.contains("FP32=") }
-        assertTrue(rejection.logMessage.contains("FP16="))
-        assertTrue(rejection.logMessage.contains("5%"))
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(saved.vulkanTiers.all { it.baselineDurationNanos == 10L })
+        assertTrue(saved.vulkanTiers.all { it.bestCandidateDurationNanos == 11L })
+        assertEquals(3, events.count { it.logMessage.contains("FP32=") })
+        assertTrue(events.filter { it.logMessage.contains("FP32=") }.all {
+            it.logMessage.contains("FP16=") && it.logMessage.contains("5%")
+        })
     }
 
     @Test
@@ -1583,7 +1588,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun candidateBelowQualityThresholdLeavesLegacyPathActive() = runBlocking {
+    fun candidateBelowQualityThresholdPublishesSafeOnlyCalibration() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         var attempt = 0
         val runner = testRunner(
@@ -1605,8 +1610,13 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertTrue(result is CalibrationRunResult.Failed)
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(
+            ResolutionTier.entries.map { VulkanCalibrationDecision.QUALITY_REJECTED },
+            saved.vulkanTiers.map(CalibratedVulkanTier::decision)
+        )
     }
 
     @Test

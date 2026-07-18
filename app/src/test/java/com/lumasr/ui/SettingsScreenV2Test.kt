@@ -32,6 +32,7 @@ class SettingsScreenV2Test {
         assertEquals("未校准，将使用兼容模式", calibrationStatusText(CalibrationUiStatus.NOT_RUN))
         assertEquals("正在本机校准…", calibrationStatusText(CalibrationUiStatus.RUNNING))
         assertEquals("已校准，高性能模式可用", calibrationStatusText(CalibrationUiStatus.READY))
+        assertEquals("已校准，将继续使用兼容模式", calibrationStatusText(CalibrationUiStatus.READY_SAFE))
         assertEquals("校准未通过，将继续使用兼容模式", calibrationStatusText(CalibrationUiStatus.FAILED))
         assertEquals("设备不支持安全加速校准", calibrationStatusText(CalibrationUiStatus.UNSUPPORTED))
         assertEquals("已跳过，将使用兼容模式", calibrationStatusText(CalibrationUiStatus.SKIPPED))
@@ -45,6 +46,7 @@ class SettingsScreenV2Test {
         assertFalse(isCalibrationActionEnabled(state.calibrationStatus))
         assertTrue(canChangeModel(state.copy(calibrationStatus = CalibrationUiStatus.READY)))
         assertTrue(isCalibrationActionEnabled(CalibrationUiStatus.READY))
+        assertTrue(isCalibrationActionEnabled(CalibrationUiStatus.READY_SAFE))
     }
 
     @Test

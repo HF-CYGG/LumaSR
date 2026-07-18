@@ -267,26 +267,56 @@ class InferenceCalibrationRunner(
         taskId: String,
         progress: CalibrationProgressSession
     ): CalibrationPreparation {
-        val fp16Quality = when (val result = calibrateFp16Quality(request, taskId, progress)) {
-            is QualityProbeResult.Ready -> result.quality
-            is QualityProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+        val qualityResult = calibrateFp16Quality(request, taskId, progress)
+        val fp16Quality = when (qualityResult) {
+            is QualityProbeResult.Ready -> qualityResult.quality
+            is QualityProbeResult.Rejected -> qualityResult.quality
+            is QualityProbeResult.Failed -> return CalibrationPreparation.Failed(qualityResult.reason)
         }
+        val qualityAccepted = qualityResult is QualityProbeResult.Ready
         progress.note(
             "FP16 质量门",
-            "✓ SSIM=${formatMetric(fp16Quality.ssim)} · PSNR=${formatMetric(fp16Quality.psnrDb)}dB · P99=${fp16Quality.p99ChannelError}"
+            (if (qualityAccepted) "✓" else "✗") +
+                " SSIM=${formatMetric(fp16Quality.ssim)} · PSNR=${formatMetric(fp16Quality.psnrDb)}dB · P99=${fp16Quality.p99ChannelError}"
         )
-        val selectedByTier = linkedMapOf<ResolutionTier, MeasuredVulkanCandidate>()
+        val vulkanTiers = linkedMapOf<ResolutionTier, CalibratedVulkanTier>()
         val selectedCpuByTier = linkedMapOf<ResolutionTier, MeasuredCpuCandidate>()
         for (tier in ResolutionTier.entries) {
-            when (val result = calibrateTier(request, taskId, tier, fp16Quality, progress)) {
-                is CandidateProbeResult.Ready -> {
-                    selectedByTier[tier] = result.candidate
-                    progress.note(
-                        "$tier Vulkan 档位",
-                        "✓ 已选择 $tier · tile=${result.candidate.tileSize} · batch=${result.candidate.commandBatchSize}"
-                    )
+            if (qualityAccepted) {
+                when (val result = calibrateTier(request, taskId, tier, fp16Quality, progress)) {
+                    is CandidateProbeResult.Ready -> {
+                        val profile = CalibratedVulkanProfile(
+                            resolutionTier = tier,
+                            tileSize = result.candidate.tileSize,
+                            commandBatchSize = result.candidate.commandBatchSize
+                        )
+                        vulkanTiers[tier] = CalibratedVulkanTier(
+                            resolutionTier = tier,
+                            decision = VulkanCalibrationDecision.ENABLED,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            bestCandidateDurationNanos = result.candidate.durationNanos,
+                            profile = profile
+                        )
+                        progress.note(
+                            "$tier Vulkan 档位",
+                            "✓ 已选择 $tier · tile=${result.candidate.tileSize} · batch=${result.candidate.commandBatchSize}"
+                        )
+                    }
+                    is CandidateProbeResult.Rejected -> {
+                        vulkanTiers[tier] = CalibratedVulkanTier(
+                            resolutionTier = tier,
+                            decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            bestCandidateDurationNanos = result.bestCandidateDurationNanos
+                        )
+                    }
+                    is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
                 }
-                is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+            } else {
+                vulkanTiers[tier] = CalibratedVulkanTier(
+                    resolutionTier = tier,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
             }
             if (cpuCalibrationCandidates != null) {
                 when (
@@ -312,7 +342,7 @@ class InferenceCalibrationRunner(
             }
         }
 
-        val ttaProfiles = if (request.supportsTta) {
+        val ttaProfiles = if (request.supportsTta && qualityAccepted) {
             when (val result = calibrateTta(request, taskId, progress)) {
                 is TtaCandidateProbeResult.Ready -> listOfNotNull(result.profile)
                 is TtaCandidateProbeResult.Failed -> {
@@ -324,20 +354,19 @@ class InferenceCalibrationRunner(
         }
 
         ensureCalibrationThermallySafe()
-        val standard = selectedByTier.getValue(ResolutionTier.STANDARD)
+        val enabledProfiles = vulkanTiers.values.mapNotNull(CalibratedVulkanTier::profile)
+        val standardBatchSize = enabledProfiles
+            .singleOrNull { it.resolutionTier == ResolutionTier.STANDARD }
+            ?.commandBatchSize
+            ?: 1
         val benchmark = InferenceBenchmarkResult(
             identity = request.identity,
             fp16Quality = fp16Quality,
-            recommendedCommandBatchSize = standard.commandBatchSize,
+            recommendedCommandBatchSize = standardBatchSize,
             measuredAtEpochMs = request.measuredAtEpochMs,
             validUntilEpochMs = request.measuredAtEpochMs + VALIDITY_MS,
-            vulkanProfiles = selectedByTier.map { (tier, selected) ->
-                CalibratedVulkanProfile(
-                    resolutionTier = tier,
-                    tileSize = selected.tileSize,
-                    commandBatchSize = selected.commandBatchSize
-                )
-            },
+            vulkanProfiles = enabledProfiles,
+            vulkanTiers = vulkanTiers.values.toList(),
             cpuProfiles = selectedCpuByTier.map { (tier, selected) ->
                 CalibratedCpuProfile(
                     resolutionTier = tier,
@@ -431,7 +460,7 @@ class InferenceCalibrationRunner(
         return if (AdaptiveInferencePolicy.isFp16Eligible(request.device, quality)) {
             QualityProbeResult.Ready(quality)
         } else {
-            QualityProbeResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+            QualityProbeResult.Rejected(quality)
         }
     }
 
@@ -861,6 +890,7 @@ class InferenceCalibrationRunner(
                 )
             ) {
                 is CandidateProbeResult.Ready -> result.candidate
+                is CandidateProbeResult.Rejected -> return result
                 is CandidateProbeResult.Failed -> return result
             }
             tileCandidates += measured
@@ -878,7 +908,10 @@ class InferenceCalibrationRunner(
                     "FP16=${formatPerformanceDuration(fastest.durationNanos)} · " +
                     "实测提速=${formatSpeedup(reference.durationNanos, fastest.durationNanos)}"
             )
-            return CandidateProbeResult.Failed(CalibrationFailureReason.PERFORMANCE_REJECTED)
+            return CandidateProbeResult.Rejected(
+                baselineDurationNanos = reference.durationNanos,
+                bestCandidateDurationNanos = fastest.durationNanos
+            )
         }
 
         val measuredTileCount = estimatedTileCount(pattern, selectedTile.tileSize)
@@ -903,16 +936,18 @@ class InferenceCalibrationRunner(
                 )
             ) {
                 is CandidateProbeResult.Ready -> result.candidate
+                is CandidateProbeResult.Rejected -> return result
                 is CandidateProbeResult.Failed -> return result
             }
             batchCandidates += measured
         }
         return CandidateProbeResult.Ready(
-            selectQualifiedUpgrade(
+            candidate = selectQualifiedUpgrade(
                 device = request.device,
                 baseline = selectedTile,
                 candidates = batchCandidates
-            )
+            ),
+            baselineDurationNanos = reference.durationNanos
         )
     }
 
@@ -962,12 +997,13 @@ class InferenceCalibrationRunner(
             return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
         return CandidateProbeResult.Ready(
-            MeasuredVulkanCandidate(
+            candidate = MeasuredVulkanCandidate(
                 tileSize = params.tileSize,
                 commandBatchSize = params.commandBatchSize,
                 durationNanos = output.durationNanos,
                 quality = quality
-            )
+            ),
+            baselineDurationNanos = reference.durationNanos
         )
     }
 
@@ -1240,13 +1276,23 @@ class InferenceCalibrationRunner(
     }
 
     private sealed interface CandidateProbeResult {
-        data class Ready(val candidate: MeasuredVulkanCandidate) : CandidateProbeResult
+        data class Ready(
+            val candidate: MeasuredVulkanCandidate,
+            val baselineDurationNanos: Long
+        ) : CandidateProbeResult
+
+        data class Rejected(
+            val baselineDurationNanos: Long,
+            val bestCandidateDurationNanos: Long
+        ) : CandidateProbeResult
 
         data class Failed(val reason: CalibrationFailureReason) : CandidateProbeResult
     }
 
     private sealed interface QualityProbeResult {
         data class Ready(val quality: Fp16QualityMetrics) : QualityProbeResult
+
+        data class Rejected(val quality: Fp16QualityMetrics) : QualityProbeResult
 
         data class Failed(val reason: CalibrationFailureReason) : QualityProbeResult
     }

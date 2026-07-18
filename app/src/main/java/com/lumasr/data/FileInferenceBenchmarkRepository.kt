@@ -5,10 +5,12 @@ import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
+import com.lumasr.domain.CalibratedVulkanTier
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
 import com.lumasr.domain.ResolutionTier
+import com.lumasr.domain.VulkanCalibrationDecision
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -306,8 +308,8 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 4
-    private const val LEGACY_SCHEMA_VERSION = 3
+    private const val SCHEMA_VERSION = 5
+    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4)
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -319,7 +321,7 @@ private object BenchmarkResultJson {
     fun decodeRecords(value: String): List<Pair<Int, JsonElement>> {
         val root = json.parseToJsonElement(value).jsonObject
         val schemaVersion = root.requiredInt("schemaVersion")
-        check(schemaVersion == SCHEMA_VERSION || schemaVersion == LEGACY_SCHEMA_VERSION) {
+        check(schemaVersion == SCHEMA_VERSION || schemaVersion in LEGACY_SCHEMA_VERSIONS) {
             "Unsupported benchmark schema"
         }
         return root.requiredArray("results").map { record -> schemaVersion to record }
@@ -351,6 +353,9 @@ private object BenchmarkResultJson {
         put("vulkanProfiles", buildJsonArray {
             result.vulkanProfiles.forEach { add(encodeVulkanProfile(it)) }
         })
+        put("vulkanTiers", buildJsonArray {
+            result.vulkanTiers.forEach { add(encodeVulkanTier(it)) }
+        })
         put("cpuProfiles", buildJsonArray {
             result.cpuProfiles.forEach { add(encodeCpuProfile(it)) }
         })
@@ -373,6 +378,14 @@ private object BenchmarkResultJson {
         put("cpuThreads", profile.cpuThreads)
         put("openmpBlocktimeMs", profile.openmpBlocktimeMs)
         put("postprocessThreads", profile.postprocessThreads)
+    }
+
+    private fun encodeVulkanTier(tier: CalibratedVulkanTier): JsonObject = buildJsonObject {
+        put("resolutionTier", tier.resolutionTier.name)
+        put("decision", tier.decision.name)
+        put("baselineDurationNanos", tier.baselineDurationNanos)
+        put("bestCandidateDurationNanos", tier.bestCandidateDurationNanos)
+        put("profile", tier.profile?.let(::encodeVulkanProfile) ?: JsonNull)
     }
 
     private fun encodeTtaProfile(profile: CalibratedTtaProfile): JsonObject = buildJsonObject {
@@ -421,10 +434,22 @@ private object BenchmarkResultJson {
             vulkanProfiles = record.requiredArray("vulkanProfiles").map {
                 decodeVulkanProfile(it.jsonObject)
             },
+            vulkanTiers = if (schemaVersion == SCHEMA_VERSION) {
+                record.requiredArray("vulkanTiers").map { decodeVulkanTier(it.jsonObject) }
+            } else {
+                record.requiredArray("vulkanProfiles").map { profileElement ->
+                    val profile = decodeVulkanProfile(profileElement.jsonObject)
+                    CalibratedVulkanTier(
+                        resolutionTier = profile.resolutionTier,
+                        decision = VulkanCalibrationDecision.ENABLED,
+                        profile = profile
+                    )
+                }
+            },
             cpuProfiles = record.requiredArray("cpuProfiles").map {
                 decodeCpuProfile(it.jsonObject)
             },
-            ttaProfiles = if (schemaVersion == LEGACY_SCHEMA_VERSION) {
+            ttaProfiles = if (schemaVersion == 3) {
                 emptyList()
             } else {
                 record.requiredArray("ttaProfiles").map { decodeTtaProfile(it.jsonObject) }
@@ -449,6 +474,17 @@ private object BenchmarkResultJson {
             openmpBlocktimeMs = record.requiredInt("openmpBlocktimeMs"),
             postprocessThreads = record.requiredInt("postprocessThreads")
         )
+
+    private fun decodeVulkanTier(record: JsonObject): CalibratedVulkanTier {
+        val profile = record["profile"]?.takeUnless { it is JsonNull }?.jsonObject
+        return CalibratedVulkanTier(
+            resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
+            decision = VulkanCalibrationDecision.valueOf(record.requiredString("decision")),
+            baselineDurationNanos = record.optionalLong("baselineDurationNanos"),
+            bestCandidateDurationNanos = record.optionalLong("bestCandidateDurationNanos"),
+            profile = profile?.let(::decodeVulkanProfile)
+        )
+    }
 
     private fun decodeTtaProfile(record: JsonObject): CalibratedTtaProfile {
         val quality = record.getValue("quality").jsonObject
@@ -502,5 +538,13 @@ private object BenchmarkResultJson {
         return value.jsonPrimitive
             .also { check(it.isString) { "$key must be a JSON string or null" } }
             .contentOrNull
+    }
+
+    private fun JsonObject.optionalLong(key: String): Long? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(!it.isString) { "$key must be a JSON number or null" } }
+            .long
     }
 }

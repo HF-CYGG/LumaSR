@@ -67,6 +67,49 @@ data class CalibratedCpuProfile(
     }
 }
 
+enum class VulkanCalibrationDecision {
+    ENABLED,
+    QUALITY_REJECTED,
+    PERFORMANCE_REJECTED
+}
+
+data class CalibratedVulkanTier(
+    val resolutionTier: ResolutionTier,
+    val decision: VulkanCalibrationDecision,
+    val baselineDurationNanos: Long? = null,
+    val bestCandidateDurationNanos: Long? = null,
+    val profile: CalibratedVulkanProfile? = null
+) {
+    init {
+        require((baselineDurationNanos == null) == (bestCandidateDurationNanos == null)) {
+            "Vulkan tier durations must either both be present or both be absent"
+        }
+        baselineDurationNanos?.let { require(it > 0L) { "Vulkan baseline duration must be positive" } }
+        bestCandidateDurationNanos?.let {
+            require(it > 0L) { "Vulkan candidate duration must be positive" }
+        }
+        when (decision) {
+            VulkanCalibrationDecision.ENABLED -> {
+                require(profile?.resolutionTier == resolutionTier) {
+                    "Enabled Vulkan tier must contain a matching profile"
+                }
+            }
+            VulkanCalibrationDecision.QUALITY_REJECTED -> {
+                require(profile == null) { "Quality-rejected Vulkan tier cannot contain a profile" }
+                require(baselineDurationNanos == null) {
+                    "Quality-rejected Vulkan tier cannot contain performance evidence"
+                }
+            }
+            VulkanCalibrationDecision.PERFORMANCE_REJECTED -> {
+                require(profile == null) { "Performance-rejected Vulkan tier cannot contain a profile" }
+                require(baselineDurationNanos != null) {
+                    "Performance-rejected Vulkan tier requires measured durations"
+                }
+            }
+        }
+    }
+}
+
 data class CalibratedTtaProfile(
     val scale: Int,
     val noise: Int,

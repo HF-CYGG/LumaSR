@@ -17,7 +17,7 @@ object DeviceFingerprintHasher {
 }
 
 object BenchmarkIdentityFactory {
-    const val SCHEMA_KEY = "inference-benchmark-v2"
+    const val SCHEMA_KEY = "inference-benchmark-v3"
 
     fun create(
         modelId: String,

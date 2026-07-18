@@ -5,9 +5,11 @@ import com.lumasr.domain.BenchmarkPublicationGate
 import com.lumasr.domain.CalibratedCpuProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
+import com.lumasr.domain.CalibratedVulkanTier
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
 import com.lumasr.domain.ResolutionTier
+import com.lumasr.domain.VulkanCalibrationDecision
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -32,6 +34,47 @@ import java.util.concurrent.atomic.AtomicBoolean
 class FileInferenceBenchmarkRepositoryTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun persistsSchemaV5PositiveAndNegativeVulkanTierEvidence() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v5-tier-evidence")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val enabledProfile = CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.SMALL,
+            tileSize = 128,
+            commandBatchSize = 2
+        )
+        val expected = result(
+            identity = identity(),
+            vulkanProfiles = listOf(enabledProfile),
+            vulkanTiers = listOf(
+                CalibratedVulkanTier(
+                    resolutionTier = ResolutionTier.SMALL,
+                    decision = VulkanCalibrationDecision.ENABLED,
+                    baselineDurationNanos = 1_000L,
+                    bestCandidateDurationNanos = 800L,
+                    profile = enabledProfile
+                ),
+                CalibratedVulkanTier(
+                    resolutionTier = ResolutionTier.STANDARD,
+                    decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                    baselineDurationNanos = 1_000L,
+                    bestCandidateDurationNanos = 1_050L
+                ),
+                CalibratedVulkanTier(
+                    resolutionTier = ResolutionTier.LARGE,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
+            )
+        )
+
+        repository.save(expected)
+
+        assertEquals(listOf(expected), repository.list())
+        val json = File(root, "inference-benchmarks.json").readText()
+        assertTrue(json.contains("\"schemaVersion\":5"))
+        assertTrue(json.contains("\"decision\":\"PERFORMANCE_REJECTED\""))
+    }
 
     @Test
     fun cancellationRequestDoesNotBlockBehindCommitWork() = runBlocking {
@@ -137,7 +180,7 @@ class FileInferenceBenchmarkRepositoryTest {
         repository.save(expected)
 
         assertEquals(listOf(expected), repository.list())
-        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":4"))
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":5"))
     }
 
     @Test
@@ -169,7 +212,7 @@ class FileInferenceBenchmarkRepositoryTest {
         assertEquals(listOf(resolutionAwareResult("valid-profile")), records)
         assertTrue(records.single().ttaProfiles.isEmpty())
         assertTrue(record.exists())
-        assertTrue(record.readText().contains("\"schemaVersion\":4"))
+        assertTrue(record.readText().contains("\"schemaVersion\":5"))
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
@@ -587,6 +630,13 @@ class FileInferenceBenchmarkRepositoryTest {
         measuredAt: Long = 1_000L,
         validUntil: Long = 2_000L,
         vulkanProfiles: List<CalibratedVulkanProfile> = emptyList(),
+        vulkanTiers: List<CalibratedVulkanTier> = vulkanProfiles.map {
+            CalibratedVulkanTier(
+                resolutionTier = it.resolutionTier,
+                decision = VulkanCalibrationDecision.ENABLED,
+                profile = it
+            )
+        },
         cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
         ttaProfiles: List<CalibratedTtaProfile> = emptyList()
     ) = InferenceBenchmarkResult(
@@ -594,6 +644,7 @@ class FileInferenceBenchmarkRepositoryTest {
         fp16Quality = quality,
         recommendedCommandBatchSize = batchSize,
         vulkanProfiles = vulkanProfiles,
+        vulkanTiers = vulkanTiers,
         cpuProfiles = cpuProfiles,
         ttaProfiles = ttaProfiles,
         measuredAtEpochMs = measuredAt,

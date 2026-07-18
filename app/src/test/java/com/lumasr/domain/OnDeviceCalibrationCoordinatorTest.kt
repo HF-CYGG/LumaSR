@@ -90,6 +90,12 @@ class OnDeviceCalibrationCoordinatorTest {
             identity = identity,
             fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
             recommendedCommandBatchSize = 4,
+            vulkanTiers = ResolutionTier.entries.map { tier ->
+                CalibratedVulkanTier(
+                    resolutionTier = tier,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
+            },
             measuredAtEpochMs = 1_000L,
             validUntilEpochMs = 1_500L
         )
@@ -176,7 +182,7 @@ class OnDeviceCalibrationCoordinatorTest {
     }
 
     @Test
-    fun validCalibrationRequiresFp16QualityEligibility() = runBlocking {
+    fun validSafeOnlyCalibrationDoesNotRequireFp16QualityEligibility() = runBlocking {
         val repository = FakeRepository()
         val coordinator = coordinator(repository = repository, clock = { 1_500L })
         repository.value = InferenceBenchmarkResult(
@@ -190,11 +196,17 @@ class OnDeviceCalibrationCoordinatorTest {
             ),
             fp16Quality = Fp16QualityMetrics(0.99, 39.0, 4),
             recommendedCommandBatchSize = 4,
+            vulkanTiers = ResolutionTier.entries.map { tier ->
+                CalibratedVulkanTier(
+                    resolutionTier = tier,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
+            },
             measuredAtEpochMs = 1_000L,
             validUntilEpochMs = 2_000L
         )
 
-        assertFalse(coordinator.hasValidCalibration(model()))
+        assertTrue(coordinator.hasValidCalibration(model()))
     }
 
     private fun coordinator(

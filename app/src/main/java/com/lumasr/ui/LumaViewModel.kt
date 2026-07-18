@@ -519,7 +519,11 @@ class LumaViewModel(
                     return@update state.copy(calibrationStatus = CalibrationUiStatus.NOT_RUN)
                 }
                 val calibrationStatus = when (result) {
-                    is CalibrationRunResult.Completed -> CalibrationUiStatus.READY
+                    is CalibrationRunResult.Completed -> if (result.benchmark.hasEnabledOptimizations) {
+                        CalibrationUiStatus.READY
+                    } else {
+                        CalibrationUiStatus.READY_SAFE
+                    }
                     is CalibrationRunResult.Failed -> {
                         if (result.reason == CalibrationFailureReason.UNSUPPORTED_DEVICE) {
                             CalibrationUiStatus.UNSUPPORTED
@@ -541,7 +545,11 @@ class LumaViewModel(
                     CalibrationRunResult.TimedOut -> CalibrationDialogStatus.TIMED_OUT
                 }
                 val summary = when (result) {
-                    is CalibrationRunResult.Completed -> "✓ 本机校准完成，高性能模式已安全启用"
+                    is CalibrationRunResult.Completed -> if (result.benchmark.hasEnabledOptimizations) {
+                        "✓ 本机校准完成，高性能模式已安全启用"
+                    } else {
+                        "✓ 本机校准完成，当前设备继续使用兼容模式"
+                    }
                     is CalibrationRunResult.Failed -> "✗ 校准未通过 · ${result.reason.name}"
                     CalibrationRunResult.TimedOut -> "✗ 校准超时，将继续使用兼容模式"
                 }
@@ -553,7 +561,11 @@ class LumaViewModel(
                     .finishCalibrationDialog(dialogStatus, elapsedMs, summary)
                     .withResultMessage(
                         if (result is CalibrationRunResult.Completed) {
-                            "本机校准完成，高性能模式已安全启用。"
+                            if (result.benchmark.hasEnabledOptimizations) {
+                                "本机校准完成，高性能模式已安全启用。"
+                            } else {
+                                "本机校准完成，当前设备继续使用兼容模式。"
+                            }
                         } else {
                             "校准未通过，将继续使用兼容模式。"
                         }
@@ -590,14 +602,18 @@ class LumaViewModel(
         val model = _uiState.value.selectedModel ?: return
         if (calibrationJob?.isActive == true) return
         viewModelScope.launch {
-            val (supported, valid) = try {
+            val (supported, valid, enabled) = try {
                 withContext(ioDispatcher) {
-                    calibrationCoordinator.isSupported to calibrationCoordinator.hasValidCalibration(model)
+                    Triple(
+                        calibrationCoordinator.isSupported,
+                        calibrationCoordinator.hasValidCalibration(model),
+                        calibrationCoordinator.hasEnabledCalibration(model)
+                    )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                false to false
+                Triple(false, false, false)
             }
             _uiState.update { state ->
                 if (state.calibrationStatus == CalibrationUiStatus.RUNNING) return@update state
@@ -610,7 +626,8 @@ class LumaViewModel(
                     ),
                     calibrationStatus = when {
                         !supported -> CalibrationUiStatus.UNSUPPORTED
-                        valid -> CalibrationUiStatus.READY
+                        valid && enabled -> CalibrationUiStatus.READY
+                        valid -> CalibrationUiStatus.READY_SAFE
                         userPreferencesRepository.wasCalibrationSkipped() -> CalibrationUiStatus.SKIPPED
                         else -> CalibrationUiStatus.NOT_RUN
                     }
