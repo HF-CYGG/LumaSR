@@ -10,6 +10,64 @@ enum class InferencePrecision {
     FP16
 }
 
+data class VulkanDriverQuirks(
+    val corruptedOnlinePipelineCache: Boolean,
+    val storageBufferNoL1: Boolean,
+    val bufferImageLoadZero: Boolean,
+    val implicitFp16Arithmetic: Boolean
+)
+
+data class VulkanDeviceCapabilities(
+    val vendorId: Long,
+    val deviceId: Long?,
+    val apiVersion: Long?,
+    val driverId: Long?,
+    val driverVersion: Long?,
+    val pipelineCacheUuid: String?,
+    val subgroupSize: Int?,
+    val subgroupMinSize: Int?,
+    val subgroupMaxSize: Int?,
+    val computeQueueCount: Int?,
+    val maxComputeSharedMemoryBytes: Long?,
+    val supportsSubgroupOps: Boolean,
+    val supportsSubgroupSizeControl: Boolean,
+    val supportsComputeFullSubgroups: Boolean,
+    val driverQuirks: VulkanDriverQuirks
+) {
+    init {
+        require(vendorId in 0..UINT32_MAX) { "Vulkan vendor id must fit uint32" }
+        require(deviceId == null || deviceId in 0..UINT32_MAX) {
+            "Vulkan device id must fit uint32"
+        }
+        require(apiVersion == null || apiVersion in 0..UINT32_MAX) {
+            "Vulkan API version must fit uint32"
+        }
+        require(driverId == null || driverId in 0..UINT32_MAX) {
+            "Vulkan driver id must fit uint32"
+        }
+        require(driverVersion == null || driverVersion in 0..UINT32_MAX) {
+            "Vulkan driver version must fit uint32"
+        }
+        require(pipelineCacheUuid == null || PIPELINE_CACHE_UUID.matches(pipelineCacheUuid)) {
+            "Vulkan pipeline cache UUID must be lowercase hexadecimal"
+        }
+        require(subgroupSize == null || subgroupSize > 0)
+        require(subgroupMinSize == null || subgroupMinSize > 0)
+        require(subgroupMaxSize == null || subgroupMaxSize > 0)
+        require(computeQueueCount == null || computeQueueCount > 0)
+        require(maxComputeSharedMemoryBytes == null || maxComputeSharedMemoryBytes > 0L)
+    }
+
+    val isQualcommAdreno: Boolean
+        get() = vendorId == QUALCOMM_VENDOR_ID
+
+    companion object {
+        const val QUALCOMM_VENDOR_ID = 0x5143L
+        private const val UINT32_MAX = 0xffff_ffffL
+        private val PIPELINE_CACHE_UUID = Regex("[0-9a-f]{32}")
+    }
+}
+
 data class DeviceCapabilityProfile(
     val schemaKey: String,
     val profileKey: String,
@@ -25,8 +83,13 @@ data class DeviceCapabilityProfile(
     val gpuRoughScore: Int?,
     val supportsVulkan: Boolean,
     val supportsFp16Storage: Boolean,
-    val supportsFp16Arithmetic: Boolean
-)
+    val supportsFp16Arithmetic: Boolean,
+    val vulkanCapabilities: VulkanDeviceCapabilities? = null,
+    val acceleratorCalibrationKey: String? = null
+) {
+    val isQualcommAdreno: Boolean
+        get() = vulkanCapabilities?.isQualcommAdreno == true
+}
 
 data class InferenceExecutionProfile(
     val backend: NativeBackend,

@@ -307,6 +307,7 @@ Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
     jstring gpu_vendor = nullptr;
     jstring gpu_device = nullptr;
     jstring gpu_driver = nullptr;
+    jstring pipeline_cache_uuid = nullptr;
     jobject result = nullptr;
 
     do {
@@ -317,7 +318,7 @@ Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
         const jmethodID snapshot_constructor = env->GetMethodID(
             snapshot_class,
             "<init>",
-            "(Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;ZZZ)V"
+            "(Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/Integer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Integer;JJJJJLjava/lang/String;IIIIJZZZZZZZZZZ)V"
         );
         if (snapshot_constructor == nullptr || env->ExceptionCheck()) {
             break;
@@ -367,6 +368,7 @@ Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
         gpu_vendor = new_nullable_string(env, snapshot.gpuVendor);
         gpu_device = new_nullable_string(env, snapshot.gpuDevice);
         gpu_driver = new_nullable_string(env, snapshot.gpuDriverVersion);
+        pipeline_cache_uuid = new_nullable_string(env, snapshot.pipelineCacheUuid);
         if (env->ExceptionCheck()) {
             break;
         }
@@ -381,6 +383,24 @@ Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
             gpu_device,
             gpu_driver,
             rough_score,
+            static_cast<jlong>(snapshot.gpuVendorId),
+            static_cast<jlong>(snapshot.gpuDeviceId),
+            static_cast<jlong>(snapshot.gpuApiVersion),
+            static_cast<jlong>(snapshot.gpuDriverId),
+            static_cast<jlong>(snapshot.gpuDriverVersionRaw),
+            pipeline_cache_uuid,
+            static_cast<jint>(snapshot.subgroupSize),
+            static_cast<jint>(snapshot.subgroupMinSize),
+            static_cast<jint>(snapshot.subgroupMaxSize),
+            static_cast<jint>(snapshot.computeQueueCount),
+            static_cast<jlong>(snapshot.maxComputeSharedMemoryBytes),
+            snapshot.supportsSubgroupOps ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsSubgroupSizeControl ? JNI_TRUE : JNI_FALSE,
+            snapshot.supportsComputeFullSubgroups ? JNI_TRUE : JNI_FALSE,
+            snapshot.corruptedOnlinePipelineCache ? JNI_TRUE : JNI_FALSE,
+            snapshot.storageBufferNoL1 ? JNI_TRUE : JNI_FALSE,
+            snapshot.bufferImageLoadZero ? JNI_TRUE : JNI_FALSE,
+            snapshot.implicitFp16Arithmetic ? JNI_TRUE : JNI_FALSE,
             snapshot.supportsVulkan ? JNI_TRUE : JNI_FALSE,
             snapshot.supportsFp16Storage ? JNI_TRUE : JNI_FALSE,
             snapshot.supportsFp16Arithmetic ? JNI_TRUE : JNI_FALSE
@@ -394,6 +414,7 @@ Java_com_lumasr_data_NativeCapabilityJni_readSnapshot(
     delete_local_ref(env, gpu_vendor);
     delete_local_ref(env, gpu_device);
     delete_local_ref(env, gpu_driver);
+    delete_local_ref(env, pipeline_cache_uuid);
     delete_local_ref(env, integer_class);
     delete_local_ref(env, snapshot_class);
     if (env->ExceptionCheck()) {

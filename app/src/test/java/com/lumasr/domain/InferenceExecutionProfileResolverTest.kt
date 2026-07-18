@@ -183,6 +183,30 @@ class InferenceExecutionProfileResolverTest {
     }
 
     @Test
+    fun benchmarkIdentityIncludesDedicatedAdrenoCalibrationKey() {
+        val device = device().copy(
+            acceleratorCalibrationKey = "adreno-capability-v1:" + "a".repeat(64)
+        )
+
+        val identity = BenchmarkIdentityFactory.create(
+            modelId = model().id,
+            engine = model().engine,
+            modelArtifactHash = ModelArtifactIdentityFactory.create(model()),
+            runtimeBuildKey = "app-1:release:arm64-v8a",
+            device = device,
+            rawDeviceFingerprint = "Xiaomi/aurora/user/release-keys"
+        )
+
+        assertNotEquals(device.profileKey, identity.profileHash)
+        assertEquals(
+            DeviceFingerprintHasher.sha256Hex(
+                "${device.profileKey}\nadreno-capability-v1:${"a".repeat(64)}"
+            ),
+            identity.profileHash
+        )
+    }
+
+    @Test
     fun mapsEveryQualifiedExecutionFieldIntoPersistableParams() = runBlocking {
         val base = params()
         val identity = identity(base)

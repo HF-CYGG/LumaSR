@@ -34,7 +34,9 @@ object BenchmarkIdentityFactory {
             engineKey = "ncnn:${engine.name}:${DeviceFingerprintHasher.sha256Hex(modelId)}",
             modelArtifactHash = modelArtifactHash,
             runtimeBuildKey = runtimeBuildKey,
-            profileHash = device.profileKey,
+            profileHash = device.acceleratorCalibrationKey?.let { acceleratorKey ->
+                DeviceFingerprintHasher.sha256Hex("${device.profileKey}\n$acceleratorKey")
+            } ?: device.profileKey,
             deviceFingerprint = DeviceFingerprintHasher.sha256(rawDeviceFingerprint),
             gpuDriverVersion = device.gpuDriverVersion
         )

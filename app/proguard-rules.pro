@@ -13,5 +13,5 @@
 }
 
 -keep class com.lumasr.data.NativeCapabilitySnapshot {
-    public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer,java.lang.String,java.lang.String,java.lang.String,java.lang.Integer,boolean,boolean,boolean);
+    public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer,java.lang.String,java.lang.String,java.lang.String,java.lang.Integer,long,long,long,long,long,java.lang.String,int,int,int,int,long,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean);
 }

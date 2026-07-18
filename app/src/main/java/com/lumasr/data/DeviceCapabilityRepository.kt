@@ -4,6 +4,8 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import com.lumasr.domain.DeviceCapabilityProfile
+import com.lumasr.domain.VulkanDeviceCapabilities
+import com.lumasr.domain.VulkanDriverQuirks
 import java.security.MessageDigest
 
 data class NativeCapabilitySnapshot(
@@ -14,6 +16,24 @@ data class NativeCapabilitySnapshot(
     val gpuDevice: String? = null,
     val gpuDriverVersion: String? = null,
     val gpuRoughScore: Int? = null,
+    val gpuVendorId: Long = -1L,
+    val gpuDeviceId: Long = -1L,
+    val gpuApiVersion: Long = -1L,
+    val gpuDriverId: Long = -1L,
+    val gpuDriverVersionRaw: Long = -1L,
+    val pipelineCacheUuid: String? = null,
+    val subgroupSize: Int = -1,
+    val subgroupMinSize: Int = -1,
+    val subgroupMaxSize: Int = -1,
+    val computeQueueCount: Int = -1,
+    val maxComputeSharedMemoryBytes: Long = -1L,
+    val supportsSubgroupOps: Boolean = false,
+    val supportsSubgroupSizeControl: Boolean = false,
+    val supportsComputeFullSubgroups: Boolean = false,
+    val corruptedOnlinePipelineCache: Boolean = false,
+    val storageBufferNoL1: Boolean = false,
+    val bufferImageLoadZero: Boolean = false,
+    val implicitFp16Arithmetic: Boolean = false,
     val supportsVulkan: Boolean = false,
     val supportsFp16Storage: Boolean = false,
     val supportsFp16Arithmetic: Boolean = false
@@ -141,6 +161,10 @@ class DeviceCapabilityRepository(
         val gpuDevice = native.gpuDevice.normalizedOrNull()
         val gpuDriverVersion = native.gpuDriverVersion.normalizedOrNull()
         val gpuRoughScore = native.gpuRoughScore?.takeIf { it >= 0 }
+        val vulkanCapabilities = native.toVulkanCapabilities()
+        val acceleratorCalibrationKey = vulkanCapabilities
+            ?.takeIf(VulkanDeviceCapabilities::isQualcommAdreno)
+            ?.let(::adrenoCalibrationKey)
         val profileKey = profileKey(
             android = android,
             memoryBucketMb = memoryBucketMb,
@@ -171,8 +195,67 @@ class DeviceCapabilityRepository(
             gpuRoughScore = gpuRoughScore,
             supportsVulkan = native.supportsVulkan,
             supportsFp16Storage = native.supportsFp16Storage,
-            supportsFp16Arithmetic = native.supportsFp16Arithmetic
+            supportsFp16Arithmetic = native.supportsFp16Arithmetic,
+            vulkanCapabilities = vulkanCapabilities,
+            acceleratorCalibrationKey = acceleratorCalibrationKey
         )
+    }
+
+    private fun NativeCapabilitySnapshot.toVulkanCapabilities(): VulkanDeviceCapabilities? {
+        if (!supportsVulkan) return null
+        val vendorId = gpuVendorId.takeIf { it in 0..UINT32_MAX } ?: return null
+        val normalizedUuid = pipelineCacheUuid
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { PIPELINE_CACHE_UUID.matches(it) }
+        return VulkanDeviceCapabilities(
+            vendorId = vendorId,
+            deviceId = gpuDeviceId.uint32OrNull(),
+            apiVersion = gpuApiVersion.uint32OrNull(),
+            driverId = gpuDriverId.uint32OrNull(),
+            driverVersion = gpuDriverVersionRaw.uint32OrNull(),
+            pipelineCacheUuid = normalizedUuid,
+            subgroupSize = subgroupSize.positiveOrNull(),
+            subgroupMinSize = subgroupMinSize.positiveOrNull(),
+            subgroupMaxSize = subgroupMaxSize.positiveOrNull(),
+            computeQueueCount = computeQueueCount.positiveOrNull(),
+            maxComputeSharedMemoryBytes = maxComputeSharedMemoryBytes.takeIf { it > 0L },
+            supportsSubgroupOps = supportsSubgroupOps,
+            supportsSubgroupSizeControl = supportsSubgroupSizeControl,
+            supportsComputeFullSubgroups = supportsComputeFullSubgroups,
+            driverQuirks = VulkanDriverQuirks(
+                corruptedOnlinePipelineCache = corruptedOnlinePipelineCache,
+                storageBufferNoL1 = storageBufferNoL1,
+                bufferImageLoadZero = bufferImageLoadZero,
+                implicitFp16Arithmetic = implicitFp16Arithmetic
+            )
+        )
+    }
+
+    private fun adrenoCalibrationKey(capabilities: VulkanDeviceCapabilities): String {
+        val values = listOf(
+            ADRENO_SCHEMA_KEY,
+            capabilities.vendorId,
+            capabilities.deviceId,
+            capabilities.apiVersion,
+            capabilities.driverId,
+            capabilities.driverVersion,
+            capabilities.pipelineCacheUuid,
+            capabilities.subgroupSize,
+            capabilities.subgroupMinSize,
+            capabilities.subgroupMaxSize,
+            capabilities.computeQueueCount,
+            capabilities.maxComputeSharedMemoryBytes,
+            capabilities.supportsSubgroupOps,
+            capabilities.supportsSubgroupSizeControl,
+            capabilities.supportsComputeFullSubgroups,
+            capabilities.driverQuirks.corruptedOnlinePipelineCache,
+            capabilities.driverQuirks.storageBufferNoL1,
+            capabilities.driverQuirks.bufferImageLoadZero,
+            capabilities.driverQuirks.implicitFp16Arithmetic
+        )
+        val digest = sha256(values)
+        return "$ADRENO_SCHEMA_KEY:$digest"
     }
 
     private fun profileKey(
@@ -236,9 +319,25 @@ class DeviceCapabilityRepository(
         return filterNot(Char::isISOControl).trim().take(maxLength)
     }
 
+    private fun Long.uint32OrNull(): Long? = takeIf { it in 0..UINT32_MAX }
+
+    private fun Int.positiveOrNull(): Int? = takeIf { it > 0 }
+
+    private fun sha256(values: List<Any?>): String {
+        val encodedIdentity = values.joinToString(separator = "\n") { value ->
+            value?.toString()?.let { "${it.length}:$it" } ?: "-1:"
+        }
+        return MessageDigest.getInstance("SHA-256")
+            .digest(encodedIdentity.toByteArray(Charsets.UTF_8))
+            .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    }
+
     companion object {
         const val SCHEMA_KEY = "device-capability-v1"
+        const val ADRENO_SCHEMA_KEY = "adreno-capability-v1"
         const val MAX_CAPABILITY_STRING_LENGTH = 128
+        private const val UINT32_MAX = 0xffff_ffffL
+        private val PIPELINE_CACHE_UUID = Regex("[0-9a-f]{32}")
         private const val MAX_IDENTITY_STRING_LENGTH = 512
         private const val MEBIBYTE = 1_024L * 1_024L
         private val MEMORY_BUCKETS_MB = listOf(

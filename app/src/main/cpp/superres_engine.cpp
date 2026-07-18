@@ -3176,6 +3176,25 @@ SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot() {
     snapshot.gpuDevice = sanitize_capability_text(gpuInfo.device_name());
     snapshot.gpuDriverVersion = sanitize_capability_text(driverIdentity);
     snapshot.gpuRoughScore = normalize_gpu_rough_score(gpuInfo.rough_score());
+    snapshot.gpuVendorId = vulkan_uint32_to_int64(gpuInfo.vendor_id());
+    snapshot.gpuDeviceId = vulkan_uint32_to_int64(gpuInfo.device_id());
+    snapshot.gpuApiVersion = vulkan_uint32_to_int64(gpuInfo.api_version());
+    snapshot.gpuDriverId = vulkan_uint32_to_int64(gpuInfo.driver_id());
+    snapshot.gpuDriverVersionRaw = vulkan_uint32_to_int64(gpuInfo.driver_version());
+    snapshot.pipelineCacheUuid = pipeline_cache_uuid_hex(gpuInfo.pipeline_cache_uuid());
+    snapshot.subgroupSize = normalize_gpu_rough_score(gpuInfo.subgroup_size());
+    snapshot.subgroupMinSize = normalize_gpu_rough_score(gpuInfo.min_subgroup_size());
+    snapshot.subgroupMaxSize = normalize_gpu_rough_score(gpuInfo.max_subgroup_size());
+    snapshot.computeQueueCount = normalize_gpu_rough_score(gpuInfo.compute_queue_count());
+    snapshot.maxComputeSharedMemoryBytes =
+        vulkan_uint32_to_int64(gpuInfo.max_shared_memory_size());
+    snapshot.supportsSubgroupOps = gpuInfo.support_subgroup_ops() != 0u;
+    snapshot.supportsSubgroupSizeControl = gpuInfo.support_subgroup_size_control();
+    snapshot.supportsComputeFullSubgroups = gpuInfo.support_compute_full_subgroups();
+    snapshot.corruptedOnlinePipelineCache = gpuInfo.bug_corrupted_online_pipeline_cache();
+    snapshot.storageBufferNoL1 = gpuInfo.bug_storage_buffer_no_l1();
+    snapshot.bufferImageLoadZero = gpuInfo.bug_buffer_image_load_zero();
+    snapshot.implicitFp16Arithmetic = gpuInfo.bug_implicit_fp16_arithmetic();
     snapshot.supportsVulkan = true;
     snapshot.supportsFp16Storage = gpuInfo.support_fp16_storage();
     snapshot.supportsFp16Arithmetic = gpuInfo.support_fp16_arithmetic();
