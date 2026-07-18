@@ -83,7 +83,10 @@ class NativeBitmapCalibrationProbeTest {
             peakSlotBytes = 12_345L,
             producerWaitMs = 6,
             consumerWaitMs = 7,
-            overlapMs = 8
+            overlapMs = 8,
+            pipelineCacheHit = true,
+            pipelineCacheBytes = 4_096L,
+            pipelineCacheRebuilt = false
         )
         val processor = object : NativeBitmapRegionProcessor {
             override suspend fun processBitmapRegion(
@@ -127,6 +130,9 @@ class NativeBitmapCalibrationProbeTest {
         assertEquals(2, result.telemetry?.effectivePipelineDepth)
         assertEquals(12_345L, result.telemetry?.peakSlotBytes)
         assertEquals(8L, result.telemetry?.overlapMs)
+        assertTrue(requireNotNull(result.telemetry).pipelineCacheHit)
+        assertEquals(4_096L, result.telemetry?.pipelineCacheBytes)
+        assertFalse(requireNotNull(result.telemetry).pipelineCacheRebuilt)
     }
 
     @Test

@@ -2,6 +2,10 @@ package com.lumasr.ui
 
 import com.lumasr.domain.CalibrationProgressEvent
 import com.lumasr.domain.CalibrationProgressEventType
+import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationReport
+import com.lumasr.domain.CalibrationReportEvent
+import com.lumasr.domain.CalibrationReportOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -10,6 +14,59 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalibrationProgressUiStateTest {
+    @Test
+    fun modeSpecificEtaUsesThreeAndEightMinuteHardBudgets() {
+        fun nearBudget(mode: CalibrationMode, elapsedMs: Long) = CalibrationProgressUiReducer.apply(
+            CalibrationProgressUiReducer.start(1_000L, mode),
+            event(
+                type = CalibrationProgressEventType.STEP_COMPLETED,
+                elapsedMs = elapsedMs,
+                completedWorkUnits = 1L,
+                totalWorkUnits = 100L,
+                logMessage = "measured"
+            )
+        )
+
+        assertEquals(10_000L, nearBudget(CalibrationMode.QUICK, 170_000L).estimatedRemainingMs)
+        assertEquals(10_000L, nearBudget(CalibrationMode.DEEP, 470_000L).estimatedRemainingMs)
+    }
+
+    @Test
+    fun persistedReportReopensWithCompleteTerminalLog() {
+        val report = CalibrationReport(
+            id = "report-1",
+            mode = CalibrationMode.QUICK,
+            outcome = CalibrationReportOutcome.SUCCEEDED,
+            startedAtEpochMs = 1_000L,
+            finishedAtEpochMs = 3_000L,
+            elapsedMs = 2_000L,
+            acceleratorCalibrationKey = null,
+            modelId = "model-a",
+            summary = "done",
+            events = listOf(
+                CalibrationReportEvent(
+                    elapsedMs = 100L,
+                    type = CalibrationProgressEventType.STEP_STARTED,
+                    title = "step",
+                    message = "> step"
+                ),
+                CalibrationReportEvent(
+                    elapsedMs = 2_000L,
+                    type = CalibrationProgressEventType.NOTE,
+                    title = "finish",
+                    message = "done"
+                )
+            )
+        )
+
+        val state = report.toDialogState()
+
+        assertEquals(CalibrationDialogStatus.SUCCEEDED, state.status)
+        assertEquals(CalibrationMode.QUICK, state.mode)
+        assertEquals(listOf("> step", "done"), state.logLines.map { it.text })
+        assertTrue(state.canDismiss)
+    }
+
     @Test
     fun estimatesRemainingTimeFromCompletedRealWorkAndClampsToRunBudget() {
         val started = CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L)

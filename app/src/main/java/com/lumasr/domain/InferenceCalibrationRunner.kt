@@ -42,7 +42,10 @@ data class CalibrationProbeTelemetry(
     val peakSlotBytes: Long,
     val producerWaitMs: Long,
     val consumerWaitMs: Long,
-    val overlapMs: Long
+    val overlapMs: Long,
+    val pipelineCacheHit: Boolean = false,
+    val pipelineCacheBytes: Long = 0L,
+    val pipelineCacheRebuilt: Boolean = false
 ) {
     init {
         require(modelLoadMs >= 0L) { "Calibration model load time must be non-negative" }
@@ -56,6 +59,9 @@ data class CalibrationProbeTelemetry(
         require(producerWaitMs >= 0L) { "Calibration producer wait time must be non-negative" }
         require(consumerWaitMs >= 0L) { "Calibration consumer wait time must be non-negative" }
         require(overlapMs >= 0L) { "Calibration overlap time must be non-negative" }
+        require(pipelineCacheBytes >= 0L) {
+            "Calibration pipeline cache size must be non-negative"
+        }
     }
 }
 
@@ -1084,12 +1090,20 @@ class InferenceCalibrationRunner(
     private fun tuningCandidates(request: InferenceCalibrationRequest): List<VulkanExecutionTuning> {
         if (request.mode == CalibrationMode.LEGACY) return emptyList()
         val capabilities = request.device.vulkanCapabilities ?: return emptyList()
-        val base = VulkanExecutionTuning.DEFAULT.copy(
+        val capabilityDefault = VulkanExecutionTuning.DEFAULT.copy(
             useSubgroupOps = capabilities.supportsSubgroupOps,
             useShaderLocalMemory = capabilities.maxComputeSharedMemoryBytes != null
         )
+        val seed = request.baseParams.vulkanTuning.copy(
+            useSubgroupOps = request.baseParams.vulkanTuning.useSubgroupOps &&
+                capabilities.supportsSubgroupOps,
+            useShaderLocalMemory = request.baseParams.vulkanTuning.useShaderLocalMemory &&
+                capabilities.maxComputeSharedMemoryBytes != null
+        )
         return buildList {
-            add(base)
+            add(seed)
+            add(capabilityDefault)
+            val base = capabilityDefault
             if (base.useSubgroupOps) add(base.copy(useSubgroupOps = false))
             if (base.useShaderLocalMemory) add(base.copy(useShaderLocalMemory = false))
             if (base.useSubgroupOps && base.useShaderLocalMemory) {
@@ -1713,7 +1727,10 @@ class InferenceCalibrationRunner(
                 "depth=${telemetry.requestedMaxPipelineDepth}/${telemetry.effectivePipelineDepth} · " +
                 "peakSlot=${telemetry.peakSlotBytes}B · " +
                 "producerWait=${telemetry.producerWaitMs}ms · " +
-                "consumerWait=${telemetry.consumerWaitMs}ms · overlap=${telemetry.overlapMs}ms"
+                "consumerWait=${telemetry.consumerWaitMs}ms · overlap=${telemetry.overlapMs}ms · " +
+                "pipelineCacheHit=${if (telemetry.pipelineCacheHit) 1 else 0} · " +
+                "pipelineCacheBytes=${telemetry.pipelineCacheBytes} · " +
+                "pipelineCacheRebuilt=${if (telemetry.pipelineCacheRebuilt) 1 else 0}"
         )
     }
 

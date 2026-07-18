@@ -38,7 +38,8 @@ class LumaViewModelArchitectureTest {
         val source = File("src/main/java/com/lumasr/ui/LumaViewModel.kt").readText()
 
         assertTrue(source.contains("fun skipCalibrationPrompt()"))
-        assertTrue(source.contains("fun runCalibration()"))
+        assertTrue(source.contains("fun runCalibration("))
+        assertTrue(source.contains("mode: CalibrationMode"))
         assertTrue(source.contains("withContext(ioDispatcher)"))
         assertTrue(source.contains("calibrationCoordinator.run("))
         assertTrue(source.contains("CalibrationProgressReporter"))
@@ -46,6 +47,9 @@ class LumaViewModelArchitectureTest {
         assertTrue(source.contains("applyCalibrationProgress"))
         assertTrue(source.contains("finishCalibrationDialog"))
         assertTrue(source.contains("fun dismissCalibrationDialog()"))
+        assertTrue(source.contains("FileCalibrationReportRepository"))
+        assertTrue(source.contains("calibrationReportRepository.save"))
+        assertTrue(source.contains("acceleratorCalibrationKey"))
     }
 
     @Test

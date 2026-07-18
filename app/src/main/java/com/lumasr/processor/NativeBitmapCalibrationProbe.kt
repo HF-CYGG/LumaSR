@@ -97,7 +97,10 @@ class NativeBitmapCalibrationProbe(
         peakSlotBytes = peakSlotBytes,
         producerWaitMs = producerWaitMs,
         consumerWaitMs = consumerWaitMs,
-        overlapMs = overlapMs
+        overlapMs = overlapMs,
+        pipelineCacheHit = pipelineCacheHit,
+        pipelineCacheBytes = pipelineCacheBytes,
+        pipelineCacheRebuilt = pipelineCacheRebuilt
     )
 
     companion object {

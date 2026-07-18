@@ -84,6 +84,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.lumasr.domain.CalibrationMode
 import kotlinx.coroutines.delay
 
 /**
@@ -202,10 +203,12 @@ fun MainScreen(viewModel: LumaViewModel) {
             onDismissRequest = viewModel::skipCalibrationPrompt,
             title = { Text("启用安全高性能模式") },
             text = {
-                Text("可选的本机校准仅使用应用生成的测试图，耗时取决于设备与模型；不会读取或上传你的照片。")
+                Text("检测到 Snapdragon / Adreno。快速校准约 3 分钟，仅使用应用生成的测试图；不会读取或上传你的照片。")
             },
             confirmButton = {
-                TextButton(onClick = viewModel::runCalibration) { Text("开始校准") }
+                TextButton(onClick = { viewModel.runCalibration(CalibrationMode.QUICK) }) {
+                    Text("快速校准")
+                }
             },
             dismissButton = {
                 TextButton(onClick = viewModel::skipCalibrationPrompt) { Text("暂不校准") }
@@ -216,6 +219,12 @@ fun MainScreen(viewModel: LumaViewModel) {
         CalibrationProgressDialog(
             state = dialogState,
             onDismiss = viewModel::dismissCalibrationDialog
+        )
+    }
+    state.selectedCalibrationReport?.let { report ->
+        CalibrationProgressDialog(
+            state = report.toDialogState(),
+            onDismiss = viewModel::dismissCalibrationReport
         )
     }
 }
@@ -456,7 +465,10 @@ private fun LumaNavHost(
                 onAccelerationChanged = viewModel::setAccelerationMode,
                 onTileSizeChanged = viewModel::setTileSize,
                 onTileSizeAutoSelected = viewModel::setTileSizeAuto,
-                onRunCalibration = viewModel::runCalibration
+                onRunCalibration = { viewModel.runCalibration(CalibrationMode.LEGACY) },
+                onRunQuickCalibration = { viewModel.runCalibration(CalibrationMode.QUICK) },
+                onRunDeepCalibration = { viewModel.runCalibration(CalibrationMode.DEEP) },
+                onOpenCalibrationReport = viewModel::openCalibrationReport
             )
         }
     }

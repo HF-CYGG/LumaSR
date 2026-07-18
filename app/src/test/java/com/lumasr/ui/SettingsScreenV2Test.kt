@@ -56,4 +56,14 @@ class SettingsScreenV2Test {
         assertTrue(source.contains("enabled = isCalibrationActionEnabled(state.calibrationStatus)"))
         assertTrue(source.contains(".clickable(enabled = enabled, onClick = onClick)"))
     }
+
+    @Test
+    fun exposesQuickDeepCalibrationAndPersistentReportHistory() {
+        val source = File("src/main/java/com/lumasr/ui/SettingsScreenV2.kt").readText()
+
+        assertTrue(source.contains("onRunQuickCalibration"))
+        assertTrue(source.contains("onRunDeepCalibration"))
+        assertTrue(source.contains("state.calibrationReports"))
+        assertTrue(source.contains("onOpenCalibrationReport"))
+    }
 }

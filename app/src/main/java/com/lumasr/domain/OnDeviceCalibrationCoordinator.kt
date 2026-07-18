@@ -1,6 +1,7 @@
 package com.lumasr.domain
 
 import java.io.File
+import kotlinx.coroutines.CancellationException
 
 fun interface CalibrationRequestExecutor {
     suspend fun execute(
@@ -12,11 +13,24 @@ fun interface CalibrationRequestExecutor {
 interface DeviceCalibrationCoordinator {
     val isSupported: Boolean
 
+    val supportsAdrenoCalibration: Boolean
+        get() = false
+
+    val acceleratorCalibrationKey: String?
+        get() = null
+
     suspend fun run(
         model: ModelPack,
         resolvedModelDir: String,
         progressReporter: CalibrationProgressReporter = CalibrationProgressReporter.NONE
     ): CalibrationRunResult
+
+    suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        mode: CalibrationMode,
+        progressReporter: CalibrationProgressReporter = CalibrationProgressReporter.NONE
+    ): CalibrationRunResult = run(model, resolvedModelDir, progressReporter)
 
     suspend fun hasValidCalibration(model: ModelPack): Boolean
 
@@ -43,24 +57,63 @@ class OnDeviceCalibrationCoordinator(
             device.supportsFp16Storage &&
             device.supportsFp16Arithmetic
 
+    override val supportsAdrenoCalibration: Boolean
+        get() = isSupported && device.isQualcommAdreno && acceleratorCalibrationKey != null
+
+    override val acceleratorCalibrationKey: String?
+        get() = device.acceleratorCalibrationKey?.takeIf { device.isQualcommAdreno }
+
     override suspend fun run(
         model: ModelPack,
         resolvedModelDir: String,
         progressReporter: CalibrationProgressReporter
+    ): CalibrationRunResult = run(
+        model = model,
+        resolvedModelDir = resolvedModelDir,
+        mode = CalibrationMode.LEGACY,
+        progressReporter = progressReporter
+    )
+
+    override suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        mode: CalibrationMode,
+        progressReporter: CalibrationProgressReporter
     ): CalibrationRunResult {
-        if (!isSupported) {
+        if (!isSupported || (mode != CalibrationMode.LEGACY && !supportsAdrenoCalibration)) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
         }
         val measuredAt = clock()
         if (measuredAt < 0L) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         }
+        val benchmarkIdentity = identity(model)
+        val quickSeed = if (mode == CalibrationMode.DEEP) {
+            try {
+                repository.findValid(benchmarkIdentity, measuredAt)
+                    ?.takeIf { it.calibrationMode == CalibrationMode.QUICK }
+                    ?.vulkanProfiles
+                    ?.singleOrNull { it.resolutionTier == ResolutionTier.STANDARD }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+        val baseParams = calibrationParams(model, resolvedModelDir).let { params ->
+            quickSeed?.let { seed ->
+                params.copy(tileSize = seed.tileSize, vulkanTuning = seed.tuning)
+            } ?: params
+        }
         val request = InferenceCalibrationRequest(
-            identity = identity(model),
+            identity = benchmarkIdentity,
             device = device,
-            baseParams = calibrationParams(model, resolvedModelDir),
+            baseParams = baseParams,
             measuredAtEpochMs = measuredAt,
-            supportsTta = model.supportsTta
+            supportsTta = model.supportsTta,
+            mode = mode
         )
         return executor.execute(request, progressReporter)
     }
@@ -70,9 +123,13 @@ class OnDeviceCalibrationCoordinator(
         val now = clock()
         if (now < 0L) return false
         val result = repository.findValid(identity(model), now) ?: return false
+        val expectedTiers = when (result.calibrationMode) {
+            CalibrationMode.QUICK -> setOf(ResolutionTier.STANDARD)
+            CalibrationMode.LEGACY,
+            CalibrationMode.DEEP -> ResolutionTier.entries.toSet()
+        }
         return result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES &&
-            result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier).toSet() ==
-            ResolutionTier.entries.toSet()
+            result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier).toSet() == expectedTiers
     }
 
     override suspend fun hasEnabledCalibration(model: ModelPack): Boolean {

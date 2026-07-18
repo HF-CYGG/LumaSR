@@ -67,6 +67,86 @@ class OnDeviceCalibrationCoordinatorTest {
     }
 
     @Test
+    fun exposesAdrenoIdentityAndForwardsRequestedCalibrationMode() = runBlocking {
+        var captured: InferenceCalibrationRequest? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = CalibrationRequestExecutor { request, _ ->
+                captured = request
+                CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+            },
+            device = adrenoDevice(),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+
+        coordinator.run(
+            model = model(),
+            resolvedModelDir = File("build/models/waifu").absolutePath,
+            mode = CalibrationMode.DEEP
+        )
+
+        assertTrue(coordinator.supportsAdrenoCalibration)
+        assertEquals(adrenoDevice().acceleratorCalibrationKey, coordinator.acceleratorCalibrationKey)
+        assertEquals(CalibrationMode.DEEP, requireNotNull(captured).mode)
+    }
+
+    @Test
+    fun deepCalibrationReusesValidQuickStandardProfileAsSeed() = runBlocking {
+        val repository = FakeRepository()
+        val device = adrenoDevice()
+        val model = model()
+        val identity = BenchmarkIdentityFactory.create(
+            modelId = model.id,
+            engine = model.engine,
+            modelArtifactHash = ModelArtifactIdentityFactory.create(model),
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            device = device,
+            rawDeviceFingerprint = "fingerprint"
+        )
+        val tuning = VulkanExecutionTuning(
+            useSubgroupOps = false,
+            useShaderLocalMemory = true,
+            useWinogradConvolution = true,
+            useSgemmConvolution = true
+        )
+        val profile = CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.STANDARD,
+            tileSize = 256,
+            commandBatchSize = 2,
+            tuning = tuning
+        )
+        repository.value = InferenceBenchmarkResult(
+            identity = identity,
+            fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
+            recommendedCommandBatchSize = 2,
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 3_000L,
+            vulkanProfiles = listOf(profile),
+            calibrationMode = CalibrationMode.QUICK
+        )
+        var captured: InferenceCalibrationRequest? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = repository,
+            executor = CalibrationRequestExecutor { request, _ ->
+                captured = request
+                CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+            },
+            device = device,
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile,
+            clock = { 2_000L }
+        )
+
+        coordinator.run(model, File("build/models").absolutePath, CalibrationMode.DEEP)
+
+        assertEquals(256, requireNotNull(captured).baseParams.tileSize)
+        assertEquals(tuning, requireNotNull(captured).baseParams.vulkanTuning)
+    }
+
+    @Test
     fun checksOnlyCurrentModelIdentityAndInclusiveValidity() = runBlocking {
         val repository = FakeRepository()
         val coordinator = OnDeviceCalibrationCoordinator(
@@ -263,6 +343,29 @@ class OnDeviceCalibrationCoordinatorTest {
         supportsVulkan = true,
         supportsFp16Storage = true,
         supportsFp16Arithmetic = true
+    )
+
+    private fun adrenoDevice() = device().copy(
+        gpuVendor = "Qualcomm",
+        gpuDevice = "Adreno",
+        vulkanCapabilities = VulkanDeviceCapabilities(
+            vendorId = VulkanDeviceCapabilities.QUALCOMM_VENDOR_ID,
+            deviceId = 1L,
+            apiVersion = 1L,
+            driverId = 1L,
+            driverVersion = 1L,
+            pipelineCacheUuid = "0123456789abcdef0123456789abcdef",
+            subgroupSize = 64,
+            subgroupMinSize = 64,
+            subgroupMaxSize = 128,
+            computeQueueCount = 1,
+            maxComputeSharedMemoryBytes = 32_768L,
+            supportsSubgroupOps = true,
+            supportsSubgroupSizeControl = true,
+            supportsComputeFullSubgroups = true,
+            driverQuirks = VulkanDriverQuirks(false, false, false, false)
+        ),
+        acceleratorCalibrationKey = "adreno-capability-v1:${"a".repeat(64)}"
     )
 
     private class FakeRepository : InferenceBenchmarkRepository {

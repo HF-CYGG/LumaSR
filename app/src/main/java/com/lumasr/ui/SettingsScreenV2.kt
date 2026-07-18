@@ -54,6 +54,9 @@ fun SettingsScreenV2(
     onTileSizeChanged: (Int) -> Unit,
     onTileSizeAutoSelected: () -> Unit,
     onRunCalibration: () -> Unit,
+    onRunQuickCalibration: () -> Unit = onRunCalibration,
+    onRunDeepCalibration: () -> Unit = onRunCalibration,
+    onOpenCalibrationReport: (String) -> Unit = {},
     appVersionLabel: String? = null
 ) {
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
@@ -91,13 +94,30 @@ fun SettingsScreenV2(
                     onAccelerationChanged(if (gpuEnabled) AccelerationMode.CPU else AccelerationMode.AUTO)
                 }
             )
-            SettingsClickableRowV2(
-                icon = Icons.Rounded.Memory,
-                title = "本机性能校准",
-                subtitle = calibrationStatusText(state.calibrationStatus),
-                enabled = isCalibrationActionEnabled(state.calibrationStatus),
-                onClick = onRunCalibration
-            )
+            if (state.adrenoCalibrationAvailable) {
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Memory,
+                    title = "快速性能校准",
+                    subtitle = "约 3 分钟 · STANDARD Vulkan · ${calibrationStatusText(state.calibrationStatus)}",
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunQuickCalibration
+                )
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Tune,
+                    title = "深度性能校准",
+                    subtitle = "约 8 分钟 · 三档 Vulkan / CPU / TTA",
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunDeepCalibration
+                )
+            } else {
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Memory,
+                    title = "本机性能校准",
+                    subtitle = calibrationStatusText(state.calibrationStatus),
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunCalibration
+                )
+            }
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
                 title = "分块大小",
@@ -113,6 +133,18 @@ fun SettingsScreenV2(
                 onTileSizeChanged = onTileSizeChanged,
                 onTileSizeAutoSelected = onTileSizeAutoSelected
             )
+            if (state.calibrationReports.isNotEmpty()) {
+                SectionDivider()
+                SettingsGroupTitleV2("最近校准报告")
+                state.calibrationReports.forEach { report ->
+                    SettingsClickableRowV2(
+                        icon = Icons.Rounded.Memory,
+                        title = "${report.mode.name} · ${report.outcome.name}",
+                        subtitle = "${formatCalibrationDuration(report.elapsedMs)} · ${report.summary}",
+                        onClick = { onOpenCalibrationReport(report.id) }
+                    )
+                }
+            }
             SectionDivider()
             SettingsGroupTitleV2("内置模型")
             state.models.forEach { model ->

@@ -69,7 +69,7 @@ fun CalibrationProgressDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = calibrationDialogTitle(state.status),
+                    text = "${calibrationModeLabel(state.mode)}${calibrationDialogTitle(state.status)}",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
@@ -203,6 +203,12 @@ private fun calibrationDialogTitle(status: CalibrationDialogStatus): String = wh
     CalibrationDialogStatus.FAILED -> "性能校准未通过"
     CalibrationDialogStatus.TIMED_OUT -> "性能校准已超时"
     CalibrationDialogStatus.UNSUPPORTED -> "当前设备不支持校准"
+}
+
+private fun calibrationModeLabel(mode: com.lumasr.domain.CalibrationMode): String = when (mode) {
+    com.lumasr.domain.CalibrationMode.LEGACY -> ""
+    com.lumasr.domain.CalibrationMode.QUICK -> "快速 · "
+    com.lumasr.domain.CalibrationMode.DEEP -> "深度 · "
 }
 
 private val CalibrationConsoleBackground = Color(0xFF0B1118)
