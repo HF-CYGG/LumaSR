@@ -78,7 +78,8 @@ data class NativeProcessRequest(
     val openmpBlocktimeMs: Int = 20,
     val postprocessThreads: Int = 1,
     val commandBatchSize: Int = 1,
-    val modelCacheCapacity: Int = 1
+    val modelCacheCapacity: Int = 1,
+    val vulkanTuningFlags: Int = 0x0f
 )
 
 data class NativeRawTile(
@@ -243,6 +244,7 @@ object JniNativeProcessBridge :
                 postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
+                vulkanTuningFlags = request.vulkanTuningFlags,
                 progressSink = NativeProgressSink(
                     onProgress = onProgress,
                     runtimeControlProvider = runtimeControlProvider,
@@ -345,6 +347,7 @@ object JniNativeProcessBridge :
                 postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
+                vulkanTuningFlags = request.vulkanTuningFlags,
                 progressSink = NativeProgressSink(
                     onProgress = onProgress,
                     runtimeControlProvider = runtimeControlProvider,
@@ -399,6 +402,7 @@ object JniNativeProcessBridge :
                 postprocessThreads = request.postprocessThreads,
                 commandBatchSize = request.commandBatchSize,
                 modelCacheCapacity = request.modelCacheCapacity,
+                vulkanTuningFlags = request.vulkanTuningFlags,
                 progressSink = NativeProgressSink(
                     onProgress = onProgress,
                     runtimeControlProvider = runtimeControlProvider,
@@ -443,6 +447,7 @@ object JniNativeProcessBridge :
         postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
+        vulkanTuningFlags: Int,
         progressSink: NativeProgressSink
     ): Int
 
@@ -501,6 +506,7 @@ object JniNativeProcessBridge :
         postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
+        vulkanTuningFlags: Int,
         progressSink: NativeProgressSink
     ): Int
 
@@ -539,6 +545,7 @@ object JniNativeProcessBridge :
         postprocessThreads: Int,
         commandBatchSize: Int,
         modelCacheCapacity: Int,
+        vulkanTuningFlags: Int,
         progressSink: NativeProgressSink
     ): Int
 
@@ -1478,7 +1485,8 @@ internal fun UpscaleParams.toNativeRequest() = NativeProcessRequest(
     openmpBlocktimeMs = openmpBlocktimeMs,
     postprocessThreads = postprocessThreads,
     commandBatchSize = commandBatchSize,
-    modelCacheCapacity = modelCacheCapacity
+    modelCacheCapacity = modelCacheCapacity,
+    vulkanTuningFlags = vulkanTuning.toNativeFlags()
 )
 
 internal val SuperResEngine.nativeCode: Int

@@ -85,7 +85,8 @@ data class InferenceCalibrationRequest(
     val device: DeviceCapabilityProfile,
     val baseParams: UpscaleParams,
     val measuredAtEpochMs: Long,
-    val supportsTta: Boolean = false
+    val supportsTta: Boolean = false,
+    val mode: CalibrationMode = CalibrationMode.LEGACY
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Calibration time must be non-negative" }
@@ -211,7 +212,7 @@ sealed interface CalibrationRunResult {
 class InferenceCalibrationRunner(
     private val probe: InferenceCalibrationProbe,
     private val repository: InferenceBenchmarkRepository,
-    private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+    private val timeoutMs: Long? = null,
     private val thermalLevelProvider: () -> ThermalLevel? = { ThermalLevel.NORMAL },
     private val workloadOutputEdges: Map<ResolutionTier, Int> = DEFAULT_WORKLOAD_OUTPUT_EDGES,
     private val availableHeapBytesProvider: () -> Long? = { currentAvailableHeapBytes() },
@@ -231,7 +232,7 @@ class InferenceCalibrationRunner(
     private val watchdogSessions = ConcurrentHashMap<String, ResourceWatchdogSession>()
 
     init {
-        require(timeoutMs > 0L) { "Calibration timeout must be positive" }
+        require(timeoutMs == null || timeoutMs > 0L) { "Calibration timeout must be positive" }
         require(resourceSampleIntervalMs > 0L) { "Resource sample interval must be positive" }
         require(ResolutionTier.entries.all(workloadOutputEdges::containsKey)) {
             "Calibration workload must define every resolution tier"
@@ -248,10 +249,12 @@ class InferenceCalibrationRunner(
         val progress = CalibrationProgressSession(
             reporter = progressReporter,
             totalSteps = plannedStepCount(request),
-            totalWorkUnits = plannedWorkUnits(request)
+            totalWorkUnits = plannedWorkUnits(request),
+            mode = request.mode
         )
         progress.startSession()
-        if (!request.device.supportsVulkan ||
+        if ((request.mode != CalibrationMode.LEGACY && !request.device.isQualcommAdreno) ||
+            !request.device.supportsVulkan ||
             !request.device.supportsFp16Storage ||
             !request.device.supportsFp16Arithmetic ||
             !AdaptiveInferencePolicy.hasStableGpuIdentity(request.device) ||
@@ -317,12 +320,16 @@ class InferenceCalibrationRunner(
         }
 
         return try {
-            withTimeoutOrNull(timeoutMs) {
+            val effectiveTimeoutMs = effectiveTimeoutMs(request.mode)
+            withTimeoutOrNull(effectiveTimeoutMs) {
                 operation.awaitWithCancellation(::cancelOperation)
             }
                 ?: run {
                     cancelOperation()
-                    progress.note("校准超时", "✗ 已达到五分钟校准预算")
+                    progress.note(
+                        "校准超时",
+                        "✗ 已达到 ${effectiveTimeoutMs / 60_000L} 分钟校准预算"
+                    )
                     CalibrationRunResult.TimedOut
                 }
         } catch (cancelled: CancellationException) {
@@ -372,7 +379,7 @@ class InferenceCalibrationRunner(
         )
         val vulkanTiers = linkedMapOf<ResolutionTier, CalibratedVulkanTier>()
         val selectedCpuByTier = linkedMapOf<ResolutionTier, MeasuredCpuCandidate>()
-        for (tier in ResolutionTier.entries) {
+        for (tier in calibrationTiers(request.mode)) {
             if (qualityAccepted) {
                 when (val result = calibrateTier(request, taskId, tier, fp16Quality, progress)) {
                     is CandidateProbeResult.Ready -> {
@@ -380,7 +387,8 @@ class InferenceCalibrationRunner(
                             resolutionTier = tier,
                             tileSize = result.candidate.tileSize,
                             commandBatchSize = result.candidate.commandBatchSize,
-                            maxPipelineDepth = result.candidate.maxPipelineDepth
+                            maxPipelineDepth = result.candidate.maxPipelineDepth,
+                            tuning = result.candidate.tuning
                         )
                         vulkanTiers[tier] = CalibratedVulkanTier(
                             resolutionTier = tier,
@@ -424,7 +432,7 @@ class InferenceCalibrationRunner(
                     decision = VulkanCalibrationDecision.QUALITY_REJECTED
                 )
             }
-            if (cpuCalibrationCandidates != null) {
+            if (request.mode != CalibrationMode.QUICK && cpuCalibrationCandidates != null) {
                 when (
                     val result = calibrateCpuTier(
                         request,
@@ -448,7 +456,8 @@ class InferenceCalibrationRunner(
             }
         }
 
-        val ttaProfiles = if (request.supportsTta && qualityAccepted) {
+        val shouldCalibrateTta = request.mode != CalibrationMode.QUICK && request.supportsTta
+        val ttaProfiles = if (shouldCalibrateTta && qualityAccepted) {
             when (val result = calibrateTta(request, taskId, progress)) {
                 is TtaCandidateProbeResult.Ready -> listOfNotNull(result.profile)
                 is TtaCandidateProbeResult.Failed -> {
@@ -456,7 +465,7 @@ class InferenceCalibrationRunner(
                 }
             }
         } else {
-            if (request.supportsTta) {
+            if (shouldCalibrateTta) {
                 skipPlannedTta(
                     request = request,
                     taskId = taskId,
@@ -490,7 +499,8 @@ class InferenceCalibrationRunner(
                     postprocessThreads = selected.postprocessThreads
                 )
             },
-            ttaProfiles = ttaProfiles
+            ttaProfiles = ttaProfiles,
+            calibrationMode = request.mode
         )
         return CalibrationPreparation.Ready(benchmark)
     }
@@ -520,6 +530,12 @@ class InferenceCalibrationRunner(
         )
         val steps = buildList {
             add("$tier Vulkan FP32" to safeParams)
+            tuningCandidates(request).forEach { tuning ->
+                add(
+                    "$tier Vulkan tuning=${tuning.toNativeFlags()}" to
+                        optimizedBase.copy(vulkanTuning = tuning)
+                )
+            }
             vulkanCalibrationCandidates.tileSizes.sorted().forEach { tile ->
                 add("$tier Vulkan FP16 tile=$tile" to optimizedBase.copy(tileSize = tile))
             }
@@ -531,7 +547,7 @@ class InferenceCalibrationRunner(
             add("$tier Vulkan depth=2" to optimizedBase.copy(maxPipelineDepth = 2))
             add("$tier Vulkan depth=2 复测" to optimizedBase.copy(maxPipelineDepth = 2))
         }
-        check(steps.size == plannedVulkanStepsPerTier())
+        check(steps.size == plannedVulkanStepsPerTier(request))
         steps.forEach { (title, params) ->
             progress.skipStep(
                 title = title,
@@ -1065,6 +1081,33 @@ class InferenceCalibrationRunner(
         )
     }
 
+    private fun tuningCandidates(request: InferenceCalibrationRequest): List<VulkanExecutionTuning> {
+        if (request.mode == CalibrationMode.LEGACY) return emptyList()
+        val capabilities = request.device.vulkanCapabilities ?: return emptyList()
+        val base = VulkanExecutionTuning.DEFAULT.copy(
+            useSubgroupOps = capabilities.supportsSubgroupOps,
+            useShaderLocalMemory = capabilities.maxComputeSharedMemoryBytes != null
+        )
+        return buildList {
+            add(base)
+            if (base.useSubgroupOps) add(base.copy(useSubgroupOps = false))
+            if (base.useShaderLocalMemory) add(base.copy(useShaderLocalMemory = false))
+            if (base.useSubgroupOps && base.useShaderLocalMemory) {
+                add(base.copy(useSubgroupOps = false, useShaderLocalMemory = false))
+            }
+            if (request.mode == CalibrationMode.DEEP) {
+                add(base.copy(useWinogradConvolution = false))
+                add(base.copy(useSgemmConvolution = false))
+                add(
+                    base.copy(
+                        useWinogradConvolution = false,
+                        useSgemmConvolution = false
+                    )
+                )
+            }
+        }.distinct()
+    }
+
     private suspend fun calibrateTier(
         request: InferenceCalibrationRequest,
         taskId: String,
@@ -1129,6 +1172,40 @@ class InferenceCalibrationRunner(
             return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
 
+        val measuredTuningCandidates = mutableListOf<MeasuredVulkanCandidate>()
+        for (tuning in tuningCandidates(request)) {
+            val measured = when (
+                val result = measureCandidate(
+                    pattern = pattern,
+                    reference = reference,
+                    quality = quality,
+                    title = "$tier Vulkan tuning=${tuning.toNativeFlags()}",
+                    progress = progress,
+                    params = referenceParams.copy(
+                        nativeBackend = NativeBackend.OPTIMIZED,
+                        inferencePrecision = InferencePrecision.FP16,
+                        commandBatchSize = 1,
+                        modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+                        vulkanTuning = tuning
+                    )
+                )
+            ) {
+                is CandidateProbeResult.Ready -> result.candidate
+                is CandidateProbeResult.Skipped -> continue
+                is CandidateProbeResult.Rejected -> return result
+                is CandidateProbeResult.Failed -> return result
+            }
+            measuredTuningCandidates += measured
+        }
+        if (request.mode != CalibrationMode.LEGACY && measuredTuningCandidates.isEmpty()) {
+            return CandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+        }
+        val selectedTuning = measuredTuningCandidates
+            .takeIf { it.isNotEmpty() }
+            ?.let { selectConservativeCandidate(request.device, it) }
+            ?.tuning
+            ?: request.baseParams.vulkanTuning
+
         val tileCandidates = mutableListOf<MeasuredVulkanCandidate>()
         for (tileSize in vulkanCalibrationCandidates.tileSizes.sorted()) {
             val measured = when (
@@ -1143,7 +1220,8 @@ class InferenceCalibrationRunner(
                         nativeBackend = NativeBackend.OPTIMIZED,
                         inferencePrecision = InferencePrecision.FP16,
                         commandBatchSize = 1,
-                        modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
+                        modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+                        vulkanTuning = selectedTuning
                     )
                 )
             ) {
@@ -1167,7 +1245,8 @@ class InferenceCalibrationRunner(
                 nativeBackend = NativeBackend.OPTIMIZED,
                 inferencePrecision = InferencePrecision.FP16,
                 commandBatchSize = batchSize,
-                modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
+                modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+                vulkanTuning = selectedTile.tuning
             )
             if (batchSize > measuredTileCount) {
                 progress.skipStep(
@@ -1208,7 +1287,8 @@ class InferenceCalibrationRunner(
             inferencePrecision = InferencePrecision.FP16,
             commandBatchSize = selected.commandBatchSize,
             modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
-            maxPipelineDepth = 1
+            maxPipelineDepth = 1,
+            vulkanTuning = selected.tuning
         )
         if (!isAtLeastFivePercentFaster(selected.durationNanos, reference.durationNanos)) {
             val fastest = (tileCandidates + batchCandidates)
@@ -1287,6 +1367,28 @@ class InferenceCalibrationRunner(
                 )
             )
         }
+        val stableBaselineDuration = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
+        val stableCandidateDuration = maxOf(selected.durationNanos, selectedRecheck.durationNanos)
+        if (request.mode != CalibrationMode.LEGACY &&
+            !AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos = stableBaselineDuration,
+                optimizedDurationNanos = stableCandidateDuration
+            )
+        ) {
+            skipVulkanTailSteps(
+                tier = tier,
+                pattern = pattern,
+                referenceParams = referenceParams,
+                selectedParams = selectedParams,
+                includeStabilityRechecks = false,
+                progress = progress,
+                reason = "Adreno 最终性能门未达到 10%"
+            )
+            return CandidateProbeResult.Rejected(
+                baselineDurationNanos = stableBaselineDuration,
+                bestCandidateDurationNanos = stableCandidateDuration
+            )
+        }
         val selectedDepth = calibratePipelineDepth(
             tier = tier,
             pattern = pattern,
@@ -1300,9 +1402,9 @@ class InferenceCalibrationRunner(
         return CandidateProbeResult.Ready(
             candidate = selected.copy(
                 maxPipelineDepth = selectedDepth,
-                durationNanos = maxOf(selected.durationNanos, selectedRecheck.durationNanos)
+                durationNanos = stableCandidateDuration
             ),
-            baselineDurationNanos = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
+            baselineDurationNanos = stableBaselineDuration
         )
     }
 
@@ -1517,7 +1619,8 @@ class InferenceCalibrationRunner(
                 tileSize = params.tileSize,
                 commandBatchSize = params.commandBatchSize,
                 durationNanos = output.durationNanos,
-                quality = quality
+                quality = quality,
+                tuning = params.vulkanTuning
             ),
             baselineDurationNanos = reference.durationNanos
         )
@@ -1699,12 +1802,35 @@ class InferenceCalibrationRunner(
         return availableBytes >= requiredAvailableHeapBytes(tier)
     }
 
+    private fun effectiveTimeoutMs(mode: CalibrationMode): Long {
+        val modeBudget = when (mode) {
+            CalibrationMode.LEGACY -> DEFAULT_TIMEOUT_MS
+            CalibrationMode.QUICK -> QUICK_TIMEOUT_MS
+            CalibrationMode.DEEP -> DEEP_TIMEOUT_MS
+        }
+        return timeoutMs?.coerceAtMost(modeBudget) ?: modeBudget
+    }
+
+    private fun calibrationTiers(mode: CalibrationMode): List<ResolutionTier> = when (mode) {
+        CalibrationMode.QUICK -> listOf(ResolutionTier.STANDARD)
+        CalibrationMode.LEGACY,
+        CalibrationMode.DEEP -> ResolutionTier.entries
+    }
+
     private fun plannedStepCount(request: InferenceCalibrationRequest): Int {
-        val vulkanStepsPerTier = plannedVulkanStepsPerTier()
-        val cpuStepsPerTier = plannedCpuStepsPerTier(request.device)
-        val ttaSteps = if (request.supportsTta) TTA_STEP_COUNT else 0
+        val vulkanStepsPerTier = plannedVulkanStepsPerTier(request)
+        val cpuStepsPerTier = if (request.mode == CalibrationMode.QUICK) {
+            0
+        } else {
+            plannedCpuStepsPerTier(request.device)
+        }
+        val ttaSteps = if (request.mode != CalibrationMode.QUICK && request.supportsTta) {
+            TTA_STEP_COUNT
+        } else {
+            0
+        }
         return QUALITY_STEP_COUNT +
-            ResolutionTier.entries.size * (vulkanStepsPerTier + cpuStepsPerTier) +
+            calibrationTiers(request.mode).size * (vulkanStepsPerTier + cpuStepsPerTier) +
             ttaSteps
     }
 
@@ -1713,16 +1839,20 @@ class InferenceCalibrationRunner(
             QUALITY_OUTPUT_EDGE.toLong() * QUALITY_OUTPUT_EDGE.toLong(),
             QUALITY_STEP_COUNT.toLong() * GPU_WORK_MULTIPLIER
         )
-        val vulkanStepsPerTier = plannedVulkanStepsPerTier()
-        val cpuStepsPerTier = plannedCpuStepsPerTier(request.device)
-        ResolutionTier.entries.forEach { tier ->
+        val vulkanStepsPerTier = plannedVulkanStepsPerTier(request)
+        val cpuStepsPerTier = if (request.mode == CalibrationMode.QUICK) {
+            0
+        } else {
+            plannedCpuStepsPerTier(request.device)
+        }
+        calibrationTiers(request.mode).forEach { tier ->
             val edge = workloadOutputEdges.getValue(tier).toLong()
             val pixels = saturatedMultiply(edge, edge)
             val multiplier = vulkanStepsPerTier.toLong() * GPU_WORK_MULTIPLIER +
                 cpuStepsPerTier.toLong() * CPU_WORK_MULTIPLIER
             total = saturatedAdd(total, saturatedMultiply(pixels, multiplier))
         }
-        if (request.supportsTta) {
+        if (request.mode != CalibrationMode.QUICK && request.supportsTta) {
             val qualityPixels = QUALITY_OUTPUT_EDGE.toLong() * QUALITY_OUTPUT_EDGE.toLong()
             val standardEdge = workloadOutputEdges.getValue(ResolutionTier.STANDARD).toLong()
             val standardPixels = saturatedMultiply(standardEdge, standardEdge)
@@ -1738,7 +1868,8 @@ class InferenceCalibrationRunner(
         return total.coerceAtLeast(1L)
     }
 
-    private fun plannedVulkanStepsPerTier(): Int = 1 +
+    private fun plannedVulkanStepsPerTier(request: InferenceCalibrationRequest): Int = 1 +
+        tuningCandidates(request).size +
         vulkanCalibrationCandidates.tileSizes.size +
         vulkanCalibrationCandidates.commandBatchSizes.size +
         VULKAN_STABILITY_RECHECK_COUNT +
@@ -1851,6 +1982,8 @@ class InferenceCalibrationRunner(
         // search stages for every resolution tier, so keep one atomic five-minute budget rather
         // than making the new default path deterministically time out after the Vulkan phase.
         const val DEFAULT_TIMEOUT_MS = 5L * 60L * 1_000L
+        const val QUICK_TIMEOUT_MS = 3L * 60L * 1_000L
+        const val DEEP_TIMEOUT_MS = 8L * 60L * 1_000L
         const val DEFAULT_RESOURCE_SAMPLE_INTERVAL_MS = 1_000L
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
         private const val PATTERN_SEED = 0x4c756d615352L
@@ -1961,7 +2094,8 @@ class InferenceCalibrationRunner(
         val commandBatchSize: Int,
         val durationNanos: Long,
         val quality: Fp16QualityMetrics,
-        val maxPipelineDepth: Int = 1
+        val maxPipelineDepth: Int = 1,
+        val tuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
     )
 
     private data class MeasuredCpuCandidate(
@@ -2005,6 +2139,7 @@ class InferenceCalibrationRunner(
         private val reporter: CalibrationProgressReporter,
         private val totalSteps: Int,
         private val totalWorkUnits: Long,
+        private val mode: CalibrationMode = CalibrationMode.LEGACY,
         private val nanoTime: () -> Long = System::nanoTime
     ) {
         private val startedAtNanos = nanoTime()
@@ -2016,7 +2151,7 @@ class InferenceCalibrationRunner(
             report(
                 type = CalibrationProgressEventType.SESSION_STARTED,
                 title = "准备性能校准",
-                logMessage = "> 校准计划已建立 · $totalSteps 个真实步骤"
+                logMessage = "> 校准计划已建立 · mode=${mode.name} · $totalSteps 个真实步骤"
             )
         }
 
@@ -2069,6 +2204,8 @@ class InferenceCalibrationRunner(
                 append(params.commandBatchSize)
                 append(" · depth=")
                 append(params.maxPipelineDepth)
+                append(" · tuning=")
+                append(params.vulkanTuning.toNativeFlags())
                 if (params.accelerationMode == AccelerationMode.CPU) {
                     append(" · threads=")
                     append(params.cpuThreads)

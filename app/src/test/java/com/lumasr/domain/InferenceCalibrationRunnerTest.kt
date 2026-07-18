@@ -27,6 +27,143 @@ class InferenceCalibrationRunnerTest {
             VulkanCalibrationCandidates().tileSizes
         )
         assertEquals(5L * 60L * 1_000L, InferenceCalibrationRunner.DEFAULT_TIMEOUT_MS)
+        assertEquals(3L * 60L * 1_000L, InferenceCalibrationRunner.QUICK_TIMEOUT_MS)
+        assertEquals(8L * 60L * 1_000L, InferenceCalibrationRunner.DEEP_TIMEOUT_MS)
+    }
+
+    @Test
+    fun quickCalibrationOnlySearchesStandardVulkanAndRecordsMode() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val requests = mutableListOf<UpscaleParams>()
+        val runner = testRunner(
+            probe = successfulProbe(requests = requests),
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = listOf(2)
+            ),
+            cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        )
+
+        val result = runner.run(
+            request(
+                outputScale = 1,
+                supportsTta = true,
+                mode = CalibrationMode.QUICK,
+                device = adrenoDevice()
+            )
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertEquals(CalibrationMode.QUICK, saved.calibrationMode)
+        assertEquals(listOf(ResolutionTier.STANDARD), saved.vulkanTiers.map { it.resolutionTier })
+        assertTrue(saved.cpuProfiles.isEmpty())
+        assertTrue(saved.ttaProfiles.isEmpty())
+        assertFalse(requests.any { it.accelerationMode == AccelerationMode.CPU })
+        assertFalse(requests.any { it.tta })
+        val optimizedTunings = requests
+            .filter { it.nativeBackend == NativeBackend.OPTIMIZED }
+            .map(UpscaleParams::vulkanTuning)
+        assertTrue(optimizedTunings.any { !it.useSubgroupOps })
+        assertTrue(optimizedTunings.any { !it.useShaderLocalMemory })
+        assertTrue(optimizedTunings.all { it.useWinogradConvolution })
+        assertTrue(optimizedTunings.all { it.useSgemmConvolution })
+    }
+
+    @Test
+    fun deepCalibrationSearchesAllTiersCpuAndConvolutionTuning() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val requests = mutableListOf<UpscaleParams>()
+        val runner = testRunner(
+            probe = successfulProbe(requests = requests),
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            ),
+            cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        )
+
+        val result = runner.run(
+            request(
+                outputScale = 1,
+                mode = CalibrationMode.DEEP,
+                device = adrenoDevice()
+            )
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertEquals(CalibrationMode.DEEP, saved.calibrationMode)
+        assertEquals(ResolutionTier.entries, saved.vulkanTiers.map { it.resolutionTier })
+        assertEquals(ResolutionTier.entries, saved.cpuProfiles.map { it.resolutionTier })
+        assertTrue(requests.any { !it.vulkanTuning.useWinogradConvolution })
+        assertTrue(requests.any { !it.vulkanTuning.useSgemmConvolution })
+    }
+
+    @Test
+    fun quickCalibrationRequiresTenPercentFinalSpeedup() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    image = RgbImage(input.width, input.height, input.copyBytes()),
+                    durationNanos = if (params.nativeBackend == NativeBackend.LEGACY_SAFE) {
+                        1_000L
+                    } else {
+                        920L
+                    }
+                )
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            )
+        )
+
+        val result = runner.run(
+            request(
+                outputScale = 1,
+                mode = CalibrationMode.QUICK,
+                device = adrenoDevice()
+            )
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(
+            VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+            saved.vulkanTiers.single().decision
+        )
+    }
+
+    @Test
+    fun quickAndDeepModesRejectNonQualcommDevicesBeforeProbing() = runBlocking {
+        val probes = AtomicInteger(0)
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = successfulProbe(probeCount = probes),
+            repository = repository
+        )
+
+        val result = runner.run(
+            request(outputScale = 1, mode = CalibrationMode.QUICK, device = device())
+        )
+
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE),
+            result
+        )
+        assertEquals(0, probes.get())
+        assertTrue(repository.saved.isEmpty())
     }
 
     @Test
@@ -2255,13 +2392,16 @@ class InferenceCalibrationRunnerTest {
 
     private fun request(
         outputScale: Int,
-        supportsTta: Boolean = false
+        supportsTta: Boolean = false,
+        mode: CalibrationMode = CalibrationMode.LEGACY,
+        device: DeviceCapabilityProfile = device()
     ) = InferenceCalibrationRequest(
         identity = identity(),
-        device = device(),
+        device = device,
         baseParams = params(scale = outputScale),
         measuredAtEpochMs = 1_000L,
-        supportsTta = supportsTta
+        supportsTta = supportsTta,
+        mode = mode
     )
 
     private fun identity() = BenchmarkIdentity(
@@ -2290,6 +2430,33 @@ class InferenceCalibrationRunnerTest {
         supportsVulkan = true,
         supportsFp16Storage = true,
         supportsFp16Arithmetic = true
+    )
+
+    private fun adrenoDevice() = device().copy(
+        gpuVendor = "Qualcomm",
+        gpuDevice = "Adreno",
+        vulkanCapabilities = VulkanDeviceCapabilities(
+            vendorId = VulkanDeviceCapabilities.QUALCOMM_VENDOR_ID,
+            deviceId = 1L,
+            apiVersion = 1L,
+            driverId = 1L,
+            driverVersion = 1L,
+            pipelineCacheUuid = "0123456789abcdef0123456789abcdef",
+            subgroupSize = 64,
+            subgroupMinSize = 64,
+            subgroupMaxSize = 128,
+            computeQueueCount = 1,
+            maxComputeSharedMemoryBytes = 32_768L,
+            supportsSubgroupOps = true,
+            supportsSubgroupSizeControl = true,
+            supportsComputeFullSubgroups = true,
+            driverQuirks = VulkanDriverQuirks(
+                corruptedOnlinePipelineCache = false,
+                storageBufferNoL1 = false,
+                bufferImageLoadZero = false,
+                implicitFp16Arithmetic = false
+            )
+        )
     )
 
     private fun params(scale: Int) = UpscaleParams(

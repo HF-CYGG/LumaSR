@@ -8,6 +8,7 @@ import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import com.lumasr.domain.UpscaleStage
+import com.lumasr.domain.VulkanExecutionTuning
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -93,7 +94,13 @@ class NativeMemoryPipelineProcessorTest {
             openmpBlocktimeMs = 35,
             postprocessThreads = 3,
             commandBatchSize = 4,
-            modelCacheCapacity = 2
+            modelCacheCapacity = 2,
+            vulkanTuning = VulkanExecutionTuning(
+                useSubgroupOps = false,
+                useShaderLocalMemory = true,
+                useWinogradConvolution = false,
+                useSgemmConvolution = true
+            )
         ).toNativeRequest()
 
         val encoding = encodeNativeMemoryPipelinePasses(listOf(request))
@@ -113,6 +120,8 @@ class NativeMemoryPipelineProcessorTest {
         assertEquals(request.postprocessThreads, encoding.passConfigs[18])
         assertEquals(request.commandBatchSize, encoding.passConfigs[19])
         assertEquals(request.modelCacheCapacity, encoding.passConfigs[20])
+        assertEquals(0b1010, request.vulkanTuningFlags)
+        assertEquals(request.vulkanTuningFlags, encoding.passConfigs[21])
     }
 
     private fun params(taskId: String) = UpscaleParams(

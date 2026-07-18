@@ -10,6 +10,41 @@ enum class InferencePrecision {
     FP16
 }
 
+enum class CalibrationMode {
+    LEGACY,
+    QUICK,
+    DEEP
+}
+
+data class VulkanExecutionTuning(
+    val useSubgroupOps: Boolean = true,
+    val useShaderLocalMemory: Boolean = true,
+    val useWinogradConvolution: Boolean = true,
+    val useSgemmConvolution: Boolean = true
+) {
+    fun toNativeFlags(): Int =
+        (if (useSubgroupOps) SUBGROUP_OPS_FLAG else 0) or
+            (if (useShaderLocalMemory) SHADER_LOCAL_MEMORY_FLAG else 0) or
+            (if (useWinogradConvolution) WINOGRAD_CONVOLUTION_FLAG else 0) or
+            (if (useSgemmConvolution) SGEMM_CONVOLUTION_FLAG else 0)
+
+    companion object {
+        val DEFAULT = VulkanExecutionTuning()
+
+        fun fromNativeFlags(flags: Int): VulkanExecutionTuning = VulkanExecutionTuning(
+            useSubgroupOps = flags and SUBGROUP_OPS_FLAG != 0,
+            useShaderLocalMemory = flags and SHADER_LOCAL_MEMORY_FLAG != 0,
+            useWinogradConvolution = flags and WINOGRAD_CONVOLUTION_FLAG != 0,
+            useSgemmConvolution = flags and SGEMM_CONVOLUTION_FLAG != 0
+        )
+
+        private const val SUBGROUP_OPS_FLAG = 1 shl 0
+        private const val SHADER_LOCAL_MEMORY_FLAG = 1 shl 1
+        private const val WINOGRAD_CONVOLUTION_FLAG = 1 shl 2
+        private const val SGEMM_CONVOLUTION_FLAG = 1 shl 3
+    }
+}
+
 data class VulkanDriverQuirks(
     val corruptedOnlinePipelineCache: Boolean,
     val storageBufferNoL1: Boolean,
@@ -103,7 +138,8 @@ data class InferenceExecutionProfile(
     val tta: Boolean,
     val openmpBlocktimeMs: Int = 20,
     val postprocessThreads: Int = 1,
-    val maxPipelineDepth: Int = 1
+    val maxPipelineDepth: Int = 1,
+    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
 )
 
 data class Fp16QualityMetrics(
@@ -175,7 +211,8 @@ data class InferenceBenchmarkResult(
         )
     },
     val cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
-    val ttaProfiles: List<CalibratedTtaProfile> = emptyList()
+    val ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
+    val calibrationMode: CalibrationMode = CalibrationMode.LEGACY
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Benchmark measurement time must be non-negative" }
@@ -363,7 +400,8 @@ object AdaptiveInferencePolicy {
                     gpuHeadroomPercent = 8,
                     modelCacheCapacity = 2,
                     tta = false,
-                    maxPipelineDepth = measuredProfile.maxPipelineDepth
+                    maxPipelineDepth = measuredProfile.maxPipelineDepth,
+                    vulkanTuning = measuredProfile.tuning
                 )
             } else {
                 InferenceExecutionProfile(

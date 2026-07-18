@@ -288,7 +288,8 @@ SuperResExecutionProfile resolve_execution_profile(
             params.openmpBlocktimeMs,
             params.postprocessThreads,
             params.commandBatchSize,
-            params.modelCacheCapacity
+            params.modelCacheCapacity,
+            params.vulkanTuningFlags
         },
         useVulkan,
         ncnn::get_big_cpu_count(),
@@ -395,6 +396,22 @@ LoadedNet load_cached_net(
     net->opt.use_vulkan_compute = useVulkan;
     if (useVulkan) {
         const ncnn::GpuInfo& gpuInfo = ncnn::get_gpu_info(ncnn::get_default_gpu_index());
+        net->opt.use_subgroup_ops = has_vulkan_tuning_flag(
+            profile.vulkanTuningFlags,
+            kSuperResVulkanTuningSubgroupOps
+        );
+        net->opt.use_shader_local_memory = has_vulkan_tuning_flag(
+            profile.vulkanTuningFlags,
+            kSuperResVulkanTuningShaderLocalMemory
+        );
+        net->opt.use_winograd_convolution = has_vulkan_tuning_flag(
+            profile.vulkanTuningFlags,
+            kSuperResVulkanTuningWinogradConvolution
+        );
+        net->opt.use_sgemm_convolution = has_vulkan_tuning_flag(
+            profile.vulkanTuningFlags,
+            kSuperResVulkanTuningSgemmConvolution
+        );
         net->opt.use_fp16_packed = true;
         net->opt.use_fp16_storage = true;
         // Legacy-safe remains on FP32 arithmetic; optimized FP16 is gated by the GPU capability check.
@@ -558,7 +575,7 @@ void log_native_performance_sample(
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
-        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d cacheHit=%d cacheSize=%d pipelineCacheHit=%d pipelineCacheBytes=%lld pipelineCacheRebuilt=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=%s finalPublishPending=%d",
+        "Performance task=%s model=%s modelKey=%s driverId=0x%08x driverVersion=0x%08x accel=%s backend=%d precision=%d fallback=%d requestedPipelineDepth=%d pipelineDepth=%d peakOccupiedSlots=%d peakSlotBytes=%lld producerWaitMs=%lld consumerWaitMs=%lld overlapMs=%lld threads=%d blocktimeMs=%d postprocessThreads=%d batch=%d cacheCapacity=%d vulkanTuning=%d cacheHit=%d cacheSize=%d pipelineCacheHit=%d pipelineCacheBytes=%lld pipelineCacheRebuilt=%d retry=%d region=%d tile=%d decodeMs=%lld modelLoadMs=%lld tileInputMs=%lld tileExtractMs=%lld tileCopyMs=%lld saveMs=%lld preprocessMs=%lld uploadMs=%lld inferenceMs=%lld downloadMs=%lld postprocessMs=%lld encodeMs=%lld totalMs=%lld timingScope=%s finalPublishPending=%d",
         params.taskId.c_str(),
         modelKey.c_str(),
         modelKey.c_str(),
@@ -580,6 +597,7 @@ void log_native_performance_sample(
         executionProfile.postprocessThreads,
         executionProfile.commandBatchSize,
         executionProfile.modelCacheCapacity,
+        executionProfile.vulkanTuningFlags,
         performance.cacheHit ? 1 : 0,
         performance.cacheSize,
         performance.pipelineCacheHit ? 1 : 0,

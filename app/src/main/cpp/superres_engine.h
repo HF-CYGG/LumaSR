@@ -62,6 +62,7 @@ struct SuperResNativeParams {
     int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
+    int vulkanTuningFlags = 0x0f;
 };
 
 struct SuperResRawTile {

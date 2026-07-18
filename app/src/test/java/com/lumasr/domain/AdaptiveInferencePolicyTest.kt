@@ -387,7 +387,15 @@ class AdaptiveInferencePolicyTest {
             currentBenchmarkIdentity = identity.copy(),
             currentSafeTileSize = 512,
             nowEpochMs = NOW_EPOCH_MS,
-            calibratedVulkanProfile = standardVulkanProfile(commandBatchSize = 2)
+            calibratedVulkanProfile = standardVulkanProfile(
+                commandBatchSize = 2,
+                tuning = VulkanExecutionTuning(
+                    useSubgroupOps = false,
+                    useShaderLocalMemory = true,
+                    useWinogradConvolution = false,
+                    useSgemmConvolution = true
+                )
+            )
         )
 
         assertEquals(NativeBackend.OPTIMIZED, optimized.backend)
@@ -395,6 +403,8 @@ class AdaptiveInferencePolicyTest {
         assertEquals(InferencePrecision.FP16, optimized.precision)
         assertEquals(2, optimized.commandBatchSize)
         assertEquals(2, optimized.modelCacheCapacity)
+        assertFalse(optimized.vulkanTuning.useSubgroupOps)
+        assertFalse(optimized.vulkanTuning.useWinogradConvolution)
 
         val stale = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -802,11 +812,13 @@ class AdaptiveInferencePolicyTest {
 
     private fun standardVulkanProfile(
         tileSize: Int = 256,
-        commandBatchSize: Int = 4
+        commandBatchSize: Int = 4,
+        tuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
     ) = CalibratedVulkanProfile(
         resolutionTier = ResolutionTier.STANDARD,
         tileSize = tileSize,
-        commandBatchSize = commandBatchSize
+        commandBatchSize = commandBatchSize,
+        tuning = tuning
     )
 
     private fun benchmarkResult(

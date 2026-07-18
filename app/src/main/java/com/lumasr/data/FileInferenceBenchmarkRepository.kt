@@ -6,11 +6,13 @@ import com.lumasr.domain.CalibratedCpuProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
+import com.lumasr.domain.CalibrationMode
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
 import com.lumasr.domain.ResolutionTier
 import com.lumasr.domain.VulkanCalibrationDecision
+import com.lumasr.domain.VulkanExecutionTuning
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -57,7 +59,15 @@ class FileInferenceBenchmarkRepository(
         PROCESS_MUTEX.withLock {
             validateResult(result)
             ensureDirectory()
-            val updated = readAll()
+            val current = readAll()
+            val existing = current.firstOrNull { it.identity == result.identity }
+            if (existing != null &&
+                result.measuredAtEpochMs in existing.measuredAtEpochMs..existing.validUntilEpochMs &&
+                existing.calibrationMode.priority > result.calibrationMode.priority
+            ) {
+                return@withLock gate.tryCommit(commit = {})
+            }
+            val updated = current
                 .filterNot { it.identity == result.identity }
                 .plus(result)
                 .sortedWith(RESULT_ORDER)
@@ -212,6 +222,13 @@ class FileInferenceBenchmarkRepository(
         }
     }
 
+    private val CalibrationMode.priority: Int
+        get() = when (this) {
+            CalibrationMode.LEGACY -> 0
+            CalibrationMode.QUICK -> 1
+            CalibrationMode.DEEP -> 2
+        }
+
     private fun ensureDirectory() {
         check(directory.isDirectory || directory.mkdirs()) { "Cannot create benchmark repository directory" }
     }
@@ -308,8 +325,8 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 5
-    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4)
+    private const val SCHEMA_VERSION = 6
+    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4, 5)
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -350,6 +367,7 @@ private object BenchmarkResultJson {
             put("p99ChannelError", result.fp16Quality.p99ChannelError)
         })
         put("recommendedCommandBatchSize", result.recommendedCommandBatchSize)
+        put("calibrationMode", result.calibrationMode.name)
         put("vulkanProfiles", buildJsonArray {
             result.vulkanProfiles.forEach { add(encodeVulkanProfile(it)) }
         })
@@ -371,6 +389,12 @@ private object BenchmarkResultJson {
         put("tileSize", profile.tileSize)
         put("commandBatchSize", profile.commandBatchSize)
         put("maxPipelineDepth", profile.maxPipelineDepth)
+        put("tuning", buildJsonObject {
+            put("useSubgroupOps", profile.tuning.useSubgroupOps)
+            put("useShaderLocalMemory", profile.tuning.useShaderLocalMemory)
+            put("useWinogradConvolution", profile.tuning.useWinogradConvolution)
+            put("useSgemmConvolution", profile.tuning.useSgemmConvolution)
+        })
     }
 
     private fun encodeCpuProfile(profile: CalibratedCpuProfile): JsonObject = buildJsonObject {
@@ -435,7 +459,7 @@ private object BenchmarkResultJson {
             vulkanProfiles = record.requiredArray("vulkanProfiles").map {
                 decodeVulkanProfile(it.jsonObject)
             },
-            vulkanTiers = if (schemaVersion == SCHEMA_VERSION) {
+            vulkanTiers = if (schemaVersion >= 5) {
                 record.requiredArray("vulkanTiers").map { decodeVulkanTier(it.jsonObject) }
             } else {
                 record.requiredArray("vulkanProfiles").map { profileElement ->
@@ -456,7 +480,12 @@ private object BenchmarkResultJson {
                 record.requiredArray("ttaProfiles").map { decodeTtaProfile(it.jsonObject) }
             },
             measuredAtEpochMs = record.requiredLong("measuredAtEpochMs"),
-            validUntilEpochMs = record.requiredLong("validUntilEpochMs")
+            validUntilEpochMs = record.requiredLong("validUntilEpochMs"),
+            calibrationMode = if (schemaVersion >= SCHEMA_VERSION) {
+                CalibrationMode.valueOf(record.requiredString("calibrationMode"))
+            } else {
+                CalibrationMode.LEGACY
+            }
         )
     }
 
@@ -465,7 +494,15 @@ private object BenchmarkResultJson {
             resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
             tileSize = record.requiredInt("tileSize"),
             commandBatchSize = record.requiredInt("commandBatchSize"),
-            maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1
+            maxPipelineDepth = record.optionalInt("maxPipelineDepth") ?: 1,
+            tuning = record["tuning"]?.jsonObject?.let { tuning ->
+                VulkanExecutionTuning(
+                    useSubgroupOps = tuning.requiredBoolean("useSubgroupOps"),
+                    useShaderLocalMemory = tuning.requiredBoolean("useShaderLocalMemory"),
+                    useWinogradConvolution = tuning.requiredBoolean("useWinogradConvolution"),
+                    useSgemmConvolution = tuning.requiredBoolean("useSgemmConvolution")
+                )
+            } ?: VulkanExecutionTuning.DEFAULT
         )
 
     private fun decodeCpuProfile(record: JsonObject): CalibratedCpuProfile =
@@ -508,6 +545,13 @@ private object BenchmarkResultJson {
     private fun JsonObject.requiredString(key: String): String = getValue(key).jsonPrimitive
         .also { check(it.isString) { "$key must be a JSON string" } }
         .content
+
+    private fun JsonObject.requiredBoolean(key: String): Boolean = getValue(key).jsonPrimitive
+        .also { check(!it.isString) { "$key must be a JSON boolean" } }
+        .content.let { value ->
+            check(value == "true" || value == "false") { "$key must be a JSON boolean" }
+            value.toBooleanStrict()
+        }
 
     private fun JsonObject.requiredInt(key: String): Int = getValue(key).jsonPrimitive
         .also { check(!it.isString) { "$key must be a JSON number" } }

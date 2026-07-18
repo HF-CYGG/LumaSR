@@ -88,7 +88,8 @@ data class UpscaleParams(
     val postprocessThreads: Int = 1,
     val commandBatchSize: Int = 1,
     val modelCacheCapacity: Int = 1,
-    val maxPipelineDepth: Int = 1
+    val maxPipelineDepth: Int = 1,
+    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
 )
 
 data class UpscalePipelinePlan(

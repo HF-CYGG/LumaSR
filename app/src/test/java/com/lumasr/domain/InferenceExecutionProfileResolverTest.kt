@@ -12,19 +12,41 @@ import org.junit.Test
 
 class InferenceExecutionProfileResolverTest {
     @Test
-    fun mapperPersistsOpenmpAndPostprocessExecutionControls() {
+    fun mapperPersistsNativeExecutionControls() {
         val base = params()
+        val tuning = VulkanExecutionTuning(
+            useSubgroupOps = false,
+            useShaderLocalMemory = true,
+            useWinogradConvolution = false,
+            useSgemmConvolution = true
+        )
         val profile = InferenceExecutionProfileMapper.from(base).copy(
             openmpBlocktimeMs = 37,
-            postprocessThreads = 3
+            postprocessThreads = 3,
+            vulkanTuning = tuning
         )
 
         val resolved = InferenceExecutionProfileMapper.apply(base, profile)
 
         assertEquals(37, resolved.openmpBlocktimeMs)
         assertEquals(3, resolved.postprocessThreads)
+        assertEquals(tuning, resolved.vulkanTuning)
         assertEquals(37, InferenceExecutionProfileMapper.from(resolved).openmpBlocktimeMs)
         assertEquals(3, InferenceExecutionProfileMapper.from(resolved).postprocessThreads)
+        assertEquals(tuning, InferenceExecutionProfileMapper.from(resolved).vulkanTuning)
+    }
+
+    @Test
+    fun vulkanTuningFlagsAreStableAndIgnoreUnknownBits() {
+        val tuning = VulkanExecutionTuning(
+            useSubgroupOps = false,
+            useShaderLocalMemory = true,
+            useWinogradConvolution = false,
+            useSgemmConvolution = true
+        )
+
+        assertEquals(0b1010, tuning.toNativeFlags())
+        assertEquals(tuning, VulkanExecutionTuning.fromNativeFlags(0b1_1010))
     }
 
     @Test

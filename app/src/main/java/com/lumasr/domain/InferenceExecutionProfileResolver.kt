@@ -79,7 +79,8 @@ object InferenceExecutionProfileMapper {
         postprocessThreads = profile.postprocessThreads,
         commandBatchSize = profile.commandBatchSize,
         modelCacheCapacity = profile.modelCacheCapacity,
-        maxPipelineDepth = profile.maxPipelineDepth.coerceIn(1, 2)
+        maxPipelineDepth = profile.maxPipelineDepth.coerceIn(1, 2),
+        vulkanTuning = profile.vulkanTuning
     )
 
     fun from(params: UpscaleParams): InferenceExecutionProfile = InferenceExecutionProfile(
@@ -96,7 +97,8 @@ object InferenceExecutionProfileMapper {
         ),
         modelCacheCapacity = params.modelCacheCapacity.coerceIn(1, 2),
         tta = params.tta,
-        maxPipelineDepth = params.maxPipelineDepth.coerceIn(1, 2)
+        maxPipelineDepth = params.maxPipelineDepth.coerceIn(1, 2),
+        vulkanTuning = params.vulkanTuning
     )
 }
 

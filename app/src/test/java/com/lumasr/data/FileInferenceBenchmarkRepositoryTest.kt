@@ -6,10 +6,12 @@ import com.lumasr.domain.CalibratedCpuProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
+import com.lumasr.domain.CalibrationMode
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
 import com.lumasr.domain.ResolutionTier
 import com.lumasr.domain.VulkanCalibrationDecision
+import com.lumasr.domain.VulkanExecutionTuning
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -36,7 +38,52 @@ class FileInferenceBenchmarkRepositoryTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun persistsSchemaV5PositiveAndNegativeVulkanTierEvidence() = runBlocking {
+    fun persistsSchemaV6CalibrationModeAndVulkanTuning() = runBlocking {
+        val root = temporaryFolder.newFolder("schema-v6-adreno-tuning")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val tuning = VulkanExecutionTuning(
+            useSubgroupOps = false,
+            useShaderLocalMemory = true,
+            useWinogradConvolution = false,
+            useSgemmConvolution = true
+        )
+        val expected = result(
+            identity = identity(),
+            calibrationMode = CalibrationMode.QUICK,
+            vulkanProfiles = listOf(
+                CalibratedVulkanProfile(
+                    resolutionTier = ResolutionTier.STANDARD,
+                    tileSize = 128,
+                    commandBatchSize = 2,
+                    tuning = tuning
+                )
+            )
+        )
+
+        repository.save(expected)
+
+        assertEquals(listOf(expected), repository.list())
+        val json = File(root, "inference-benchmarks.json").readText()
+        assertTrue(json.contains("\"schemaVersion\":6"))
+        assertTrue(json.contains("\"calibrationMode\":\"QUICK\""))
+        assertTrue(json.contains("\"useSubgroupOps\":false"))
+    }
+
+    @Test
+    fun quickPublicationCannotDowngradeDeepCalibrationForSameIdentity() = runBlocking {
+        val root = temporaryFolder.newFolder("deep-priority")
+        val repository = FileInferenceBenchmarkRepository(root)
+        val deep = result(identity(), calibrationMode = CalibrationMode.DEEP, measuredAt = 1_000L)
+        val quick = result(identity(), calibrationMode = CalibrationMode.QUICK, measuredAt = 2_000L)
+        repository.save(deep)
+
+        repository.save(quick)
+
+        assertEquals(listOf(deep), repository.list())
+    }
+
+    @Test
+    fun persistsSchemaV6PositiveAndNegativeVulkanTierEvidence() = runBlocking {
         val root = temporaryFolder.newFolder("schema-v5-tier-evidence")
         val repository = FileInferenceBenchmarkRepository(root)
         val enabledProfile = CalibratedVulkanProfile(
@@ -73,7 +120,7 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":5"))
+        assertTrue(json.contains("\"schemaVersion\":6"))
         assertTrue(json.contains("\"decision\":\"PERFORMANCE_REJECTED\""))
         assertTrue(json.contains("\"maxPipelineDepth\":2"))
     }
@@ -182,7 +229,7 @@ class FileInferenceBenchmarkRepositoryTest {
         repository.save(expected)
 
         assertEquals(listOf(expected), repository.list())
-        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":5"))
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":6"))
     }
 
     @Test
@@ -214,7 +261,7 @@ class FileInferenceBenchmarkRepositoryTest {
         assertEquals(listOf(resolutionAwareResult("valid-profile")), records)
         assertTrue(records.single().ttaProfiles.isEmpty())
         assertTrue(record.exists())
-        assertTrue(record.readText().contains("\"schemaVersion\":5"))
+        assertTrue(record.readText().contains("\"schemaVersion\":6"))
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
@@ -640,7 +687,8 @@ class FileInferenceBenchmarkRepositoryTest {
             )
         },
         cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
-        ttaProfiles: List<CalibratedTtaProfile> = emptyList()
+        ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
+        calibrationMode: CalibrationMode = CalibrationMode.LEGACY
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = quality,
@@ -649,6 +697,7 @@ class FileInferenceBenchmarkRepositoryTest {
         vulkanTiers = vulkanTiers,
         cpuProfiles = cpuProfiles,
         ttaProfiles = ttaProfiles,
+        calibrationMode = calibrationMode,
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil
     )

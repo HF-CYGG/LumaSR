@@ -25,7 +25,8 @@ data class CalibratedVulkanProfile(
     val resolutionTier: ResolutionTier,
     val tileSize: Int,
     val commandBatchSize: Int,
-    val maxPipelineDepth: Int = 1
+    val maxPipelineDepth: Int = 1,
+    val tuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
 ) {
     init {
         require(tileSize in UpscaleParamsFactory.supportedTileSizes) {
