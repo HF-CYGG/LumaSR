@@ -3,13 +3,20 @@ package com.lumasr.domain
 import java.io.File
 
 fun interface CalibrationRequestExecutor {
-    suspend fun execute(request: InferenceCalibrationRequest): CalibrationRunResult
+    suspend fun execute(
+        request: InferenceCalibrationRequest,
+        progressReporter: CalibrationProgressReporter
+    ): CalibrationRunResult
 }
 
 interface DeviceCalibrationCoordinator {
     val isSupported: Boolean
 
-    suspend fun run(model: ModelPack, resolvedModelDir: String): CalibrationRunResult
+    suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        progressReporter: CalibrationProgressReporter = CalibrationProgressReporter.NONE
+    ): CalibrationRunResult
 
     suspend fun hasValidCalibration(model: ModelPack): Boolean
 }
@@ -36,7 +43,8 @@ class OnDeviceCalibrationCoordinator(
 
     override suspend fun run(
         model: ModelPack,
-        resolvedModelDir: String
+        resolvedModelDir: String,
+        progressReporter: CalibrationProgressReporter
     ): CalibrationRunResult {
         if (!isSupported) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
@@ -52,7 +60,7 @@ class OnDeviceCalibrationCoordinator(
             measuredAtEpochMs = measuredAt,
             supportsTta = model.supportsTta
         )
-        return executor.execute(request)
+        return executor.execute(request, progressReporter)
     }
 
     override suspend fun hasValidCalibration(model: ModelPack): Boolean {

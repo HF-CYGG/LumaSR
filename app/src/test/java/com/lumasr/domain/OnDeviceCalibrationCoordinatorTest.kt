@@ -9,11 +9,37 @@ import org.junit.Test
 
 class OnDeviceCalibrationCoordinatorTest {
     @Test
+    fun forwardsProgressReporterToTheRequestExecutor() = runBlocking {
+        var forwardedReporter: CalibrationProgressReporter? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = object : CalibrationRequestExecutor {
+                override suspend fun execute(
+                    request: InferenceCalibrationRequest,
+                    progressReporter: CalibrationProgressReporter
+                ): CalibrationRunResult {
+                    forwardedReporter = progressReporter
+                    return CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+                }
+            },
+            device = device(),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+        val reporter = CalibrationProgressReporter { }
+
+        coordinator.run(model(), File("build/models/waifu").absolutePath, reporter)
+
+        assertTrue(forwardedReporter === reporter)
+    }
+
+    @Test
     fun buildsModelSpecificLocalRequestWithCompleteIdentity() = runBlocking {
         var captured: InferenceCalibrationRequest? = null
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = FakeRepository(),
-            executor = CalibrationRequestExecutor { request ->
+            executor = CalibrationRequestExecutor { request, _ ->
                 captured = request
                 CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
             },
@@ -45,7 +71,7 @@ class OnDeviceCalibrationCoordinatorTest {
         val repository = FakeRepository()
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = repository,
-            executor = CalibrationRequestExecutor { error("not used") },
+            executor = CalibrationRequestExecutor { _, _ -> error("not used") },
             device = device(),
             rawDeviceFingerprint = "fingerprint",
             runtimeBuildKey = "app-1:test:arm64-v8a",
@@ -77,7 +103,7 @@ class OnDeviceCalibrationCoordinatorTest {
         var invoked = false
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = FakeRepository(),
-            executor = CalibrationRequestExecutor {
+            executor = CalibrationRequestExecutor { _, _ ->
                 invoked = true
                 error("must not run")
             },
@@ -102,7 +128,7 @@ class OnDeviceCalibrationCoordinatorTest {
         var invoked = false
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = FakeRepository(),
-            executor = CalibrationRequestExecutor {
+            executor = CalibrationRequestExecutor { _, _ ->
                 invoked = true
                 CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
             },
@@ -178,7 +204,7 @@ class OnDeviceCalibrationCoordinatorTest {
         clock: () -> Long = { 1_500L }
     ) = OnDeviceCalibrationCoordinator(
         repository = repository,
-        executor = CalibrationRequestExecutor {
+        executor = CalibrationRequestExecutor { _, _ ->
             error("unsupported calibration must not invoke executor")
         },
         device = device,

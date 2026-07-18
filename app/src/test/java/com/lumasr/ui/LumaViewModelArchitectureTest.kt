@@ -41,6 +41,11 @@ class LumaViewModelArchitectureTest {
         assertTrue(source.contains("fun runCalibration()"))
         assertTrue(source.contains("withContext(ioDispatcher)"))
         assertTrue(source.contains("calibrationCoordinator.run("))
+        assertTrue(source.contains("CalibrationProgressReporter"))
+        assertTrue(source.contains("calibrationTickerJob"))
+        assertTrue(source.contains("applyCalibrationProgress"))
+        assertTrue(source.contains("finishCalibrationDialog"))
+        assertTrue(source.contains("fun dismissCalibrationDialog()"))
     }
 
     @Test

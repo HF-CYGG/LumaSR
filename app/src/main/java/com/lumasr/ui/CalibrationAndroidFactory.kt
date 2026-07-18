@@ -71,7 +71,9 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     )
     return OnDeviceCalibrationCoordinator(
         repository = repository,
-        executor = CalibrationRequestExecutor(runner::run),
+        executor = CalibrationRequestExecutor { request, progressReporter ->
+            runner.run(request, progressReporter)
+        },
         device = device,
         rawDeviceFingerprint = Build.FINGERPRINT.orEmpty(),
         runtimeBuildKey = inferenceRuntimeBuildKey(),
