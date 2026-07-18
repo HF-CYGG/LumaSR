@@ -1,6 +1,7 @@
 package com.lumasr.ui
 
 import com.lumasr.domain.CalibrationProgressEvent
+import com.lumasr.domain.CalibrationProgressEventType
 
 enum class CalibrationDialogStatus {
     RUNNING,
@@ -63,11 +64,20 @@ object CalibrationProgressUiReducer {
         val elapsedMs = maxOf(state.elapsedMs, event.elapsedMs)
         val completedWork = event.completedWorkUnits
         val totalWork = event.totalWorkUnits
-        val progress = if (totalWork > 0L) {
+        val workProgress = if (totalWork > 0L) {
             (completedWork.toDouble() / totalWork.toDouble()).toFloat().coerceIn(0f, 1f)
         } else {
             state.progressFraction
         }
+        val completedStepProgress = if (
+            event.type == CalibrationProgressEventType.STEP_COMPLETED && event.totalSteps > 0
+        ) {
+            event.stepIndex.toFloat() / event.totalSteps.toFloat()
+        } else {
+            state.progressFraction
+        }
+        val progress = maxOf(state.progressFraction, workProgress, completedStepProgress)
+            .coerceIn(0f, 1f)
         val estimate = estimateRemainingMs(
             elapsedMs = elapsedMs,
             completedWorkUnits = completedWork,
@@ -115,9 +125,14 @@ object CalibrationProgressUiReducer {
             "Finished calibration must use a terminal status"
         }
         val finalElapsedMs = maxOf(state.elapsedMs, elapsedMs)
-        val finalLogs = summary.takeIf { it.isNotBlank() }
-            ?.let { state.logLines + CalibrationConsoleLine(finalElapsedMs, it) }
-            ?: state.logLines
+        val finalSummary = summary.takeIf { it.isNotBlank() }
+        val finalLogs = if (
+            finalSummary == null || state.logLines.lastOrNull()?.text == finalSummary
+        ) {
+            state.logLines
+        } else {
+            state.logLines + CalibrationConsoleLine(finalElapsedMs, finalSummary)
+        }
         return state.copy(
             status = status,
             elapsedMs = finalElapsedMs,

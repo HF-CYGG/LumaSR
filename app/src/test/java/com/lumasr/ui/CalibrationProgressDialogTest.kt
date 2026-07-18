@@ -28,8 +28,9 @@ class CalibrationProgressDialogTest {
         assertTrue(source.contains("FontFamily.Monospace"))
         assertTrue(source.contains("SelectionContainer"))
         assertTrue(source.contains("verticalScroll(logScrollState)"))
-        assertTrue(source.contains("LaunchedEffect(state.logLines.size)"))
-        assertTrue(source.contains("logScrollState.animateScrollTo"))
+        assertTrue(source.contains("snapshotFlow { logScrollState.maxValue }"))
+        assertTrue(source.contains("collectLatest"))
+        assertTrue(source.contains("logScrollState.scrollTo"))
         assertTrue(source.contains("TextButton(onClick = onDismiss"))
     }
 }

@@ -78,6 +78,24 @@ class CalibrationProgressUiStateTest {
     }
 
     @Test
+    fun completedStepFractionIsTheMinimumVisibleProgress() {
+        val state = CalibrationProgressUiReducer.apply(
+            CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L),
+            event(
+                type = CalibrationProgressEventType.STEP_COMPLETED,
+                elapsedMs = 13_000L,
+                completedWorkUnits = 2L,
+                totalWorkUnits = 100L,
+                logMessage = "completed step",
+                stepIndex = 4,
+                totalSteps = 15
+            )
+        )
+
+        assertEquals(4f / 15f, state.progressFraction, 0.0001f)
+    }
+
+    @Test
     fun terminalStateStopsClockKeepsLogsAndRequiresExplicitDismiss() {
         val running = CalibrationProgressUiReducer.apply(
             CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L),
@@ -109,16 +127,42 @@ class CalibrationProgressUiStateTest {
         assertSame(running, CalibrationProgressUiReducer.dismiss(running))
     }
 
+    @Test
+    fun terminalSummaryIsNotDuplicatedWhenRunnerAlreadyLoggedIt() {
+        val summary = "calibration failed"
+        val running = CalibrationProgressUiReducer.apply(
+            CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L),
+            event(
+                type = CalibrationProgressEventType.NOTE,
+                elapsedMs = 12_000L,
+                completedWorkUnits = 2L,
+                totalWorkUnits = 100L,
+                logMessage = summary
+            )
+        )
+
+        val finished = CalibrationProgressUiReducer.finish(
+            state = running,
+            status = CalibrationDialogStatus.FAILED,
+            elapsedMs = 12_000L,
+            summary = summary
+        )
+
+        assertEquals(listOf(summary), finished.logLines.map { it.text })
+    }
+
     private fun event(
         type: CalibrationProgressEventType,
         elapsedMs: Long,
         completedWorkUnits: Long,
         totalWorkUnits: Long,
-        logMessage: String
+        logMessage: String,
+        stepIndex: Int = 1,
+        totalSteps: Int = 11
     ) = CalibrationProgressEvent(
         type = type,
-        stepIndex = 1,
-        totalSteps = 11,
+        stepIndex = stepIndex,
+        totalSteps = totalSteps,
         completedWorkUnits = completedWorkUnits,
         totalWorkUnits = totalWorkUnits,
         elapsedMs = elapsedMs,
