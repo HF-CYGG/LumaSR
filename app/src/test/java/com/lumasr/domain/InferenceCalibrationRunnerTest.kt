@@ -33,6 +33,7 @@ class InferenceCalibrationRunnerTest {
     fun productionCandidateBudgetMeasuresEveryRealTierWithoutExpandingSearchGrid() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val measured = mutableListOf<RecordedProbeRequest>()
+        val requestedCacheCapacities = mutableListOf<Int>()
         val progressEvents = mutableListOf<CalibrationProgressEvent>()
         val outputEdges = mapOf(
             ResolutionTier.SMALL to 2_048,
@@ -44,22 +45,26 @@ class InferenceCalibrationRunnerTest {
                 override suspend fun run(
                     input: RgbImage,
                     params: UpscaleParams
-                ): CalibrationProbeOutput = CalibrationProbeOutput(
-                    image = RgbImage(
-                        input.width * params.scale,
-                        input.height * params.scale,
-                        ByteArray(
-                            input.width * params.scale * input.height * params.scale *
-                                RgbImage.CHANNEL_COUNT
-                        )
-                    ),
-                    durationNanos = successfulDuration(params)
-                )
+                ): CalibrationProbeOutput {
+                    requestedCacheCapacities += params.modelCacheCapacity
+                    return CalibrationProbeOutput(
+                        image = RgbImage(
+                            input.width * params.scale,
+                            input.height * params.scale,
+                            ByteArray(
+                                input.width * params.scale * input.height * params.scale *
+                                    RgbImage.CHANNEL_COUNT
+                            )
+                        ),
+                        durationNanos = successfulDuration(params)
+                    )
+                }
 
                 override suspend fun measure(
                     input: RgbImage,
                     params: UpscaleParams
                 ): CalibrationProbeMeasurement {
+                    requestedCacheCapacities += params.modelCacheCapacity
                     measured += RecordedProbeRequest(input.width, input.height, params)
                     return CalibrationProbeMeasurement(
                         outputWidth = input.width * params.scale,
@@ -82,6 +87,7 @@ class InferenceCalibrationRunnerTest {
         )
 
         assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(setOf(3), requestedCacheCapacities.toSet())
         assertEquals(9, measured.size)
         outputEdges.values.forEach { outputEdge ->
             val tierRequests = measured.filter { it.inputWidth * it.params.scale == outputEdge }
@@ -1378,6 +1384,7 @@ class InferenceCalibrationRunnerTest {
     @Test
     fun candidatesSlowerThanLegacyReferenceNeverEnableOptimizedPath() = runBlocking {
         val repository = RecordingBenchmarkRepository()
+        val events = mutableListOf<CalibrationProgressEvent>()
         val runner = testRunner(
             probe = object : InferenceCalibrationProbe {
                 override suspend fun run(input: RgbImage, params: UpscaleParams): CalibrationProbeOutput {
@@ -1392,12 +1399,18 @@ class InferenceCalibrationRunnerTest {
             repository = repository
         )
 
-        val result = runner.run(request(outputScale = 1))
+        val result = runner.run(
+            request(outputScale = 1),
+            CalibrationProgressReporter(events::add)
+        )
 
         assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED),
+            CalibrationRunResult.Failed(CalibrationFailureReason.PERFORMANCE_REJECTED),
             result
         )
+        val rejection = events.single { it.logMessage.contains("FP32=") }
+        assertTrue(rejection.logMessage.contains("FP16="))
+        assertTrue(rejection.logMessage.contains("5%"))
         assertTrue(repository.saved.isEmpty())
     }
 

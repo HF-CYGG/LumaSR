@@ -151,6 +151,7 @@ enum class CalibrationFailureReason {
     PROBE_FAILED,
     INVALID_OUTPUT,
     QUALITY_REJECTED,
+    PERFORMANCE_REJECTED,
     PERSISTENCE_FAILED
 }
 
@@ -370,7 +371,7 @@ class InferenceCalibrationRunner(
             nativeBackend = NativeBackend.LEGACY_SAFE,
             inferencePrecision = InferencePrecision.FP32,
             commandBatchSize = 1,
-            modelCacheCapacity = 1,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
             tta = false,
             pipelinePasses = emptyList()
         )
@@ -401,7 +402,7 @@ class InferenceCalibrationRunner(
         val optimizedParams = safeParams.copy(
             nativeBackend = NativeBackend.OPTIMIZED,
             inferencePrecision = InferencePrecision.FP16,
-            modelCacheCapacity = 2
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
         )
         progress.startStep(
             title = "FP16 质量候选",
@@ -457,7 +458,7 @@ class InferenceCalibrationRunner(
             nativeBackend = NativeBackend.LEGACY_SAFE,
             inferencePrecision = InferencePrecision.FP32,
             commandBatchSize = 1,
-            modelCacheCapacity = 1,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
             tta = true,
             pipelinePasses = emptyList()
         )
@@ -489,7 +490,7 @@ class InferenceCalibrationRunner(
             nativeBackend = NativeBackend.OPTIMIZED,
             inferencePrecision = InferencePrecision.FP16,
             commandBatchSize = CalibratedTtaProfile.OPTIMIZED_TTA_PASS_BATCH_SIZE,
-            modelCacheCapacity = 2
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
         )
         progress.startStep(
             title = "TTA FP16 质量候选",
@@ -623,7 +624,7 @@ class InferenceCalibrationRunner(
             postprocessThreads = request.baseParams.postprocessThreads
                 .coerceIn(1, physicalCoreLimit),
             commandBatchSize = 1,
-            modelCacheCapacity = 1,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
             tta = false,
             pipelinePasses = emptyList()
         )
@@ -813,7 +814,7 @@ class InferenceCalibrationRunner(
             nativeBackend = NativeBackend.LEGACY_SAFE,
             inferencePrecision = InferencePrecision.FP32,
             commandBatchSize = 1,
-            modelCacheCapacity = 1,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
             tta = false,
             pipelinePasses = emptyList()
         )
@@ -855,7 +856,7 @@ class InferenceCalibrationRunner(
                         nativeBackend = NativeBackend.OPTIMIZED,
                         inferencePrecision = InferencePrecision.FP16,
                         commandBatchSize = 1,
-                        modelCacheCapacity = 2
+                        modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
                     )
                 )
             ) {
@@ -868,7 +869,17 @@ class InferenceCalibrationRunner(
             device = request.device,
             baselineDurationNanos = reference.durationNanos,
             candidates = tileCandidates
-        ) ?: return CandidateProbeResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+        ) ?: run {
+            val fastest = tileCandidates.minBy(MeasuredVulkanCandidate::durationNanos)
+            progress.note(
+                "$tier Vulkan 性能门",
+                "✗ 未达到 5% 提速门槛 · " +
+                    "FP32=${formatPerformanceDuration(reference.durationNanos)} · " +
+                    "FP16=${formatPerformanceDuration(fastest.durationNanos)} · " +
+                    "实测提速=${formatSpeedup(reference.durationNanos, fastest.durationNanos)}"
+            )
+            return CandidateProbeResult.Failed(CalibrationFailureReason.PERFORMANCE_REJECTED)
+        }
 
         val measuredTileCount = estimatedTileCount(pattern, selectedTile.tileSize)
         val batchCandidates = mutableListOf<MeasuredVulkanCandidate>()
@@ -887,7 +898,7 @@ class InferenceCalibrationRunner(
                         nativeBackend = NativeBackend.OPTIMIZED,
                         inferencePrecision = InferencePrecision.FP16,
                         commandBatchSize = batchSize,
-                        modelCacheCapacity = 2
+                        modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY
                     )
                 )
             ) {
@@ -996,6 +1007,21 @@ class InferenceCalibrationRunner(
 
     private fun isAtLeastFivePercentFaster(candidateNanos: Long, currentNanos: Long): Boolean =
         candidateNanos.toDouble() <= currentNanos.toDouble() * MAX_UPGRADE_DURATION_RATIO
+
+    private fun formatPerformanceDuration(durationNanos: Long): String = String.format(
+        Locale.US,
+        "%.2fs",
+        durationNanos.coerceAtLeast(0L) / 1_000_000_000.0
+    )
+
+    private fun formatSpeedup(baselineNanos: Long, candidateNanos: Long): String {
+        val speedupPercent = if (baselineNanos > 0L) {
+            (1.0 - candidateNanos.toDouble() / baselineNanos.toDouble()) * 100.0
+        } else {
+            0.0
+        }
+        return String.format(Locale.US, "%+.1f%%", speedupPercent)
+    }
 
     private fun ensureCalibrationThermallySafe() {
         when (runCatching { thermalLevelProvider() }.getOrNull()) {
@@ -1160,6 +1186,7 @@ class InferenceCalibrationRunner(
         private const val CPU_WORK_MULTIPLIER = 5L
         private const val TTA_WORK_MULTIPLIER = 8L
         private const val MAX_UPGRADE_DURATION_RATIO = 0.95
+        private const val CALIBRATION_MODEL_CACHE_CAPACITY = 3
         private const val DEFAULT_CPU_THREADS = 4
         private const val MEBIBYTE = 1_024L * 1_024L
         private val PERFECT_CPU_REFERENCE_QUALITY = Fp16QualityMetrics(
