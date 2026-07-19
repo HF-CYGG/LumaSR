@@ -41,11 +41,8 @@ class CheckForUpdateUseCase(
             "Installed version is not a supported numeric version."
         }
         val release = source.latestRelease()
-        if (release.tagName == LEGACY_RELEASE_TAG) {
-            return UpdateCheckResult.UpToDate(installed)
-        }
-        val remote = requireNotNull(AppVersion.parse(release.tagName)) {
-            "Latest release tag is not a supported numeric version."
+        val remote = requireNotNull(release.resolveVersion()) {
+            "Latest release tag or rolling release title is not a supported numeric version."
         }
         if (remote <= installed) {
             return UpdateCheckResult.UpToDate(installed)
@@ -66,6 +63,17 @@ class CheckForUpdateUseCase(
     }
 
     private companion object {
-        const val LEGACY_RELEASE_TAG = "release"
+        const val ROLLING_RELEASE_TAG = "release"
+        val ROLLING_RELEASE_TITLE_PATTERN = Regex(
+            pattern = "^(?:LumaSR\\s+)?([vV]?[0-9]+(?:\\.[0-9]+){1,3})$",
+            option = RegexOption.IGNORE_CASE
+        )
+    }
+
+    private fun LatestRelease.resolveVersion(): AppVersion? {
+        AppVersion.parse(tagName)?.let { return it }
+        if (tagName != ROLLING_RELEASE_TAG) return null
+        val match = ROLLING_RELEASE_TITLE_PATTERN.matchEntire(title.trim()) ?: return null
+        return AppVersion.parse(match.groupValues[1])
     }
 }

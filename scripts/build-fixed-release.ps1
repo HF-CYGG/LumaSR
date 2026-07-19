@@ -101,7 +101,8 @@ try {
         -ApkPath $artifactPath `
         -ExpectedTag $releaseTag `
         -ExpectedVersionName $releaseElement.versionName `
-        -ExpectedVersionCode ([long]$releaseElement.versionCode)
+        -ExpectedVersionCode ([long]$releaseElement.versionCode) `
+        -ExpectedAssetName 'LumaSR.apk'
     if ($LASTEXITCODE -ne 0) {
         throw 'Published Release APK contract verification failed.'
     }

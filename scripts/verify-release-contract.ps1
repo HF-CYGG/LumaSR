@@ -10,7 +10,10 @@ param(
     [string]$ExpectedVersionName,
 
     [Parameter(Mandatory)]
-    [long]$ExpectedVersionCode
+    [long]$ExpectedVersionCode,
+
+    [Parameter(Mandatory)]
+    [string]$ExpectedAssetName
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,8 +61,8 @@ function Find-AndroidBuildTool {
 & $metadataValidatorPath -TagName $ExpectedTag -ProjectRoot $projectRoot
 
 $resolvedApk = (Resolve-Path -LiteralPath $ApkPath).Path
-if ((Split-Path -Leaf $resolvedApk) -cne 'LumaSR.apk') {
-    throw "GitHub Release APK must be named LumaSR.apk: $resolvedApk"
+if ((Split-Path -Leaf $resolvedApk) -cne $ExpectedAssetName) {
+    throw "GitHub Release APK must be named $ExpectedAssetName`: $resolvedApk"
 }
 if ((Get-Item -LiteralPath $resolvedApk).Length -le 0) {
     throw "Release APK is empty: $resolvedApk"
@@ -99,5 +102,5 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host (
     "Release APK contract verified: tag=$ExpectedTag " +
-    "versionName=$actualVersionName versionCode=$actualVersionCode asset=LumaSR.apk"
+    "versionName=$actualVersionName versionCode=$actualVersionCode asset=$ExpectedAssetName"
 )

@@ -42,6 +42,32 @@ class GitHubReleaseParserTest {
 
         assertEquals("app-release.apk", release.assetName)
         assertNull(release.digest)
+        assertEquals(
+            githubUrl("release", "app-release.apk"),
+            release.originalDownloadUrl
+        )
+        assertEquals(
+            "https://gh.jasonzeng.dev/${githubUrl("release", "app-release.apk")}",
+            release.acceleratedDownloadUrl
+        )
+    }
+
+    @Test
+    fun acceptsSingleVersionedApkFromRollingReleaseUrl() {
+        val assetName = "LumaSR-v0.3.2.apk"
+        val release = GitHubReleaseParser.parse(
+            releaseJson(
+                tag = "release",
+                assets = assetJson(assetName, 128, githubUrl("release", assetName))
+            )
+        )
+
+        assertEquals(assetName, release.assetName)
+        assertEquals(githubUrl("release", assetName), release.originalDownloadUrl)
+        assertEquals(
+            "https://gh.jasonzeng.dev/${githubUrl("release", assetName)}",
+            release.acceleratedDownloadUrl
+        )
     }
 
     @Test

@@ -39,7 +39,8 @@ if (
     -ApkPath $apkPath `
     -ExpectedTag $TagName `
     -ExpectedVersionName $manifest.versionName `
-    -ExpectedVersionCode ([long]$manifest.versionCode)
+    -ExpectedVersionCode ([long]$manifest.versionCode) `
+    -ExpectedAssetName 'LumaSR.apk'
 
 $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $apkPath).Hash.ToLowerInvariant()
 $checksumMatch = [regex]::Match(

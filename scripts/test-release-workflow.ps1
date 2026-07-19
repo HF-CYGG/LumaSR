@@ -9,9 +9,9 @@ if (!(Test-Path -LiteralPath $validatorPath -PathType Leaf)) {
     throw "Release metadata validator is missing: $validatorPath"
 }
 
-& $validatorPath -TagName 'v0.3.2' -ProjectRoot $projectRoot
+& $validatorPath -TagName 'v0.3.3' -ProjectRoot $projectRoot
 
-foreach ($invalidTag in @('release', 'v0.3.2-beta', 'v0.3.1')) {
+foreach ($invalidTag in @('release', 'v0.3.3-beta', 'v0.3.2')) {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass `

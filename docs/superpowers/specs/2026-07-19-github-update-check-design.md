@@ -7,9 +7,9 @@ LumaSR 在前台启动时自动检查 GitHub 最新正式 Release，并在设置
 ## 发布契约
 
 - 唯一元数据源为 `https://api.github.com/repos/HF-CYGG/LumaSR/releases/latest`。
-- 当前遗留 `release` 标签只作为历史兼容；客户端将它视为当前无可比较更新，不显示错误弹窗。
-- 从下一版本开始，每个正式版本创建不可变 GitHub Release 标签，例如 `v0.3.2`、`v0.3.3`。
-- 正式 APK 固定命名为 `LumaSR.apk`；旧 Release 中唯一有效的 `.apk` 可作为兼容资产。
+- 当前继续使用固定 `release` 标签；客户端从严格格式的 Release 标题（`v0.3.2` 或 `LumaSR v0.3.2`）解析真实版本。
+- 数值版本标签仍保持优先解析，以兼容未来恢复 `v0.3.3`、`v1.0.5.1` 等不可变 Release。
+- 滚动 Release 只保留一个版本化 APK，例如 `LumaSR-v0.3.2.apk`；旧 Release 中唯一有效的 `.apk` 仍可作为兼容资产。
 - 客户端直接使用 API 返回的 `assets[].browser_download_url`，不手工拼接版本标签。
 - 国内下载地址为 `https://gh.jasonzeng.dev/` 加经过白名单验证的 GitHub APK URL；同时保留 GitHub 原始地址。
 - Release APK 必须延续固定证书签名，`versionCode` 严格递增，并在发布前通过 `apksigner verify`。
@@ -19,7 +19,7 @@ LumaSR 在前台启动时自动检查 GitHub 最新正式 Release，并在设置
 - `AppVersion` 解析 `v0.3.2`、`0.3.2` 以及最多四段数字版本并逐段比较，禁止字符串比较。
 - `LatestReleaseSource` 是领域层读取接口；`GitHubReleaseSource` 使用 `HttpURLConnection` 在 `Dispatchers.IO` 请求公开 API，不携带 Token。
 - `GitHubReleaseParser` 使用项目已有 `kotlinx-serialization-json` 解析 Release 和 APK 资产，并验证 HTTPS、`github.com`、仓库路径、上传状态、文件大小和 `.apk` 后缀。
-- `CheckForUpdateUseCase` 比较本机和远端版本，返回可更新或已是最新；遗留 `release` 标签映射为已是最新。
+- `CheckForUpdateUseCase` 比较本机和远端版本，返回可更新或已是最新；只有固定 `release` 标签允许严格回退解析标题。
 - 独立 `UpdateViewModel` 管理自动检查节流、手动检查、设置开关、错误可见性和更新弹窗，不把更新状态并入图片处理状态。
 - `UpdatePreferencesRepository` 使用独立 `SharedPreferences` 保存自动检查开关和最近一次自动尝试时间。
 
@@ -48,7 +48,7 @@ LumaSR 在前台启动时自动检查 GitHub 最新正式 Release，并在设置
 
 ## 验证
 
-- JVM 单测覆盖三/四段版本比较、遗留标签、Release JSON、资产选择、URL 白名单、加速链接、自动检查节流和用例结果。
+- JVM 单测覆盖三/四段版本比较、滚动标签标题、Release JSON、版本化单一资产、URL 白名单、加速链接、自动检查节流和用例结果。
 - 设置页静态测试覆盖自动检查开关、手动检查入口与隐私文案。
 - 运行目标测试后扩大到全量 `testDebugUnitTest`、`lintDebug` 和 `assembleDebug`。
 - 无真机或无真实新 Release 时，明确保留浏览器跳转和真实网络链路的手动验证缺口。

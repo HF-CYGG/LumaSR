@@ -21,8 +21,8 @@ android {
         applicationId = "com.lumasr"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.2"
+        versionCode = 4
+        versionName = "0.3.3"
         buildConfigField("boolean", "LUMASR_QNN_ENABLED", qnnEnabled.get().toString())
 
         externalNativeBuild {

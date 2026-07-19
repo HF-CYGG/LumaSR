@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'release'
 
 permissions:
   contents: read
@@ -16,8 +17,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate immutable release metadata
+      - name: Validate release metadata
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: .\scripts\validate-release-metadata.ps1 -TagName $env:RELEASE_TAG
+        run: |
+          if ($env:RELEASE_TAG -ceq 'release') {
+            .\scripts\validate-rolling-release-metadata.ps1 -TagName $env:RELEASE_TAG
+          } else {
+            .\scripts\validate-release-metadata.ps1 -TagName $env:RELEASE_TAG
+          }
