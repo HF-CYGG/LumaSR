@@ -68,6 +68,31 @@ class CalibrationProgressUiStateTest {
     }
 
     @Test
+    fun fallbackAndDeferredReportsRemainSuccessfulDistinctTerminalStates() {
+        fun state(outcome: CalibrationReportOutcome) = CalibrationReport(
+            id = "report-${outcome.name.lowercase()}",
+            mode = CalibrationMode.QUICK,
+            outcome = outcome,
+            startedAtEpochMs = 1_000L,
+            finishedAtEpochMs = 2_000L,
+            elapsedMs = 1_000L,
+            acceleratorCalibrationKey = null,
+            modelId = "model-a",
+            summary = outcome.name,
+            events = emptyList()
+        ).toDialogState()
+
+        val fallback = state(CalibrationReportOutcome.COMPLETED_WITH_FALLBACK)
+        val deferred = state(CalibrationReportOutcome.DEFERRED)
+
+        assertEquals(CalibrationDialogStatus.COMPLETED_WITH_FALLBACK, fallback.status)
+        assertEquals(1f, fallback.progressFraction, 0f)
+        assertEquals(CalibrationDialogStatus.DEFERRED, deferred.status)
+        assertTrue(fallback.canDismiss)
+        assertTrue(deferred.canDismiss)
+    }
+
+    @Test
     fun estimatesRemainingTimeFromCompletedRealWorkAndClampsToRunBudget() {
         val started = CalibrationProgressUiReducer.start(startedAtElapsedMs = 1_000L)
 

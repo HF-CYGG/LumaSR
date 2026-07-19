@@ -216,7 +216,15 @@ data class InferenceBenchmarkResult(
     val cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
     val ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
     val qnnProfiles: List<CalibratedQnnProfile> = emptyList(),
-    val calibrationMode: CalibrationMode = CalibrationMode.LEGACY
+    val calibrationMode: CalibrationMode = CalibrationMode.LEGACY,
+    val tierOutcomes: List<CalibrationTierOutcome> = emptyList(),
+    val overallGrade: CalibrationPerformanceGrade =
+        tierOutcomes.firstOrNull { it.resolutionTier == ResolutionTier.STANDARD }?.grade
+            ?: if (vulkanProfiles.any { it.resolutionTier == ResolutionTier.STANDARD }) {
+                CalibrationPerformanceGrade.HIGH_PERFORMANCE
+            } else {
+                CalibrationPerformanceGrade.COMPATIBLE
+            }
 ) {
     init {
         require(measuredAtEpochMs >= 0L) { "Benchmark measurement time must be non-negative" }
@@ -246,6 +254,14 @@ data class InferenceBenchmarkResult(
         ) { "Calibrated TTA keys must be unique" }
         require(qnnProfiles.map(CalibratedQnnProfile::resolutionTier).distinct().size == qnnProfiles.size) {
             "Calibrated QNN resolution tiers must be unique"
+        }
+        require(tierOutcomes.map(CalibrationTierOutcome::resolutionTier).distinct().size == tierOutcomes.size) {
+            "Calibration tier outcomes must be unique"
+        }
+        tierOutcomes.firstOrNull { it.resolutionTier == ResolutionTier.STANDARD }?.let { standard ->
+            require(overallGrade == standard.grade) {
+                "Overall calibration grade must match the standard resolution tier"
+            }
         }
     }
 

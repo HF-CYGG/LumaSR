@@ -33,14 +33,22 @@ object PersistentProcessingUiMapper {
         if (batchRecords.isEmpty()) {
             return mapped.withNewMessage(processing.notice?.message)
         }
+        val previousBatchImages = previous.selectedImages.ifEmpty {
+            previous.selectedImage?.let(::listOf).orEmpty()
+        }
         val batchImages = batchRecords.map { record ->
+            val retained = previousBatchImages.getOrNull(record.task.imageIndex)
+                ?.takeIf { it.displayName == record.task.sourceDisplayName }
+                ?: previousBatchImages.singleOrNull {
+                    it.displayName == record.task.sourceDisplayName
+                }
             SelectedImageInfo(
                 sourceUri = record.task.copiedInputPath,
                 displayName = record.task.sourceDisplayName,
-                sizeBytes = null,
-                width = null,
-                height = null,
-                mimeType = null
+                sizeBytes = retained?.sizeBytes,
+                width = retained?.width,
+                height = retained?.height,
+                mimeType = retained?.mimeType
             )
         }
         val terminalStop = batchRecords.firstOrNull {

@@ -17,6 +17,41 @@ import org.junit.Test
 
 class PersistentProcessingUiMapperTest {
     @Test
+    fun trackedBatchRetainsSelectedImageDimensionsAcrossPersistentUpdates() {
+        val previousImage = SelectedImageInfo(
+            sourceUri = "content://selected",
+            displayName = "first.png",
+            sizeBytes = 4_096L,
+            width = 3_000,
+            height = 2_000,
+            mimeType = "image/png"
+        )
+        val mapped = PersistentProcessingUiMapper.apply(
+            LumaUiState(
+                selectedImage = previousImage,
+                selectedImages = listOf(previousImage)
+            ),
+            PersistentProcessingState(
+                records = listOf(
+                    record(
+                        id = "first",
+                        imageIndex = 0,
+                        state = ProcessingTaskState.COMPLETED,
+                        imageCount = 1
+                    )
+                ),
+                trackedBatchId = BATCH_ID
+            )
+        )
+
+        assertEquals(3_000, mapped.selectedImage?.width)
+        assertEquals(2_000, mapped.selectedImage?.height)
+        assertEquals(4_096L, mapped.selectedImage?.sizeBytes)
+        assertEquals("image/png", mapped.selectedImage?.mimeType)
+        assertTrue(mapped.selectedImage?.sourceUri.orEmpty().endsWith("input.png"))
+    }
+
+    @Test
     fun completedTwoImageBatchProducesTwoOrderedResults() {
         val state = PersistentProcessingState(
             records = listOf(

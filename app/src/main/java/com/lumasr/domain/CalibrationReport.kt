@@ -2,6 +2,8 @@ package com.lumasr.domain
 
 enum class CalibrationReportOutcome {
     SUCCEEDED,
+    COMPLETED_WITH_FALLBACK,
+    DEFERRED,
     FAILED,
     TIMED_OUT,
     UNSUPPORTED
@@ -36,7 +38,9 @@ data class CalibrationReport(
     val acceleratorCalibrationKey: String?,
     val modelId: String,
     val summary: String,
-    val events: List<CalibrationReportEvent>
+    val events: List<CalibrationReportEvent>,
+    val overallGrade: CalibrationPerformanceGrade? = null,
+    val tierOutcomes: List<CalibrationTierOutcome> = emptyList()
 ) {
     init {
         require(REPORT_ID.matches(id)) { "Calibration report id is invalid" }
@@ -55,6 +59,16 @@ data class CalibrationReport(
             }
             require(key.none(Char::isISOControl)) {
                 "Calibration report accelerator key contains control characters"
+            }
+        }
+        require(tierOutcomes.map(CalibrationTierOutcome::resolutionTier).distinct().size ==
+            tierOutcomes.size
+        ) { "Calibration report resolution tiers must be unique" }
+        overallGrade?.let { grade ->
+            tierOutcomes.firstOrNull { it.resolutionTier == ResolutionTier.STANDARD }?.let {
+                require(it.grade == grade) {
+                    "Calibration report overall grade must match STANDARD"
+                }
             }
         }
     }

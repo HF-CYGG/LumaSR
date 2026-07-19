@@ -171,12 +171,15 @@ class LumaUiStateSelectionTest {
             status = CalibrationDialogStatus.SUCCEEDED,
             elapsedMs = 12_000L,
             summary = "✓ 校准完成"
-        ).copy(calibrationStatus = CalibrationUiStatus.READY)
+        ).copy(calibrationStatus = CalibrationUiStatus.READY_HIGH_PERFORMANCE)
 
         assertEquals(1, updated.calibrationDialog?.stepIndex)
         assertEquals(listOf("> FP32 质量基准"), updated.calibrationDialog?.logLines?.map { it.text })
         assertTrue(finished.calibrationDialog?.canDismiss == true)
-        assertEquals(CalibrationUiStatus.READY, finished.dismissCalibrationDialog().calibrationStatus)
+        assertEquals(
+            CalibrationUiStatus.READY_HIGH_PERFORMANCE,
+            finished.dismissCalibrationDialog().calibrationStatus
+        )
         assertEquals(null, finished.dismissCalibrationDialog().calibrationDialog)
         assertTrue(updated.dismissCalibrationDialog().calibrationDialog?.isRunning == true)
     }

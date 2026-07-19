@@ -75,7 +75,8 @@ data class CalibratedCpuProfile(
 enum class VulkanCalibrationDecision {
     ENABLED,
     QUALITY_REJECTED,
-    PERFORMANCE_REJECTED
+    PERFORMANCE_REJECTED,
+    BACKEND_UNAVAILABLE
 }
 
 data class CalibratedVulkanTier(
@@ -109,6 +110,12 @@ data class CalibratedVulkanTier(
                 require(profile == null) { "Performance-rejected Vulkan tier cannot contain a profile" }
                 require(baselineDurationNanos != null) {
                     "Performance-rejected Vulkan tier requires measured durations"
+                }
+            }
+            VulkanCalibrationDecision.BACKEND_UNAVAILABLE -> {
+                require(profile == null) { "Unavailable Vulkan tier cannot contain a profile" }
+                require(baselineDurationNanos == null) {
+                    "Unavailable Vulkan tier cannot contain Vulkan performance evidence"
                 }
             }
         }

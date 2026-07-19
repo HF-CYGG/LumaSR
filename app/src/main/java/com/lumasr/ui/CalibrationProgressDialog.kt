@@ -31,7 +31,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.lumasr.domain.CalibrationPerformanceGrade
+import com.lumasr.domain.CalibrationTierOutcome
+import com.lumasr.domain.ResolutionTier
 import kotlinx.coroutines.flow.collectLatest
+import java.util.Locale
 
 @Composable
 fun CalibrationProgressDialog(
@@ -113,6 +117,26 @@ fun CalibrationProgressDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                if (state.tierOutcomes.isNotEmpty()) {
+                    Text(
+                        text = "分辨率档位" + state.overallGrade?.let {
+                            " · 总体${calibrationGradeLabel(it)}"
+                        }.orEmpty(),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        state.tierOutcomes.sortedBy { it.resolutionTier.ordinal }.forEach { outcome ->
+                            CalibrationTierSummary(
+                                outcome = outcome,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 Text(
                     text = "真实校准日志",
@@ -163,6 +187,58 @@ fun CalibrationProgressDialog(
 }
 
 @Composable
+private fun CalibrationTierSummary(
+    outcome: CalibrationTierOutcome,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = outcome.resolutionTier.calibrationTierLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = calibrationGradeLabel(outcome.grade),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                text = outcome.speedupPercent?.let {
+                    String.format(Locale.US, "%+.1f%%", it)
+                } ?: outcome.fallbackReason?.name.orEmpty(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+private fun calibrationGradeLabel(grade: CalibrationPerformanceGrade): String = when (grade) {
+    CalibrationPerformanceGrade.ELITE -> "极致"
+    CalibrationPerformanceGrade.HIGH_PERFORMANCE -> "高性能"
+    CalibrationPerformanceGrade.STABLE -> "稳定"
+    CalibrationPerformanceGrade.COMPATIBLE -> "兼容"
+}
+
+private val ResolutionTier.calibrationTierLabel: String
+    get() = when (this) {
+        ResolutionTier.SMALL -> "SMALL"
+        ResolutionTier.STANDARD -> "STANDARD"
+        ResolutionTier.LARGE -> "LARGE"
+    }
+
+@Composable
 private fun ConsoleLine(text: String) {
     Text(
         text = text,
@@ -200,6 +276,8 @@ private fun calibrationStepText(state: CalibrationProgressDialogState): String {
 private fun calibrationDialogTitle(status: CalibrationDialogStatus): String = when (status) {
     CalibrationDialogStatus.RUNNING -> "正在进行性能校准"
     CalibrationDialogStatus.SUCCEEDED -> "性能校准完成"
+    CalibrationDialogStatus.COMPLETED_WITH_FALLBACK -> "性能校准已带回退完成"
+    CalibrationDialogStatus.DEFERRED -> "性能校准暂缓"
     CalibrationDialogStatus.FAILED -> "性能校准未通过"
     CalibrationDialogStatus.TIMED_OUT -> "性能校准已超时"
     CalibrationDialogStatus.UNSUPPORTED -> "当前设备不支持校准"

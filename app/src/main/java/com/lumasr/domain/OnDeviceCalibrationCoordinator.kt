@@ -35,6 +35,8 @@ interface DeviceCalibrationCoordinator {
     suspend fun hasValidCalibration(model: ModelPack): Boolean
 
     suspend fun hasEnabledCalibration(model: ModelPack): Boolean = hasValidCalibration(model)
+
+    suspend fun calibrationGrade(model: ModelPack): CalibrationPerformanceGrade? = null
 }
 
 class OnDeviceCalibrationCoordinator(
@@ -123,13 +125,10 @@ class OnDeviceCalibrationCoordinator(
         val now = clock()
         if (now < 0L) return false
         val result = repository.findValid(identity(model), now) ?: return false
-        val expectedTiers = when (result.calibrationMode) {
-            CalibrationMode.QUICK -> setOf(ResolutionTier.STANDARD)
-            CalibrationMode.LEGACY,
-            CalibrationMode.DEEP -> ResolutionTier.entries.toSet()
-        }
+        val measuredTiers = result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier)
         return result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES &&
-            result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier).toSet() == expectedTiers
+            measuredTiers.distinct().size == measuredTiers.size &&
+            ResolutionTier.STANDARD in measuredTiers
     }
 
     override suspend fun hasEnabledCalibration(model: ModelPack): Boolean {
@@ -137,6 +136,13 @@ class OnDeviceCalibrationCoordinator(
         val now = clock()
         if (now < 0L) return false
         return repository.findValid(identity(model), now)?.hasEnabledOptimizations == true
+    }
+
+    override suspend fun calibrationGrade(model: ModelPack): CalibrationPerformanceGrade? {
+        if (!hasValidCalibration(model)) return null
+        val now = clock()
+        if (now < 0L) return null
+        return repository.findValid(identity(model), now)?.overallGrade
     }
 
     private fun identity(model: ModelPack): BenchmarkIdentity = BenchmarkIdentityFactory.create(

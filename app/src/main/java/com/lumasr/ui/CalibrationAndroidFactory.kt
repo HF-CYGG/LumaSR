@@ -69,6 +69,7 @@ internal fun createDeviceCalibrationCoordinator(context: Context): DeviceCalibra
     val probe = NativeBitmapCalibrationProbe(
         processor = nativeProcessor,
         cancelNative = nativeProcessor::cancel,
+        releaseNativeResources = nativeProcessor::clearNativeCache,
         directory = directory
     )
     val runner = InferenceCalibrationRunner(

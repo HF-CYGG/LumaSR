@@ -243,6 +243,23 @@ class NativeBitmapCalibrationProbeTest {
     }
 
     @Test
+    fun releasesNativeCandidateResourcesOnRequest() {
+        var releases = 0
+        val probe = NativeBitmapCalibrationProbe(
+            processor = RecordingRegionProcessor(::successful),
+            cancelNative = {},
+            releaseNativeResources = { releases += 1 },
+            directory = temporaryFolder.newFolder("release"),
+            bitmapFactory = { null },
+            outputDecoder = { null }
+        )
+
+        probe.releaseCandidateResources()
+
+        assertEquals(1, releases)
+    }
+
+    @Test
     fun coroutineCancellationStillDeletesTemporaryOutput() = runBlocking {
         val root = temporaryFolder.newFolder("coroutine-cancel")
         val started = CompletableDeferred<Unit>()

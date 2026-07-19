@@ -7,7 +7,11 @@ import com.lumasr.domain.CalibratedQnnProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
+import com.lumasr.domain.CalibrationFallbackReason
+import com.lumasr.domain.CalibrationMeasuredBackend
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationPerformanceGrade
+import com.lumasr.domain.CalibrationTierOutcome
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkRepository
 import com.lumasr.domain.InferenceBenchmarkResult
@@ -331,8 +335,8 @@ private fun systemMoveReplacing(source: File, destination: File) {
 }
 
 private object BenchmarkResultJson {
-    private const val SCHEMA_VERSION = 7
-    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4, 5, 6)
+    private const val SCHEMA_VERSION = 8
+    private val LEGACY_SCHEMA_VERSIONS = setOf(3, 4, 5, 6, 7)
     private const val POSITIVE_INFINITY = "+Infinity"
     private val json = Json
 
@@ -389,6 +393,10 @@ private object BenchmarkResultJson {
         put("qnnProfiles", buildJsonArray {
             result.qnnProfiles.forEach { add(encodeQnnProfile(it)) }
         })
+        put("overallGrade", result.overallGrade.name)
+        put("tierOutcomes", buildJsonArray {
+            result.tierOutcomes.forEach { add(encodeTierOutcome(it)) }
+        })
         put("measuredAtEpochMs", result.measuredAtEpochMs)
         put("validUntilEpochMs", result.validUntilEpochMs)
     }
@@ -420,6 +428,16 @@ private object BenchmarkResultJson {
         put("baselineDurationNanos", tier.baselineDurationNanos)
         put("bestCandidateDurationNanos", tier.bestCandidateDurationNanos)
         put("profile", tier.profile?.let(::encodeVulkanProfile) ?: JsonNull)
+    }
+
+    private fun encodeTierOutcome(outcome: CalibrationTierOutcome): JsonObject = buildJsonObject {
+        put("resolutionTier", outcome.resolutionTier.name)
+        put("grade", outcome.grade.name)
+        put("backend", outcome.backend.name)
+        put("baselineDurationNanos", outcome.baselineDurationNanos)
+        put("selectedDurationNanos", outcome.selectedDurationNanos?.let(::JsonPrimitive) ?: JsonNull)
+        put("speedupPercent", outcome.speedupPercent?.let(::JsonPrimitive) ?: JsonNull)
+        put("fallbackReason", outcome.fallbackReason?.name?.let(::JsonPrimitive) ?: JsonNull)
     }
 
     private fun encodeTtaProfile(profile: CalibratedTtaProfile): JsonObject = buildJsonObject {
@@ -526,6 +544,18 @@ private object BenchmarkResultJson {
                 CalibrationMode.valueOf(record.requiredString("calibrationMode"))
             } else {
                 CalibrationMode.LEGACY
+            },
+            tierOutcomes = if (schemaVersion >= 8) {
+                record.requiredArray("tierOutcomes").map { decodeTierOutcome(it.jsonObject) }
+            } else {
+                emptyList()
+            },
+            overallGrade = if (schemaVersion >= 8) {
+                CalibrationPerformanceGrade.valueOf(record.requiredString("overallGrade"))
+            } else if (record.requiredArray("vulkanProfiles").isNotEmpty()) {
+                CalibrationPerformanceGrade.HIGH_PERFORMANCE
+            } else {
+                CalibrationPerformanceGrade.COMPATIBLE
             }
         )
     }
@@ -565,6 +595,19 @@ private object BenchmarkResultJson {
             profile = profile?.let(::decodeVulkanProfile)
         )
     }
+
+    private fun decodeTierOutcome(record: JsonObject): CalibrationTierOutcome =
+        CalibrationTierOutcome(
+            resolutionTier = ResolutionTier.valueOf(record.requiredString("resolutionTier")),
+            grade = CalibrationPerformanceGrade.valueOf(record.requiredString("grade")),
+            backend = CalibrationMeasuredBackend.valueOf(record.requiredString("backend")),
+            baselineDurationNanos = record.requiredLong("baselineDurationNanos"),
+            selectedDurationNanos = record.optionalLong("selectedDurationNanos"),
+            speedupPercent = record.optionalDouble("speedupPercent"),
+            fallbackReason = record.optionalString("fallbackReason")?.let(
+                CalibrationFallbackReason::valueOf
+            )
+        )
 
     private fun decodeTtaProfile(record: JsonObject): CalibratedTtaProfile {
         val quality = record.getValue("quality").jsonObject
@@ -656,6 +699,15 @@ private object BenchmarkResultJson {
         return value.jsonPrimitive
             .also { check(!it.isString) { "$key must be a JSON number or null" } }
             .long
+    }
+
+    private fun JsonObject.optionalDouble(key: String): Double? {
+        val value = get(key) ?: return null
+        if (value is JsonNull) return null
+        return value.jsonPrimitive
+            .also { check(!it.isString) { "$key must be a JSON number or null" } }
+            .double
+            .also { check(it.isFinite()) { "$key must be finite" } }
     }
 
     private fun JsonObject.optionalInt(key: String): Int? {

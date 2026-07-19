@@ -7,7 +7,11 @@ import com.lumasr.domain.CalibratedQnnProfile
 import com.lumasr.domain.CalibratedTtaProfile
 import com.lumasr.domain.CalibratedVulkanProfile
 import com.lumasr.domain.CalibratedVulkanTier
+import com.lumasr.domain.CalibrationFallbackReason
+import com.lumasr.domain.CalibrationMeasuredBackend
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationPerformanceGrade
+import com.lumasr.domain.CalibrationTierOutcome
 import com.lumasr.domain.Fp16QualityMetrics
 import com.lumasr.domain.InferenceBenchmarkResult
 import com.lumasr.domain.QnnPerformanceMode
@@ -41,11 +45,23 @@ class FileInferenceBenchmarkRepositoryTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun roundTripsSchemaV7QnnProfilesWithoutRawDeviceData() = runBlocking {
+    fun roundTripsSchemaV8GradesTierOutcomesAndQnnProfilesWithoutRawDeviceData() = runBlocking {
         val root = temporaryFolder.newFolder("schema-v7-qnn")
         val repository = FileInferenceBenchmarkRepository(root)
         val expected = result(
             identity = identity(),
+            overallGrade = CalibrationPerformanceGrade.STABLE,
+            tierOutcomes = listOf(
+                CalibrationTierOutcome(
+                    resolutionTier = ResolutionTier.STANDARD,
+                    grade = CalibrationPerformanceGrade.STABLE,
+                    backend = CalibrationMeasuredBackend.VULKAN,
+                    baselineDurationNanos = 2_000L,
+                    selectedDurationNanos = 1_950L,
+                    speedupPercent = 2.5,
+                    fallbackReason = CalibrationFallbackReason.PERFORMANCE_GATE
+                )
+            ),
             qnnProfiles = listOf(
                 CalibratedQnnProfile(
                     resolutionTier = ResolutionTier.LARGE,
@@ -69,7 +85,9 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":7"))
+        assertTrue(json.contains("\"schemaVersion\":8"))
+        assertTrue(json.contains("\"overallGrade\":\"STABLE\""))
+        assertTrue(json.contains("\"fallbackReason\":\"PERFORMANCE_GATE\""))
         assertTrue(json.contains("\"graphKey\":\"realcugan-x4-fp16-v73\""))
         assertFalse(json.contains("SM8650"))
         assertFalse(json.contains("/storage/"))
@@ -83,7 +101,9 @@ class FileInferenceBenchmarkRepositoryTest {
         val record = File(root, "inference-benchmarks.json")
         record.writeText(
             record.readText()
-                .replace("\"schemaVersion\":7", "\"schemaVersion\":6")
+                .replace("\"schemaVersion\":8", "\"schemaVersion\":6")
+                .replace(",\"overallGrade\":\"COMPATIBLE\"", "")
+                .replace(",\"tierOutcomes\":[]", "")
                 .replace(",\"qnnProfiles\":[]", "")
         )
 
@@ -91,6 +111,41 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(1, restored.size)
         assertTrue(restored.single().qnnProfiles.isEmpty())
+    }
+
+    @Test
+    fun schemaV7InfersHighPerformanceForOptimizedAndCompatibleForSafeRecords() = runBlocking {
+        suspend fun restoredGrade(
+            folder: String,
+            profiles: List<CalibratedVulkanProfile>
+        ): CalibrationPerformanceGrade {
+            val root = temporaryFolder.newFolder(folder)
+            val repository = FileInferenceBenchmarkRepository(root)
+            repository.save(result(identity = identity(), vulkanProfiles = profiles))
+            val record = File(root, "inference-benchmarks.json")
+            record.writeText(
+                record.readText()
+                    .replace("\"schemaVersion\":8", "\"schemaVersion\":7")
+                    .replace(Regex(",\"overallGrade\":\"[A-Z_]+\""), "")
+                    .replace(",\"tierOutcomes\":[]", "")
+            )
+            return repository.list().single().overallGrade
+        }
+
+        val optimized = CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.STANDARD,
+            tileSize = 256,
+            commandBatchSize = 2
+        )
+
+        assertEquals(
+            CalibrationPerformanceGrade.HIGH_PERFORMANCE,
+            restoredGrade("legacy-v7-optimized", listOf(optimized))
+        )
+        assertEquals(
+            CalibrationPerformanceGrade.COMPATIBLE,
+            restoredGrade("legacy-v7-safe", emptyList())
+        )
     }
 
     @Test
@@ -120,7 +175,7 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":7"))
+        assertTrue(json.contains("\"schemaVersion\":8"))
         assertTrue(json.contains("\"calibrationMode\":\"QUICK\""))
         assertTrue(json.contains("\"useSubgroupOps\":false"))
     }
@@ -176,7 +231,7 @@ class FileInferenceBenchmarkRepositoryTest {
 
         assertEquals(listOf(expected), repository.list())
         val json = File(root, "inference-benchmarks.json").readText()
-        assertTrue(json.contains("\"schemaVersion\":7"))
+        assertTrue(json.contains("\"schemaVersion\":8"))
         assertTrue(json.contains("\"decision\":\"PERFORMANCE_REJECTED\""))
         assertTrue(json.contains("\"maxPipelineDepth\":2"))
     }
@@ -285,7 +340,7 @@ class FileInferenceBenchmarkRepositoryTest {
         repository.save(expected)
 
         assertEquals(listOf(expected), repository.list())
-        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":7"))
+        assertTrue(File(root, "inference-benchmarks.json").readText().contains("\"schemaVersion\":8"))
     }
 
     @Test
@@ -317,7 +372,7 @@ class FileInferenceBenchmarkRepositoryTest {
         assertEquals(listOf(resolutionAwareResult("valid-profile")), records)
         assertTrue(records.single().ttaProfiles.isEmpty())
         assertTrue(record.exists())
-        assertTrue(record.readText().contains("\"schemaVersion\":7"))
+        assertTrue(record.readText().contains("\"schemaVersion\":8"))
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
@@ -745,7 +800,15 @@ class FileInferenceBenchmarkRepositoryTest {
         cpuProfiles: List<CalibratedCpuProfile> = emptyList(),
         ttaProfiles: List<CalibratedTtaProfile> = emptyList(),
         qnnProfiles: List<CalibratedQnnProfile> = emptyList(),
-        calibrationMode: CalibrationMode = CalibrationMode.LEGACY
+        calibrationMode: CalibrationMode = CalibrationMode.LEGACY,
+        tierOutcomes: List<CalibrationTierOutcome> = emptyList(),
+        overallGrade: CalibrationPerformanceGrade =
+            tierOutcomes.firstOrNull { it.resolutionTier == ResolutionTier.STANDARD }?.grade
+                ?: if (vulkanProfiles.any { it.resolutionTier == ResolutionTier.STANDARD }) {
+                    CalibrationPerformanceGrade.HIGH_PERFORMANCE
+                } else {
+                    CalibrationPerformanceGrade.COMPATIBLE
+                }
     ) = InferenceBenchmarkResult(
         identity = identity,
         fp16Quality = quality,
@@ -756,6 +819,8 @@ class FileInferenceBenchmarkRepositoryTest {
         ttaProfiles = ttaProfiles,
         qnnProfiles = qnnProfiles,
         calibrationMode = calibrationMode,
+        tierOutcomes = tierOutcomes,
+        overallGrade = overallGrade,
         measuredAtEpochMs = measuredAt,
         validUntilEpochMs = validUntil
     )

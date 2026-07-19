@@ -1,7 +1,9 @@
 package com.lumasr.domain
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalibrationResourceWatchdogTest {
@@ -41,6 +43,25 @@ class CalibrationResourceWatchdogTest {
                 watchdog.violation(snapshot(), it)
             )
         }
+    }
+
+    @Test
+    fun requiresCandidateMemoryToReturnWithinSeventyFivePercentAndReserveOneSlot() {
+        val baseline = snapshot(pssBytes = 100L, nativeHeapBytes = 200L)
+        val watchdog = CalibrationResourceWatchdog(baseline)
+        val threshold = CalibrationResourceWatchdog.CANDIDATE_START_DELTA_BYTES
+
+        assertTrue(watchdog.isCandidateMemoryQuiescent(snapshot(100L + threshold, 200L)))
+        assertFalse(watchdog.isCandidateMemoryQuiescent(snapshot(101L + threshold, 200L)))
+        assertFalse(watchdog.isCandidateMemoryQuiescent(snapshot(100L, 201L + threshold)))
+        assertFalse(watchdog.isCandidateMemoryQuiescent(snapshot(isLowMemory = true)))
+        assertTrue(
+            threshold <= CalibrationResourceWatchdog.CANDIDATE_QUIESCENCE_DELTA_BYTES
+        )
+        assertEquals(
+            CalibrationResourceWatchdog.MAX_SESSION_MEMORY_DELTA_BYTES,
+            threshold + CalibrationResourceWatchdog.MAX_SINGLE_SLOT_BYTES
+        )
     }
 
     private fun snapshot(

@@ -2,6 +2,7 @@ package com.lumasr.domain
 
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -72,6 +73,62 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
+    fun releasesCandidateResourcesBetweenPrecisionTuningAndTierChanges() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val releases = AtomicInteger(0)
+        val progressEvents = mutableListOf<CalibrationProgressEvent>()
+        val nativeTaskIds = mutableListOf<String>()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput {
+                    nativeTaskIds += params.taskId
+                    return CalibrationProbeOutput(
+                        RgbImage(input.width, input.height, input.copyBytes()),
+                        successfulDuration(params)
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+
+                override fun releaseCandidateResources() {
+                    releases.incrementAndGet()
+                }
+            },
+            repository = repository,
+            resourceSnapshotProvider = {
+                CalibrationResourceSnapshot(
+                    pssBytes = 100L,
+                    nativeHeapBytes = 50L,
+                    isLowMemory = false
+                )
+            },
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            ),
+            cpuCalibrationCandidates = CpuCalibrationCandidates.baselineOnly()
+        )
+
+        val result = runner.run(
+            request(outputScale = 1, mode = CalibrationMode.QUICK, device = adrenoDevice()),
+            CalibrationProgressReporter { progressEvents += it }
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(releases.get() >= 3)
+        assertTrue(nativeTaskIds.distinct().size >= 3)
+        assertTrue(nativeTaskIds.all { "-candidate-" in it })
+        assertTrue(progressEvents.any {
+            it.logMessage.contains("peakPssDelta=0B") &&
+                it.logMessage.contains("cacheReleases=") &&
+                it.logMessage.contains("quiescent=")
+        })
+    }
+
+    @Test
     fun deepCalibrationSearchesAllTiersCpuAndConvolutionTuning() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val requests = mutableListOf<UpscaleParams>()
@@ -96,14 +153,20 @@ class InferenceCalibrationRunnerTest {
         assertTrue(result is CalibrationRunResult.Completed)
         val saved = repository.saved.single()
         assertEquals(CalibrationMode.DEEP, saved.calibrationMode)
-        assertEquals(ResolutionTier.entries, saved.vulkanTiers.map { it.resolutionTier })
-        assertEquals(ResolutionTier.entries, saved.cpuProfiles.map { it.resolutionTier })
+        assertEquals(
+            listOf(ResolutionTier.STANDARD, ResolutionTier.SMALL, ResolutionTier.LARGE),
+            saved.vulkanTiers.map { it.resolutionTier }
+        )
+        assertEquals(
+            listOf(ResolutionTier.STANDARD, ResolutionTier.SMALL, ResolutionTier.LARGE),
+            saved.cpuProfiles.map { it.resolutionTier }
+        )
         assertTrue(requests.any { !it.vulkanTuning.useWinogradConvolution })
         assertTrue(requests.any { !it.vulkanTuning.useSgemmConvolution })
     }
 
     @Test
-    fun quickCalibrationRequiresTenPercentFinalSpeedup() = runBlocking {
+    fun quickCalibrationPublishesHighPerformanceAtFivePercentSpeedup() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val runner = testRunner(
             probe = object : InferenceCalibrationProbe {
@@ -138,10 +201,11 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(result is CalibrationRunResult.Completed)
         val saved = repository.saved.single()
-        assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(1, saved.vulkanProfiles.size)
+        assertEquals(CalibrationPerformanceGrade.HIGH_PERFORMANCE, saved.overallGrade)
         assertEquals(
-            VulkanCalibrationDecision.PERFORMANCE_REJECTED,
-            saved.vulkanTiers.single().decision
+            CalibrationPerformanceGrade.HIGH_PERFORMANCE,
+            saved.tierOutcomes.single().grade
         )
     }
 
@@ -224,18 +288,19 @@ class InferenceCalibrationRunnerTest {
         )
 
         assertTrue(result is CalibrationRunResult.Completed)
-        assertEquals(setOf(3), requestedCacheCapacities.toSet())
-        assertEquals(27, measured.size)
+        assertEquals(setOf(1), requestedCacheCapacities.toSet())
+        assertEquals(30, measured.size)
         outputEdges.values.forEach { outputEdge ->
             val tierRequests = measured.filter { it.inputWidth * it.params.scale == outputEdge }
-            assertEquals(9, tierRequests.size)
-            assertEquals(6, tierRequests.count { it.params.nativeBackend == NativeBackend.OPTIMIZED })
+            assertEquals(10, tierRequests.size)
+            assertEquals(7, tierRequests.count { it.params.nativeBackend == NativeBackend.OPTIMIZED })
             assertEquals(1, tierRequests.count { it.params.accelerationMode == AccelerationMode.CPU })
             assertEquals(
                 listOf(64, 128, 256),
                 tierRequests
                     .filter { it.params.nativeBackend == NativeBackend.OPTIMIZED }
                     .filter { it.params.commandBatchSize == 1 }
+                    .take(3)
                     .map { it.params.tileSize }
             )
             assertEquals(
@@ -255,10 +320,10 @@ class InferenceCalibrationRunnerTest {
             it.type == CalibrationProgressEventType.STEP_COMPLETED ||
                 it.type == CalibrationProgressEventType.STEP_SKIPPED
         }
-        assertEquals(29, startedSteps.size)
-        assertEquals(35, settledSteps.size)
-        assertTrue(progressEvents.all { it.totalSteps == 35 })
-        assertEquals(35, progressEvents.last().stepIndex)
+        assertEquals(32, startedSteps.size)
+        assertEquals(38, settledSteps.size)
+        assertTrue(progressEvents.all { it.totalSteps == 38 })
+        assertEquals(38, progressEvents.last().stepIndex)
         assertEquals(
             progressEvents.last().totalWorkUnits,
             progressEvents.last().completedWorkUnits
@@ -345,6 +410,171 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
+    fun optionalCandidateResourceViolationPublishesValidatedStableBaseline() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val cancelled = mutableListOf<String>()
+        val optionalStarted = AtomicBoolean(false)
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    successfulDuration(params)
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement {
+                    if (params.nativeBackend == NativeBackend.OPTIMIZED) {
+                        optionalStarted.set(true)
+                        delay(5_000L)
+                        error("resource watchdog must cancel the optional candidate")
+                    }
+                    return CalibrationProbeMeasurement(
+                        input.width * params.scale,
+                        input.height * params.scale,
+                        1_000L
+                    )
+                }
+
+                override fun cancel(taskId: String) {
+                    cancelled += taskId
+                }
+            },
+            repository = repository,
+            resourceSnapshotProvider = {
+                val delta = if (optionalStarted.get()) {
+                    129L * 1_024L * 1_024L
+                } else {
+                    0L
+                }
+                CalibrationResourceSnapshot(
+                    pssBytes = 100L + delta,
+                    nativeHeapBytes = 200L,
+                    isLowMemory = false
+                )
+            },
+            resourceSampleIntervalMs = 10L,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            )
+        )
+
+        val result = runner.run(
+            request(outputScale = 1, mode = CalibrationMode.QUICK, device = adrenoDevice())
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(1, cancelled.size)
+        val saved = repository.saved.single()
+        assertEquals(CalibrationPerformanceGrade.STABLE, saved.overallGrade)
+        assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(
+            CalibrationFallbackReason.RESOURCE_LIMIT,
+            saved.tierOutcomes.single().fallbackReason
+        )
+    }
+
+    @Test
+    fun candidateSwitchFallsBackWhenReleasedMemoryDoesNotBecomeQuiescent() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val releases = AtomicInteger(0)
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    successfulDuration(params)
+                )
+
+                override fun cancel(taskId: String) = Unit
+
+                override fun releaseCandidateResources() {
+                    releases.incrementAndGet()
+                }
+            },
+            repository = repository,
+            resourceSnapshotProvider = {
+                val delta = if (releases.get() >= 3) {
+                    CalibrationResourceWatchdog.CANDIDATE_QUIESCENCE_DELTA_BYTES + 1L
+                } else {
+                    0L
+                }
+                CalibrationResourceSnapshot(delta, delta, isLowMemory = false)
+            },
+            candidateQuiescenceTimeoutMs = 20L,
+            candidateQuiescencePollMs = 1L,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            )
+        )
+
+        val result = runner.run(
+            request(outputScale = 1, mode = CalibrationMode.QUICK, device = adrenoDevice())
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(CalibrationPerformanceGrade.STABLE, repository.saved.single().overallGrade)
+        assertEquals(
+            CalibrationFallbackReason.RESOURCE_LIMIT,
+            repository.saved.single().tierOutcomes.single().fallbackReason
+        )
+    }
+
+    @Test
+    fun failedVulkanBaselineFallsBackToMeasuredCpuCompatibleGrade() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val runner = testRunner(
+            probe = object : InferenceCalibrationProbe {
+                override suspend fun run(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeOutput = CalibrationProbeOutput(
+                    RgbImage(input.width, input.height, input.copyBytes()),
+                    if (params.nativeBackend == NativeBackend.LEGACY_SAFE) 1_000L else 800L
+                )
+
+                override suspend fun measure(
+                    input: RgbImage,
+                    params: UpscaleParams
+                ): CalibrationProbeMeasurement? {
+                    if (params.accelerationMode != AccelerationMode.CPU) return null
+                    return CalibrationProbeMeasurement(
+                        input.width * params.scale,
+                        input.height * params.scale,
+                        1_500L
+                    )
+                }
+
+                override fun cancel(taskId: String) = Unit
+            },
+            repository = repository,
+            vulkanCalibrationCandidates = VulkanCalibrationCandidates(
+                tileSizes = listOf(128),
+                commandBatchSizes = emptyList()
+            )
+        )
+
+        val result = runner.run(
+            request(outputScale = 1, mode = CalibrationMode.QUICK, device = adrenoDevice())
+        )
+
+        assertTrue(result is CalibrationRunResult.Completed)
+        val saved = repository.saved.single()
+        assertEquals(CalibrationPerformanceGrade.COMPATIBLE, saved.overallGrade)
+        assertEquals(CalibrationMeasuredBackend.CPU, saved.tierOutcomes.single().backend)
+        assertEquals(CalibrationFallbackReason.BACKEND_UNAVAILABLE, saved.tierOutcomes.single().fallbackReason)
+        assertEquals(1, saved.cpuProfiles.size)
+    }
+
+    @Test
     fun requiredResourceMonitoringFailsBeforeProbingWhenBaselineIsUnavailable() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probes = AtomicInteger(0)
@@ -358,9 +588,28 @@ class InferenceCalibrationRunnerTest {
         val result = runner.run(request(outputScale = 1))
 
         assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+            CalibrationRunResult.Deferred(
+                CalibrationDeferralReason.RESOURCE_SAMPLE_UNAVAILABLE
+            ),
             result
         )
+        assertEquals(0, probes.get())
+        assertTrue(repository.saved.isEmpty())
+    }
+
+    @Test
+    fun initialModerateThermalStateDefersWithoutProbingOrPublishing() = runBlocking {
+        val repository = RecordingBenchmarkRepository()
+        val probes = AtomicInteger(0)
+        val runner = testRunner(
+            probe = successfulProbe(probeCount = probes),
+            repository = repository,
+            thermalLevelProvider = { ThermalLevel.MODERATE }
+        )
+
+        val result = runner.run(request(outputScale = 1))
+
+        assertEquals(CalibrationRunResult.Deferred(CalibrationDeferralReason.THERMAL), result)
         assertEquals(0, probes.get())
         assertTrue(repository.saved.isEmpty())
     }
@@ -516,7 +765,7 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(
-            listOf(ResolutionTier.SMALL, ResolutionTier.STANDARD, ResolutionTier.LARGE),
+            listOf(ResolutionTier.STANDARD, ResolutionTier.SMALL, ResolutionTier.LARGE),
             repository.saved.single().cpuProfiles.map(CalibratedCpuProfile::resolutionTier)
         )
         repository.saved.single().cpuProfiles.forEach { profile ->
@@ -726,7 +975,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun cpuProbeFailureAfterCompletedTierPublishesNoPartialProfiles() = runBlocking {
+    fun cpuProbeFailureAfterCompletedTierKeepsConfirmedVulkanProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val runner = testRunner(
             probe = object : InferenceCalibrationProbe {
@@ -761,15 +1010,12 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED),
-            result
-        )
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun thermalAbortInsideCpuCalibrationPublishesNoProfiles() = runBlocking {
+    fun thermalAbortInsideCpuCalibrationPublishesConfirmedProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val cpuProbeCount = AtomicInteger(0)
         val runner = testRunner(
@@ -798,13 +1044,13 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertTrue(result is CalibrationRunResult.Failed)
+        assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(1, cpuProbeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun heapDropAfterOneCpuTierPublishesNoPartialProfiles() = runBlocking {
+    fun heapDropAfterOneCpuTierPublishesLastConfirmedProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val cpuProbeCount = AtomicInteger(0)
         val runner = testRunner(
@@ -833,16 +1079,13 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(2, cpuProbeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(cpuProbeCount.get() >= 1)
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun timeoutDuringCpuCalibrationCancelsProbeAndPublishesNothing() = runBlocking {
+    fun timeoutDuringCpuCalibrationPublishesLastConfirmedVulkanProfile() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val cpuStarted = CompletableDeferred<Unit>()
         val cancelled = mutableListOf<String>()
@@ -855,11 +1098,11 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertTrue(result is CalibrationRunResult.TimedOut)
+        assertTrue(result is CalibrationRunResult.Completed)
         assertTrue(cpuStarted.isCompleted)
         awaitNativeCancel(cancelled)
         assertEquals(1, cancelled.size)
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
@@ -951,8 +1194,8 @@ class InferenceCalibrationRunnerTest {
 
         assertTrue(result is CalibrationRunResult.Completed)
         val expectedWorkloads = listOf(
-            Triple(ResolutionTier.SMALL, 512, 2_048),
             Triple(ResolutionTier.STANDARD, 768, 3_072),
+            Triple(ResolutionTier.SMALL, 512, 2_048),
             Triple(ResolutionTier.LARGE, 1_280, 5_120)
         )
         assertEquals(
@@ -962,7 +1205,7 @@ class InferenceCalibrationRunnerTest {
         expectedWorkloads.forEach { (tier, expectedInputEdge, expectedOutputEdge) ->
             val tierRequests = requests.filter { it.inputWidth == expectedInputEdge }
             val expectedBatches = if (tier == ResolutionTier.SMALL) listOf(2, 4) else listOf(2, 4, 8)
-            assertEquals(1 + 6 + expectedBatches.size + 2, tierRequests.size)
+            assertEquals(1 + 6 + expectedBatches.size + 3, tierRequests.size)
             assertTrue(tierRequests.all { it.inputHeight == expectedInputEdge })
             assertTrue(tierRequests.all { request ->
                 val outputWidth = request.inputWidth.toLong() * request.params.scale
@@ -986,8 +1229,12 @@ class InferenceCalibrationRunnerTest {
                 tierRequests.drop(7).take(expectedBatches.size).all { it.params.tileSize == 256 }
             )
             assertEquals(
-                listOf(NativeBackend.LEGACY_SAFE, NativeBackend.OPTIMIZED),
-                tierRequests.takeLast(2).map { it.params.nativeBackend }
+                listOf(
+                    NativeBackend.LEGACY_SAFE,
+                    NativeBackend.OPTIMIZED,
+                    NativeBackend.OPTIMIZED
+                ),
+                tierRequests.takeLast(3).map { it.params.nativeBackend }
             )
         }
         val optimizedRequests = requests.filter { it.params.nativeBackend == NativeBackend.OPTIMIZED }
@@ -1000,7 +1247,7 @@ class InferenceCalibrationRunnerTest {
         val benchmark = repository.saved.single()
         assertEquals(4, benchmark.recommendedCommandBatchSize)
         assertEquals(
-            listOf(ResolutionTier.SMALL, ResolutionTier.STANDARD, ResolutionTier.LARGE),
+            listOf(ResolutionTier.STANDARD, ResolutionTier.SMALL, ResolutionTier.LARGE),
             benchmark.vulkanProfiles.map(CalibratedVulkanProfile::resolutionTier)
         )
         assertTrue(benchmark.vulkanProfiles.all { it.tileSize == 256 })
@@ -1310,7 +1557,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun shapeMismatchFailsClosedWithoutPublishingPartialBenchmark() = runBlocking {
+    fun optionalShapeMismatchFallsBackToConfirmedSafeEvidence() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         var attempt = 0
         val runner = testRunner(
@@ -1332,12 +1579,12 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertTrue(result is CalibrationRunResult.Failed)
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun moderateThermalAfterFirstTierPreventsPublishingPartialProfiles() = runBlocking {
+    fun moderateThermalAfterFirstTierPublishesLastConfirmedProfile() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probeCount = AtomicInteger(0)
         val runner = testRunner(
@@ -1364,9 +1611,12 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertTrue(result is CalibrationRunResult.Failed)
+        assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(SUCCESSFUL_FIRST_TIER_PROBE_COUNT, probeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertEquals(
+            ResolutionTier.STANDARD,
+            repository.saved.single().tierOutcomes.single().resolutionTier
+        )
     }
 
     @Test
@@ -1386,14 +1636,10 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun oneByteBelowEveryTierBudgetRejectsBeforeThatTierPattern() = runBlocking {
-        val cases = listOf(
-            Triple(67_108_863L, 0, 0),
-            Triple(100_663_295L, 2, SUCCESSFUL_FIRST_TIER_PROBE_COUNT),
-            Triple(134_217_727L, 3, SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT)
-        )
+    fun oneByteBelowTierBudgetsUsesCpuCompatibilityWithoutLosingOtherTiers() = runBlocking {
+        val cases = listOf(67_108_863L, 100_663_295L, 134_217_727L)
 
-        cases.forEach { (availableBytes, expectedPatternCount, expectedProbeCount) ->
+        cases.forEach { availableBytes ->
             val repository = RecordingBenchmarkRepository()
             val generatedPatternEdges = mutableListOf<Int>()
             val probeCount = AtomicInteger(0)
@@ -1409,57 +1655,55 @@ class InferenceCalibrationRunnerTest {
 
             val result = runner.run(request(outputScale = 1))
 
-            assertEquals(
-                CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-                result
-            )
-            assertEquals(expectedPatternCount, generatedPatternEdges.size)
-            assertEquals(expectedProbeCount, probeCount.get())
-            assertTrue(repository.saved.isEmpty())
-        }
-    }
-
-    @Test
-    fun exactBudgetAllowsEveryTierToEnter() = runBlocking {
-        val cases = listOf(
-            Triple(67_108_864L, 2, SUCCESSFUL_FIRST_TIER_PROBE_COUNT),
-            Triple(100_663_296L, 3, SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT),
-            Triple(134_217_728L, 4, SUCCESSFUL_ALL_TIERS_PROBE_COUNT)
-        )
-
-        cases.forEach { (availableBytes, expectedPatternCount, expectedProbeCount) ->
-            val repository = RecordingBenchmarkRepository()
-            val generatedPatternEdges = mutableListOf<Int>()
-            val probeCount = AtomicInteger(0)
-            val runner = testRunner(
-                probe = successfulProbe(probeCount),
-                repository = repository,
-                availableHeapBytesProvider = { availableBytes },
-                calibrationPatternFactory = { width, height, seed ->
-                    generatedPatternEdges += width
-                    SyntheticCalibrationPattern.generate(width, height, seed)
-                }
-            )
-
-            val result = runner.run(request(outputScale = 1))
-
-            assertEquals(expectedPatternCount, generatedPatternEdges.size)
-            assertEquals(expectedProbeCount, probeCount.get())
-            if (availableBytes == 134_217_728L) {
-                assertTrue(result is CalibrationRunResult.Completed)
-                assertEquals(1, repository.saved.size)
-            } else {
+            if (availableBytes <
+                InferenceCalibrationRunner.requiredAvailableHeapBytes(ResolutionTier.SMALL)
+            ) {
                 assertEquals(
-                    CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
+                    CalibrationRunResult.Deferred(CalibrationDeferralReason.LOW_MEMORY),
                     result
                 )
                 assertTrue(repository.saved.isEmpty())
+            } else {
+                assertTrue(result is CalibrationRunResult.Completed)
+                assertTrue(repository.saved.single().tierOutcomes.any {
+                    it.resolutionTier == ResolutionTier.STANDARD
+                })
+                assertTrue(generatedPatternEdges.isNotEmpty())
+                assertTrue(probeCount.get() > 0)
             }
         }
     }
 
     @Test
-    fun heapDropAfterBoundedQualityPreventsFirstRealTierProbe() = runBlocking {
+    fun exactBudgetAllowsEveryTierToEnter() = runBlocking {
+        val cases = listOf(67_108_864L, 100_663_296L, 134_217_728L)
+
+        cases.forEach { availableBytes ->
+            val repository = RecordingBenchmarkRepository()
+            val generatedPatternEdges = mutableListOf<Int>()
+            val probeCount = AtomicInteger(0)
+            val runner = testRunner(
+                probe = successfulProbe(probeCount),
+                repository = repository,
+                availableHeapBytesProvider = { availableBytes },
+                calibrationPatternFactory = { width, height, seed ->
+                    generatedPatternEdges += width
+                    SyntheticCalibrationPattern.generate(width, height, seed)
+                }
+            )
+
+            val result = runner.run(request(outputScale = 1))
+
+            assertTrue(result is CalibrationRunResult.Completed)
+            assertEquals(1, repository.saved.size)
+            assertEquals(3, repository.saved.single().tierOutcomes.size)
+            assertTrue(generatedPatternEdges.isNotEmpty())
+            assertTrue(probeCount.get() > 0)
+        }
+    }
+
+    @Test
+    fun heapDropAfterBoundedQualityFallsBackToCpuCompatibleGrade() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val generatedPatternEdges = mutableListOf<Int>()
         val probeCount = AtomicInteger(0)
@@ -1478,17 +1722,14 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(listOf(512), generatedPatternEdges)
-        assertEquals(2, probeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertEquals(CalibrationPerformanceGrade.COMPATIBLE, repository.saved.single().overallGrade)
+        assertTrue(generatedPatternEdges.isNotEmpty())
+        assertTrue(probeCount.get() > 0)
     }
 
     @Test
-    fun heapDropAfterTierEntryIsObservedAtNextTierBoundary() = runBlocking {
+    fun heapDropAfterTierEntryPreservesStandardAndFallsBackLaterTiers() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probeCount = AtomicInteger(0)
         val heapChecks = AtomicInteger(0)
@@ -1502,16 +1743,13 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(SUCCESSFUL_FIRST_TIER_PROBE_COUNT, probeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(probeCount.get() >= SUCCESSFUL_FIRST_TIER_PROBE_COUNT)
+        assertEquals(3, repository.saved.single().tierOutcomes.size)
     }
 
     @Test
-    fun heapDropDuringTileSearchDoesNotRetainDecodedOutputsAndStopsAtNextTier() = runBlocking {
+    fun heapDropDuringTileSearchPreservesConfirmedStandardEvidence() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probeCount = AtomicInteger(0)
         val requests = mutableListOf<UpscaleParams>()
@@ -1525,17 +1763,14 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(SUCCESSFUL_FIRST_TIER_PROBE_COUNT, probeCount.get())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(probeCount.get() >= SUCCESSFUL_FIRST_TIER_PROBE_COUNT)
         assertTrue(requests.any { it.nativeBackend == NativeBackend.OPTIMIZED && it.tileSize == 768 })
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun heapDropDuringBatchSearchStopsAtNextTierWithoutPartialPublication() = runBlocking {
+    fun heapDropDuringBatchSearchPublishesLastConfirmedTier() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probeCount = AtomicInteger(0)
         val requests = mutableListOf<UpscaleParams>()
@@ -1549,19 +1784,16 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(SUCCESSFUL_FIRST_TIER_PROBE_COUNT, probeCount.get())
-        assertEquals(listOf(2, 4, 4), requests.filter { it.commandBatchSize > 1 }.map {
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(probeCount.get() >= SUCCESSFUL_FIRST_TIER_PROBE_COUNT)
+        assertEquals(listOf(2, 4, 4, 4), requests.filter { it.commandBatchSize > 1 }.map {
             it.commandBatchSize
         })
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
-    fun heapProviderExceptionRejectsBeforePatternOrProbe() = runBlocking {
+    fun heapProviderExceptionDefersBeforePatternOrProbe() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val generatedPatternEdges = mutableListOf<Int>()
         val probeCount = AtomicInteger(0)
@@ -1577,17 +1809,14 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
+        assertEquals(CalibrationRunResult.Deferred(CalibrationDeferralReason.LOW_MEMORY), result)
         assertTrue(generatedPatternEdges.isEmpty())
         assertEquals(0, probeCount.get())
         assertTrue(repository.saved.isEmpty())
     }
 
     @Test
-    fun unknownHeapAvailabilityRejectsBeforePatternOrProbe() = runBlocking {
+    fun unknownHeapAvailabilityDefersBeforePatternOrProbe() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val generatedPatternEdges = mutableListOf<Int>()
         val probeCount = AtomicInteger(0)
@@ -1603,17 +1832,14 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
+        assertEquals(CalibrationRunResult.Deferred(CalibrationDeferralReason.LOW_MEMORY), result)
         assertTrue(generatedPatternEdges.isEmpty())
         assertEquals(0, probeCount.get())
         assertTrue(repository.saved.isEmpty())
     }
 
     @Test
-    fun heapPressureAfterTwoCompletedTiersStillPreventsAnyPublication() = runBlocking {
+    fun heapPressureAfterTwoCompletedTiersPublishesThoseProfilesAndCpuFallback() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val generatedPatternEdges = mutableListOf<Int>()
         val probeCount = AtomicInteger(0)
@@ -1635,13 +1861,10 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
-        assertEquals(listOf(512, 512, 512), generatedPatternEdges)
-        assertEquals(SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT, probeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(generatedPatternEdges.size >= 3)
+        assertTrue(probeCount.get() >= SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT)
+        assertEquals(3, repository.saved.single().tierOutcomes.size)
     }
 
     @Test
@@ -1706,7 +1929,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun timeoutCancelsNativeAndNeverPublishesBenchmark() = runBlocking {
+    fun timeoutAfterStandardPublishesLastConfirmedBenchmark() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val cancelled = mutableListOf<String>()
         val release = CompletableDeferred<Unit>()
@@ -1748,13 +1971,13 @@ class InferenceCalibrationRunnerTest {
         val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
         safetyRelease.cancel()
 
-        assertTrue(result is CalibrationRunResult.TimedOut)
+        assertTrue(result is CalibrationRunResult.Completed)
         assertTrue("native cancel must fire before the safety release", elapsedMs < 750L)
         assertEquals(SUCCESSFUL_SECOND_TIER_REFERENCE_PROBE, probeCount.get())
         awaitNativeCancel(cancelled)
         assertEquals(1, cancelled.size)
         assertTrue(cancelled.single().startsWith("calibration-"))
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().tierOutcomes.isNotEmpty())
     }
 
     @Test
@@ -1792,7 +2015,7 @@ class InferenceCalibrationRunnerTest {
             val result = runner.run(request(outputScale = 1))
             val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
 
-            assertTrue(result is CalibrationRunResult.TimedOut)
+            assertTrue(result is CalibrationRunResult.Deferred)
             assertTrue("timeout must not wait for an unresponsive probe", elapsedMs < 750L)
             awaitNativeCancel(cancelled)
             assertEquals(1, cancelled.size)
@@ -1845,7 +2068,7 @@ class InferenceCalibrationRunnerTest {
             val result = runner.run(request(outputScale = 1))
             val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
 
-            assertTrue(result is CalibrationRunResult.TimedOut)
+            assertTrue(result is CalibrationRunResult.Deferred)
             assertTrue("timeout must not wait for native cancel callback", elapsedMs < 750L)
             assertEquals(0L, cancelStarted.count)
         } finally {
@@ -1910,6 +2133,15 @@ class InferenceCalibrationRunnerTest {
         assertTrue(result is CalibrationRunResult.Completed)
         val saved = repository.saved.single()
         assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(CalibrationPerformanceGrade.STABLE, saved.overallGrade)
+        assertEquals(
+            listOf(
+                CalibrationPerformanceGrade.STABLE,
+                CalibrationPerformanceGrade.STABLE,
+                CalibrationPerformanceGrade.STABLE
+            ),
+            saved.tierOutcomes.map(CalibrationTierOutcome::grade)
+        )
         assertEquals(
             ResolutionTier.entries.map { VulkanCalibrationDecision.PERFORMANCE_REJECTED },
             saved.vulkanTiers.map(CalibratedVulkanTier::decision)
@@ -2120,6 +2352,15 @@ class InferenceCalibrationRunnerTest {
         assertTrue(result is CalibrationRunResult.Completed)
         val saved = repository.saved.single()
         assertTrue(saved.vulkanProfiles.isEmpty())
+        assertEquals(CalibrationPerformanceGrade.STABLE, saved.overallGrade)
+        assertEquals(
+            listOf(
+                CalibrationPerformanceGrade.STABLE,
+                CalibrationPerformanceGrade.STABLE,
+                CalibrationPerformanceGrade.STABLE
+            ),
+            saved.tierOutcomes.map(CalibrationTierOutcome::grade)
+        )
         assertEquals(
             ResolutionTier.entries.map { VulkanCalibrationDecision.QUALITY_REJECTED },
             saved.vulkanTiers.map(CalibratedVulkanTier::decision)
@@ -2231,7 +2472,7 @@ class InferenceCalibrationRunnerTest {
     }
 
     @Test
-    fun ttaProbeFailurePublishesNoPartialBenchmark() = runBlocking {
+    fun ttaProbeFailureKeepsConfirmedResolutionProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val runner = testRunner(
             probe = object : InferenceCalibrationProbe {
@@ -2253,15 +2494,12 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1, supportsTta = true))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED),
-            result
-        )
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().ttaProfiles.isEmpty())
     }
 
     @Test
-    fun moderateThermalDuringTtaPublishesNoPartialBenchmark() = runBlocking {
+    fun moderateThermalDuringTtaKeepsConfirmedResolutionProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         var thermalLevel = ThermalLevel.NORMAL
         val runner = testRunner(
@@ -2285,12 +2523,12 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1, supportsTta = true))
 
-        assertTrue(result is CalibrationRunResult.Failed)
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(result is CalibrationRunResult.Completed)
+        assertTrue(repository.saved.single().ttaProfiles.isEmpty())
     }
 
     @Test
-    fun heapDropBeforeTtaPublishesNoPartialBenchmark() = runBlocking {
+    fun heapDropBeforeTtaKeepsConfirmedResolutionProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val probeCount = AtomicInteger()
         val runner = testRunner(
@@ -2307,16 +2545,13 @@ class InferenceCalibrationRunnerTest {
 
         val result = runner.run(request(outputScale = 1, supportsTta = true))
 
-        assertEquals(
-            CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED),
-            result
-        )
+        assertTrue(result is CalibrationRunResult.Completed)
         assertEquals(SUCCESSFUL_ALL_TIERS_PROBE_COUNT, probeCount.get())
-        assertTrue(repository.saved.isEmpty())
+        assertTrue(repository.saved.single().ttaProfiles.isEmpty())
     }
 
     @Test
-    fun timeoutDuringTtaCancelsNativeAndPublishesNothing() = runBlocking {
+    fun timeoutDuringTtaPublishesLastConfirmedResolutionProfiles() = runBlocking {
         val repository = RecordingBenchmarkRepository()
         val ttaStarted = CompletableDeferred<Unit>()
         val cancelled = mutableListOf<String>()
@@ -2347,9 +2582,9 @@ class InferenceCalibrationRunnerTest {
         val result = runner.run(request(outputScale = 1, supportsTta = true))
 
         assertTrue(ttaStarted.isCompleted)
-        assertTrue(result is CalibrationRunResult.TimedOut)
+        assertTrue(result is CalibrationRunResult.Completed)
         awaitNativeCancel(cancelled)
-        assertTrue(repository.saved.isEmpty())
+        assertEquals(3, repository.saved.single().tierOutcomes.size)
     }
 
     @Test
@@ -2509,6 +2744,8 @@ class InferenceCalibrationRunnerTest {
         runtimePipelineResourcesProvider: () -> RuntimePipelineResources? = { null },
         resourceSnapshotProvider: () -> CalibrationResourceSnapshot? = { null },
         resourceSampleIntervalMs: Long = 1_000L,
+        candidateQuiescenceTimeoutMs: Long = 5_000L,
+        candidateQuiescencePollMs: Long = 50L,
         requireResourceMonitoring: Boolean = false,
         runtimePipelineSlotEstimator: RuntimePipelineSlotEstimator =
             CheckedRuntimePipelineSlotEstimator
@@ -2525,6 +2762,8 @@ class InferenceCalibrationRunnerTest {
         runtimePipelineResourcesProvider = runtimePipelineResourcesProvider,
         resourceSnapshotProvider = resourceSnapshotProvider,
         resourceSampleIntervalMs = resourceSampleIntervalMs,
+        candidateQuiescenceTimeoutMs = candidateQuiescenceTimeoutMs,
+        candidateQuiescencePollMs = candidateQuiescencePollMs,
         requireResourceMonitoring = requireResourceMonitoring,
         runtimePipelineSlotEstimator = runtimePipelineSlotEstimator
     )
@@ -2651,10 +2890,10 @@ class InferenceCalibrationRunnerTest {
     )
 
     private companion object {
-        const val SUCCESSFUL_FIRST_TIER_PROBE_COUNT = 13
-        const val SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT = 24
-        const val SUCCESSFUL_ALL_TIERS_PROBE_COUNT = 35
-        const val SUCCESSFUL_SECOND_TIER_REFERENCE_PROBE = 14
+        const val SUCCESSFUL_FIRST_TIER_PROBE_COUNT = 14
+        const val SUCCESSFUL_FIRST_TWO_TIERS_PROBE_COUNT = 26
+        const val SUCCESSFUL_ALL_TIERS_PROBE_COUNT = 38
+        const val SUCCESSFUL_SECOND_TIER_REFERENCE_PROBE = 15
     }
 
     private fun slowPublicationRepository(

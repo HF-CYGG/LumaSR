@@ -181,6 +181,7 @@ class OnDeviceCalibrationCoordinatorTest {
         )
 
         assertTrue(coordinator.hasValidCalibration(model()))
+        assertEquals(CalibrationPerformanceGrade.COMPATIBLE, coordinator.calibrationGrade(model()))
         assertFalse(coordinator.hasValidCalibration(model().copy(id = "another-model")))
     }
 
@@ -207,6 +208,38 @@ class OnDeviceCalibrationCoordinatorTest {
             result
         )
         assertFalse(invoked)
+    }
+
+    @Test
+    fun deepCalibrationWithConfirmedStandardCheckpointRemainsValid() = runBlocking {
+        val repository = FakeRepository()
+        val coordinator = coordinator(repository = repository, clock = { 1_500L })
+        val model = model()
+        repository.value = InferenceBenchmarkResult(
+            identity = BenchmarkIdentityFactory.create(
+                modelId = model.id,
+                engine = model.engine,
+                modelArtifactHash = ModelArtifactIdentityFactory.create(model),
+                runtimeBuildKey = "app-1:test:arm64-v8a",
+                device = device(),
+                rawDeviceFingerprint = "fingerprint"
+            ),
+            fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
+            recommendedCommandBatchSize = 1,
+            vulkanTiers = listOf(
+                CalibratedVulkanTier(
+                    resolutionTier = ResolutionTier.STANDARD,
+                    decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                    baselineDurationNanos = 1_000L,
+                    bestCandidateDurationNanos = 1_000L
+                )
+            ),
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 2_000L,
+            calibrationMode = CalibrationMode.DEEP
+        )
+
+        assertTrue(coordinator.hasValidCalibration(model))
     }
 
     @Test

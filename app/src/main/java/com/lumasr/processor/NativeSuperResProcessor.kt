@@ -1179,6 +1179,10 @@ class NativeSuperResProcessor(
         private const val LOG_TAG = "LumaSRPerformance"
         private const val TASK_ALREADY_RUNNING_MESSAGE = "Task is already running."
 
+        private val pipelineCacheConfigurator = NativePipelineCacheConfigurator { configuration ->
+            JniNativeProcessBridge.configurePipelineCache(configuration)
+        }
+
         private val loaded: Boolean by lazy {
             runCatching { System.loadLibrary("localsr") }.isSuccess
         }
@@ -1189,9 +1193,8 @@ class NativeSuperResProcessor(
             configuration: NativePipelineCacheConfiguration
         ): Boolean {
             if (!loaded) return false
-            return runCatching {
-                JniNativeProcessBridge.configurePipelineCache(configuration)
-            }.getOrDefault(false)
+            return runCatching { pipelineCacheConfigurator.configure(configuration) }
+                .getOrDefault(false)
         }
 
         private fun logPerformance(params: UpscaleParams, snapshot: NativePerformanceSnapshot) {

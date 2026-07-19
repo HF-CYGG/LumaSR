@@ -25,6 +25,7 @@ import com.lumasr.domain.AutoTileSizePolicy
 import com.lumasr.domain.ExportMode
 import com.lumasr.domain.CalibrationFailureReason
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationPerformanceGrade
 import com.lumasr.domain.CalibrationProgressEvent
 import com.lumasr.domain.CalibrationProgressReporter
 import com.lumasr.domain.CalibrationReport
@@ -552,11 +553,8 @@ class LumaViewModel(
                     return@update state.copy(calibrationStatus = CalibrationUiStatus.NOT_RUN)
                 }
                 val calibrationStatus = when (result) {
-                    is CalibrationRunResult.Completed -> if (result.benchmark.hasEnabledOptimizations) {
-                        CalibrationUiStatus.READY
-                    } else {
-                        CalibrationUiStatus.READY_SAFE
-                    }
+                    is CalibrationRunResult.Completed ->
+                        result.benchmark.overallGrade.toCalibrationUiStatus()
                     is CalibrationRunResult.Failed -> {
                         if (result.reason == CalibrationFailureReason.UNSUPPORTED_DEVICE) {
                             CalibrationUiStatus.UNSUPPORTED
@@ -564,10 +562,16 @@ class LumaViewModel(
                             CalibrationUiStatus.FAILED
                         }
                     }
+                    is CalibrationRunResult.Deferred -> CalibrationUiStatus.DEFERRED
                     CalibrationRunResult.TimedOut -> CalibrationUiStatus.FAILED
                 }
                 val dialogStatus = when (result) {
-                    is CalibrationRunResult.Completed -> CalibrationDialogStatus.SUCCEEDED
+                    is CalibrationRunResult.Completed ->
+                        if (result.benchmark.overallGrade.isAcceleratedGrade) {
+                            CalibrationDialogStatus.SUCCEEDED
+                        } else {
+                            CalibrationDialogStatus.COMPLETED_WITH_FALLBACK
+                        }
                     is CalibrationRunResult.Failed -> {
                         if (result.reason == CalibrationFailureReason.UNSUPPORTED_DEVICE) {
                             CalibrationDialogStatus.UNSUPPORTED
@@ -575,15 +579,15 @@ class LumaViewModel(
                             CalibrationDialogStatus.FAILED
                         }
                     }
+                    is CalibrationRunResult.Deferred -> CalibrationDialogStatus.DEFERRED
                     CalibrationRunResult.TimedOut -> CalibrationDialogStatus.TIMED_OUT
                 }
                 val summary = when (result) {
-                    is CalibrationRunResult.Completed -> if (result.benchmark.hasEnabledOptimizations) {
-                        "✓ 本机校准完成，高性能模式已安全启用"
-                    } else {
-                        "✓ 本机校准完成，当前设备继续使用兼容模式"
-                    }
+                    is CalibrationRunResult.Completed ->
+                        "✓ 本机校准${if (result.benchmark.overallGrade.isAcceleratedGrade) "完成" else "带回退完成"}" +
+                            " · ${result.benchmark.overallGrade.displayName}"
                     is CalibrationRunResult.Failed -> "✗ 校准未通过 · ${result.reason.name}"
+                    is CalibrationRunResult.Deferred -> "↪ 校准暂缓 · ${result.reason.name}"
                     CalibrationRunResult.TimedOut -> "✗ 校准超时，将继续使用兼容模式"
                 }
                 val elapsedMs = state.calibrationDialog?.let { dialog ->
@@ -593,16 +597,24 @@ class LumaViewModel(
                 terminalSummary = summary
                 terminalElapsedMs = elapsedMs
                 state.copy(calibrationStatus = calibrationStatus)
-                    .finishCalibrationDialog(dialogStatus, elapsedMs, summary)
+                    .finishCalibrationDialog(
+                        status = dialogStatus,
+                        elapsedMs = elapsedMs,
+                        summary = summary,
+                        overallGrade = (result as? CalibrationRunResult.Completed)
+                            ?.benchmark
+                            ?.overallGrade,
+                        tierOutcomes = (result as? CalibrationRunResult.Completed)
+                            ?.benchmark
+                            ?.tierOutcomes
+                            .orEmpty()
+                    )
                     .withResultMessage(
-                        if (result is CalibrationRunResult.Completed) {
-                            if (result.benchmark.hasEnabledOptimizations) {
-                                "本机校准完成，高性能模式已安全启用。"
-                            } else {
-                                "本机校准完成，当前设备继续使用兼容模式。"
-                            }
-                        } else {
-                            "校准未通过，将继续使用兼容模式。"
+                        when (result) {
+                            is CalibrationRunResult.Completed ->
+                                "本机校准完成：${result.benchmark.overallGrade.displayName}。"
+                            is CalibrationRunResult.Deferred -> "校准暂缓，可稍后重试。"
+                            else -> "校准未通过，将继续使用兼容模式。"
                         }
                     )
             }
@@ -663,18 +675,19 @@ class LumaViewModel(
         val model = _uiState.value.selectedModel ?: return
         if (calibrationJob?.isActive == true) return
         viewModelScope.launch {
-            val (supported, valid, enabled) = try {
+            val availability = try {
                 withContext(ioDispatcher) {
-                    Triple(
-                        calibrationCoordinator.isSupported,
-                        calibrationCoordinator.hasValidCalibration(model),
-                        calibrationCoordinator.hasEnabledCalibration(model)
+                    CalibrationAvailability(
+                        supported = calibrationCoordinator.isSupported,
+                        valid = calibrationCoordinator.hasValidCalibration(model),
+                        enabled = calibrationCoordinator.hasEnabledCalibration(model),
+                        grade = calibrationCoordinator.calibrationGrade(model)
                     )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                Triple(false, false, false)
+                CalibrationAvailability(false, false, false, null)
             }
             _uiState.update { state ->
                 if (state.calibrationStatus == CalibrationUiStatus.RUNNING) return@update state
@@ -686,12 +699,15 @@ class LumaViewModel(
                         preferencePending = adrenoAvailable &&
                             userPreferencesRepository.shouldShowCalibrationPrompt(acceleratorKey),
                         hasSelectedModel = state.selectedModelId != null,
-                        deviceSupported = supported
+                        deviceSupported = availability.supported
                     ),
                     calibrationStatus = when {
-                        !supported -> CalibrationUiStatus.UNSUPPORTED
-                        valid && enabled -> CalibrationUiStatus.READY
-                        valid -> CalibrationUiStatus.READY_SAFE
+                        !availability.supported -> CalibrationUiStatus.UNSUPPORTED
+                        availability.valid && availability.grade != null ->
+                            availability.grade.toCalibrationUiStatus()
+                        availability.valid && availability.enabled ->
+                            CalibrationUiStatus.READY_HIGH_PERFORMANCE
+                        availability.valid -> CalibrationUiStatus.READY_COMPATIBLE
                         adrenoAvailable &&
                             userPreferencesRepository.wasCalibrationSkipped(acceleratorKey) ->
                             CalibrationUiStatus.SKIPPED
@@ -719,7 +735,12 @@ class LumaViewModel(
             id = UUID.randomUUID().toString(),
             mode = mode,
             outcome = when (result) {
-                is CalibrationRunResult.Completed -> CalibrationReportOutcome.SUCCEEDED
+                is CalibrationRunResult.Completed ->
+                    if (result.benchmark.overallGrade.isAcceleratedGrade) {
+                        CalibrationReportOutcome.SUCCEEDED
+                    } else {
+                        CalibrationReportOutcome.COMPLETED_WITH_FALLBACK
+                    }
                 is CalibrationRunResult.Failed -> {
                     if (result.reason == CalibrationFailureReason.UNSUPPORTED_DEVICE) {
                         CalibrationReportOutcome.UNSUPPORTED
@@ -727,6 +748,7 @@ class LumaViewModel(
                         CalibrationReportOutcome.FAILED
                     }
                 }
+                is CalibrationRunResult.Deferred -> CalibrationReportOutcome.DEFERRED
                 CalibrationRunResult.TimedOut -> CalibrationReportOutcome.TIMED_OUT
             },
             startedAtEpochMs = startedAtEpochMs,
@@ -735,7 +757,9 @@ class LumaViewModel(
             acceleratorCalibrationKey = calibrationCoordinator.acceleratorCalibrationKey,
             modelId = modelId,
             summary = summary,
-            events = events
+            events = events,
+            overallGrade = (result as? CalibrationRunResult.Completed)?.benchmark?.overallGrade,
+            tierOutcomes = (result as? CalibrationRunResult.Completed)?.benchmark?.tierOutcomes.orEmpty()
         )
         val reports = try {
             withContext(ioDispatcher) {
@@ -1076,7 +1100,9 @@ internal fun LumaUiState.applyCalibrationProgress(event: CalibrationProgressEven
 internal fun LumaUiState.finishCalibrationDialog(
     status: CalibrationDialogStatus,
     elapsedMs: Long,
-    summary: String
+    summary: String,
+    overallGrade: CalibrationPerformanceGrade? = null,
+    tierOutcomes: List<com.lumasr.domain.CalibrationTierOutcome> = emptyList()
 ): LumaUiState {
     val dialog = calibrationDialog ?: return this
     return copy(
@@ -1084,7 +1110,9 @@ internal fun LumaUiState.finishCalibrationDialog(
             dialog,
             status,
             elapsedMs,
-            summary
+            summary,
+            overallGrade,
+            tierOutcomes
         )
     )
 }
@@ -1124,6 +1152,25 @@ private fun CalibrationRunResult.toCalibrationResultEvent(
         is CalibrationRunResult.Completed -> buildString {
             append("result mode=")
             append(benchmark.calibrationMode.name)
+            append(" grade=")
+            append(benchmark.overallGrade.name)
+            append(" tiers=")
+            append(
+                benchmark.tierOutcomes.joinToString("|") { outcome ->
+                    buildString {
+                        append(outcome.resolutionTier.name)
+                        append(':')
+                        append(outcome.grade.name)
+                        append(" backend=")
+                        append(outcome.backend.name)
+                        append(" baselineNs=")
+                        append(outcome.baselineDurationNanos)
+                        outcome.selectedDurationNanos?.let { append(" selectedNs=$it") }
+                        outcome.speedupPercent?.let { append(" speedup=${"%.2f".format(it)}%") }
+                        outcome.fallbackReason?.let { append(" fallback=${it.name}") }
+                    }
+                }
+            )
             append(" vulkan=")
             append(
                 benchmark.vulkanTiers.joinToString(",") { tier ->
@@ -1148,6 +1195,7 @@ private fun CalibrationRunResult.toCalibrationResultEvent(
             append(benchmark.ttaProfiles.size)
         }
         is CalibrationRunResult.Failed -> "result failed=${reason.name}"
+        is CalibrationRunResult.Deferred -> "result deferred=${reason.name}"
         CalibrationRunResult.TimedOut -> "result timed_out=1"
     }
     return CalibrationReportEvent(
@@ -1161,6 +1209,25 @@ private fun CalibrationRunResult.toCalibrationResultEvent(
         totalWorkUnits = previous?.totalWorkUnits ?: 0L
     )
 }
+
+private val CalibrationPerformanceGrade.isAcceleratedGrade: Boolean
+    get() = this == CalibrationPerformanceGrade.ELITE ||
+        this == CalibrationPerformanceGrade.HIGH_PERFORMANCE
+
+private val CalibrationPerformanceGrade.displayName: String
+    get() = when (this) {
+        CalibrationPerformanceGrade.ELITE -> "极致"
+        CalibrationPerformanceGrade.HIGH_PERFORMANCE -> "高性能"
+        CalibrationPerformanceGrade.STABLE -> "稳定"
+        CalibrationPerformanceGrade.COMPATIBLE -> "兼容"
+    }
+
+private data class CalibrationAvailability(
+    val supported: Boolean,
+    val valid: Boolean,
+    val enabled: Boolean,
+    val grade: CalibrationPerformanceGrade?
+)
 
 val TileSizeOptions: List<Int> = UpscaleParamsFactory.supportedTileSizes.sorted()
 
@@ -1306,7 +1373,15 @@ fun LumaUiState.autoTileSizeForCurrentSelection(
         return sanitizeTileSize(tileSize)
     }
     return images
-        .map { image -> AutoTileSizePolicy.resolve(image.width, image.height, model, scale) }
+        .map { image ->
+            AutoTileSizePolicy.resolve(
+                imageWidth = image.width,
+                imageHeight = image.height,
+                model = model,
+                scale = scale,
+                fallbackTileSize = lastAutoTileSize
+            )
+        }
         .minOrNull()
         ?.let(::sanitizeTileSize)
         ?: DEFAULT_TILE_SIZE
@@ -1354,7 +1429,14 @@ private fun LumaUiState.tileSizeFor(
     resourceProfile: ProcessingResourceProfile = ProcessingResourceProfile(image.width, image.height)
 ): Int {
     return if (tileSizeMode == TileSizeMode.AUTO) {
-        AutoTileSizePolicy.resolve(image.width, image.height, model, scale, resourceProfile)
+        AutoTileSizePolicy.resolve(
+            imageWidth = image.width,
+            imageHeight = image.height,
+            model = model,
+            scale = scale,
+            resourceProfile = resourceProfile,
+            fallbackTileSize = lastAutoTileSize
+        )
     } else {
         manualTileSize
     }.let(::sanitizeTileSize)

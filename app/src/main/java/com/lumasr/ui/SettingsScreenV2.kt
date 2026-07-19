@@ -40,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.CalibrationReportOutcome
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.availableTargetScales
@@ -139,7 +140,7 @@ fun SettingsScreenV2(
                 state.calibrationReports.forEach { report ->
                     SettingsClickableRowV2(
                         icon = Icons.Rounded.Memory,
-                        title = "${report.mode.name} · ${report.outcome.name}",
+                        title = "${report.mode.name} · ${calibrationReportOutcomeText(report.outcome)}",
                         subtitle = "${formatCalibrationDuration(report.elapsedMs)} · ${report.summary}",
                         onClick = { onOpenCalibrationReport(report.id) }
                     )
@@ -179,6 +180,15 @@ fun SettingsScreenV2(
 
 internal fun formatSettingsVersion(versionName: String, versionCode: Long): String {
     return "\u7248\u672c $versionName ($versionCode)"
+}
+
+internal fun calibrationReportOutcomeText(outcome: CalibrationReportOutcome): String = when (outcome) {
+    CalibrationReportOutcome.SUCCEEDED -> "校准完成"
+    CalibrationReportOutcome.COMPLETED_WITH_FALLBACK -> "带回退完成"
+    CalibrationReportOutcome.DEFERRED -> "暂缓"
+    CalibrationReportOutcome.FAILED -> "校准失败"
+    CalibrationReportOutcome.TIMED_OUT -> "已超时"
+    CalibrationReportOutcome.UNSUPPORTED -> "不支持"
 }
 
 @Composable

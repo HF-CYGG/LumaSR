@@ -8,6 +8,23 @@ data class NativePipelineCacheConfiguration(
     val enabled: Boolean
 )
 
+internal class NativePipelineCacheConfigurator(
+    private val configureNative: (NativePipelineCacheConfiguration) -> Boolean
+) {
+    private var appliedConfiguration: NativePipelineCacheConfiguration? = null
+
+    @Synchronized
+    fun configure(configuration: NativePipelineCacheConfiguration): Boolean {
+        val normalized = runCatching {
+            configuration.copy(directory = configuration.directory.canonicalFile)
+        }.getOrNull() ?: return false
+        if (appliedConfiguration == normalized) return true
+        if (!configureNative(normalized)) return false
+        appliedConfiguration = normalized
+        return true
+    }
+}
+
 object NativePipelineCacheConfigurationFactory {
     private const val DIRECTORY_NAME = "ncnn-pipeline-cache"
 

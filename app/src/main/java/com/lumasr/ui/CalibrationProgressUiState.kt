@@ -3,12 +3,16 @@ package com.lumasr.ui
 import com.lumasr.domain.CalibrationProgressEvent
 import com.lumasr.domain.CalibrationProgressEventType
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationPerformanceGrade
 import com.lumasr.domain.CalibrationReport
 import com.lumasr.domain.CalibrationReportOutcome
+import com.lumasr.domain.CalibrationTierOutcome
 
 enum class CalibrationDialogStatus {
     RUNNING,
     SUCCEEDED,
+    COMPLETED_WITH_FALLBACK,
+    DEFERRED,
     FAILED,
     TIMED_OUT,
     UNSUPPORTED
@@ -31,7 +35,9 @@ data class CalibrationProgressDialogState(
     val totalWorkUnits: Long,
     val progressFraction: Float,
     val estimatedRemainingMs: Long?,
-    val logLines: List<CalibrationConsoleLine>
+    val logLines: List<CalibrationConsoleLine>,
+    val overallGrade: CalibrationPerformanceGrade? = null,
+    val tierOutcomes: List<CalibrationTierOutcome> = emptyList()
 ) {
     val isRunning: Boolean
         get() = status == CalibrationDialogStatus.RUNNING
@@ -132,7 +138,9 @@ object CalibrationProgressUiReducer {
         state: CalibrationProgressDialogState,
         status: CalibrationDialogStatus,
         elapsedMs: Long,
-        summary: String
+        summary: String,
+        overallGrade: CalibrationPerformanceGrade? = null,
+        tierOutcomes: List<CalibrationTierOutcome> = emptyList()
     ): CalibrationProgressDialogState {
         require(status != CalibrationDialogStatus.RUNNING) {
             "Finished calibration must use a terminal status"
@@ -150,9 +158,14 @@ object CalibrationProgressUiReducer {
             status = status,
             elapsedMs = finalElapsedMs,
             currentStep = summary.ifBlank { state.currentStep },
-            progressFraction = if (status == CalibrationDialogStatus.SUCCEEDED) 1f else state.progressFraction,
+            progressFraction = if (
+                status == CalibrationDialogStatus.SUCCEEDED ||
+                status == CalibrationDialogStatus.COMPLETED_WITH_FALLBACK
+            ) 1f else state.progressFraction,
             estimatedRemainingMs = 0L,
-            logLines = finalLogs
+            logLines = finalLogs,
+            overallGrade = overallGrade,
+            tierOutcomes = tierOutcomes
         )
     }
 
@@ -200,6 +213,9 @@ internal fun CalibrationReport.toDialogState(): CalibrationProgressDialogState {
     return CalibrationProgressDialogState(
         status = when (outcome) {
             CalibrationReportOutcome.SUCCEEDED -> CalibrationDialogStatus.SUCCEEDED
+            CalibrationReportOutcome.COMPLETED_WITH_FALLBACK ->
+                CalibrationDialogStatus.COMPLETED_WITH_FALLBACK
+            CalibrationReportOutcome.DEFERRED -> CalibrationDialogStatus.DEFERRED
             CalibrationReportOutcome.FAILED -> CalibrationDialogStatus.FAILED
             CalibrationReportOutcome.TIMED_OUT -> CalibrationDialogStatus.TIMED_OUT
             CalibrationReportOutcome.UNSUPPORTED -> CalibrationDialogStatus.UNSUPPORTED
@@ -212,8 +228,13 @@ internal fun CalibrationReport.toDialogState(): CalibrationProgressDialogState {
         currentStep = summary,
         completedWorkUnits = completed,
         totalWorkUnits = total,
-        progressFraction = if (outcome == CalibrationReportOutcome.SUCCEEDED) 1f else measuredProgress,
+        progressFraction = if (
+            outcome == CalibrationReportOutcome.SUCCEEDED ||
+            outcome == CalibrationReportOutcome.COMPLETED_WITH_FALLBACK
+        ) 1f else measuredProgress,
         estimatedRemainingMs = 0L,
-        logLines = logs
+        logLines = logs,
+        overallGrade = overallGrade,
+        tierOutcomes = tierOutcomes
     )
 }

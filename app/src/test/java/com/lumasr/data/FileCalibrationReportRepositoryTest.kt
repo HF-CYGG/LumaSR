@@ -1,10 +1,14 @@
 package com.lumasr.data
 
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationMeasuredBackend
+import com.lumasr.domain.CalibrationPerformanceGrade
 import com.lumasr.domain.CalibrationProgressEventType
 import com.lumasr.domain.CalibrationReport
 import com.lumasr.domain.CalibrationReportEvent
 import com.lumasr.domain.CalibrationReportOutcome
+import com.lumasr.domain.CalibrationTierOutcome
+import com.lumasr.domain.ResolutionTier
 import java.io.File
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -31,6 +35,37 @@ class FileCalibrationReportRepositoryTest {
         assertEquals(listOf("report-5", "report-4", "report-3", "report-2", "report-1"), reports.map { it.id })
         assertTrue(reports.all { it.events.size == 2 })
         assertEquals(5, root.listFiles().orEmpty().count { it.extension == "json" })
+    }
+
+    @Test
+    fun roundTripsStructuredResolutionGradesForCompleteReport() = runBlocking {
+        val root = temporaryFolder.newFolder("tier-grades")
+        val repository = FileCalibrationReportRepository(root)
+        val outcomes = ResolutionTier.entries.mapIndexed { index, tier ->
+            CalibrationTierOutcome(
+                resolutionTier = tier,
+                grade = if (tier == ResolutionTier.STANDARD) {
+                    CalibrationPerformanceGrade.HIGH_PERFORMANCE
+                } else {
+                    CalibrationPerformanceGrade.STABLE
+                },
+                backend = CalibrationMeasuredBackend.VULKAN,
+                baselineDurationNanos = 2_000L + index,
+                selectedDurationNanos = if (tier == ResolutionTier.STANDARD) 1_800L else null,
+                speedupPercent = if (tier == ResolutionTier.STANDARD) 10.0 else null
+            )
+        }
+        val expected = report(7).copy(
+            overallGrade = CalibrationPerformanceGrade.HIGH_PERFORMANCE,
+            tierOutcomes = outcomes
+        )
+
+        repository.save(expected)
+
+        assertEquals(expected, repository.list().single())
+        val json = root.listFiles().orEmpty().single { it.extension == "json" }.readText()
+        assertTrue(json.contains("\"schemaVersion\":2"))
+        assertTrue(json.contains("\"resolutionTier\":\"STANDARD\""))
     }
 
     @Test

@@ -1,10 +1,15 @@
 package com.lumasr.data
 
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.CalibrationFallbackReason
+import com.lumasr.domain.CalibrationMeasuredBackend
+import com.lumasr.domain.CalibrationPerformanceGrade
 import com.lumasr.domain.CalibrationProgressEventType
 import com.lumasr.domain.CalibrationReport
 import com.lumasr.domain.CalibrationReportEvent
 import com.lumasr.domain.CalibrationReportOutcome
+import com.lumasr.domain.CalibrationTierOutcome
+import com.lumasr.domain.ResolutionTier
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
@@ -16,10 +21,13 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.double
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -127,7 +135,8 @@ class FileCalibrationReportRepository(
 }
 
 private object CalibrationReportJson {
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
+    private const val LEGACY_SCHEMA_VERSION = 1
 
     fun encode(report: CalibrationReport): String = buildJsonObject {
         put("schemaVersion", SCHEMA_VERSION)
@@ -140,6 +149,26 @@ private object CalibrationReportJson {
         put("acceleratorCalibrationKey", report.acceleratorCalibrationKey)
         put("modelId", report.modelId)
         put("summary", report.summary)
+        put("overallGrade", report.overallGrade?.name?.let(::JsonPrimitive) ?: JsonNull)
+        put("tierOutcomes", buildJsonArray {
+            report.tierOutcomes.forEach { outcome ->
+                add(buildJsonObject {
+                    put("resolutionTier", outcome.resolutionTier.name)
+                    put("grade", outcome.grade.name)
+                    put("backend", outcome.backend.name)
+                    put("baselineDurationNanos", outcome.baselineDurationNanos)
+                    put(
+                        "selectedDurationNanos",
+                        outcome.selectedDurationNanos?.let(::JsonPrimitive) ?: JsonNull
+                    )
+                    put("speedupPercent", outcome.speedupPercent?.let(::JsonPrimitive) ?: JsonNull)
+                    put(
+                        "fallbackReason",
+                        outcome.fallbackReason?.name?.let(::JsonPrimitive) ?: JsonNull
+                    )
+                })
+            }
+        })
         put("events", buildJsonArray {
             report.events.forEach { event ->
                 add(buildJsonObject {
@@ -158,7 +187,8 @@ private object CalibrationReportJson {
 
     fun decode(value: String): CalibrationReport {
         val record = Json.parseToJsonElement(value).jsonObject
-        check(record.requiredLong("schemaVersion") == SCHEMA_VERSION.toLong()) {
+        val schemaVersion = record.requiredLong("schemaVersion").toIntExact("schemaVersion")
+        check(schemaVersion == SCHEMA_VERSION || schemaVersion == LEGACY_SCHEMA_VERSION) {
             "Unsupported calibration report schema"
         }
         return CalibrationReport(
@@ -173,6 +203,34 @@ private object CalibrationReportJson {
                 ?.contentOrNull,
             modelId = record.requiredString("modelId"),
             summary = record.requiredString("summary"),
+            overallGrade = if (schemaVersion >= 2) {
+                record["overallGrade"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull
+                    ?.let(CalibrationPerformanceGrade::valueOf)
+            } else {
+                null
+            },
+            tierOutcomes = if (schemaVersion >= 2) {
+                record.getValue("tierOutcomes").jsonArray.map { element ->
+                    val outcome = element.jsonObject
+                    CalibrationTierOutcome(
+                        resolutionTier = ResolutionTier.valueOf(
+                            outcome.requiredString("resolutionTier")
+                        ),
+                        grade = CalibrationPerformanceGrade.valueOf(outcome.requiredString("grade")),
+                        backend = CalibrationMeasuredBackend.valueOf(
+                            outcome.requiredString("backend")
+                        ),
+                        baselineDurationNanos = outcome.requiredLong("baselineDurationNanos"),
+                        selectedDurationNanos = outcome.optionalLong("selectedDurationNanos"),
+                        speedupPercent = outcome.optionalDouble("speedupPercent"),
+                        fallbackReason = outcome.optionalString("fallbackReason")?.let(
+                            CalibrationFallbackReason::valueOf
+                        )
+                    )
+                }
+            } else {
+                emptyList()
+            },
             events = record.getValue("events").jsonArray.map { element ->
                 val event = element.jsonObject
                 CalibrationReportEvent(
@@ -196,6 +254,17 @@ private object CalibrationReportJson {
     private fun JsonObject.requiredLong(key: String): Long = getValue(key).jsonPrimitive
         .also { check(!it.isString) { "$key must be a JSON number" } }
         .long
+
+    private fun JsonObject.optionalString(key: String): String? =
+        get(key)?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull
+
+    private fun JsonObject.optionalLong(key: String): Long? =
+        get(key)?.takeUnless { it is JsonNull }?.jsonPrimitive?.long
+
+    private fun JsonObject.optionalDouble(key: String): Double? =
+        get(key)?.takeUnless { it is JsonNull }?.jsonPrimitive?.double?.also {
+            check(it.isFinite()) { "$key must be finite" }
+        }
 
     private fun Long.toIntExact(label: String): Int {
         check(this in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "$label is out of range" }

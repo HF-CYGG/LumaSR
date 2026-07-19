@@ -4,11 +4,54 @@ import com.lumasr.domain.DeviceCapabilityProfile
 import com.lumasr.domain.VulkanDeviceCapabilities
 import com.lumasr.domain.VulkanDriverQuirks
 import java.nio.file.Files
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NativePipelineCachePolicyTest {
+    @Test
+    fun equivalentSuccessfulConfigurationIsAppliedOnlyOnce() {
+        val root = Files.createTempDirectory("pipeline-configurator").toFile()
+        val configuration = NativePipelineCacheConfiguration(
+            directory = root.canonicalFile,
+            enabled = true
+        )
+        var nativeCalls = 0
+        val configurator = NativePipelineCacheConfigurator {
+            nativeCalls += 1
+            true
+        }
+
+        assertTrue(configurator.configure(configuration))
+        assertTrue(configurator.configure(configuration.copy(directory = root.canonicalFile)))
+        assertEquals(1, nativeCalls)
+        root.deleteRecursively()
+    }
+
+    @Test
+    fun failedOrChangedConfigurationIsRetried() {
+        val root = Files.createTempDirectory("pipeline-configurator-retry").toFile()
+        var nativeCalls = 0
+        val configurator = NativePipelineCacheConfigurator {
+            nativeCalls += 1
+            nativeCalls > 1
+        }
+
+        assertFalse(
+            configurator.configure(
+                NativePipelineCacheConfiguration(root.canonicalFile, enabled = true)
+            )
+        )
+        assertTrue(
+            configurator.configure(
+                NativePipelineCacheConfiguration(root.canonicalFile, enabled = false)
+            )
+        )
+        assertEquals(2, nativeCalls)
+        root.deleteRecursively()
+    }
+
     @Test
     fun enablesOnlySafeQualcommDeviceInsideNoBackupRoot() {
         val root = Files.createTempDirectory("pipeline-policy").toFile()

@@ -48,11 +48,24 @@ class CalibrationResourceWatchdog(
         return null
     }
 
+    fun isCandidateMemoryQuiescent(current: CalibrationResourceSnapshot): Boolean =
+        !current.isLowMemory &&
+            positiveDelta(current.pssBytes, baseline.pssBytes) <=
+            CANDIDATE_START_DELTA_BYTES &&
+            positiveDelta(current.nativeHeapBytes, baseline.nativeHeapBytes) <=
+            CANDIDATE_START_DELTA_BYTES
+
     private fun positiveDelta(current: Long, baseline: Long): Long =
         if (current <= baseline) 0L else current - baseline
 
     companion object {
         const val MAX_SESSION_MEMORY_DELTA_BYTES = 128L * 1_024L * 1_024L
         const val MAX_SINGLE_SLOT_BYTES = 64L * 1_024L * 1_024L
+        const val CANDIDATE_QUIESCENCE_DELTA_BYTES =
+            MAX_SESSION_MEMORY_DELTA_BYTES * 3L / 4L
+        // A candidate may still consume one full slot after cache cleanup. Keep that
+        // headroom inside the unchanged 128 MiB session ceiling before switching.
+        const val CANDIDATE_START_DELTA_BYTES =
+            MAX_SESSION_MEMORY_DELTA_BYTES - MAX_SINGLE_SLOT_BYTES
     }
 }

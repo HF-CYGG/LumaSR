@@ -4,6 +4,8 @@ import java.util.UUID
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -84,6 +86,8 @@ interface InferenceCalibrationProbe {
     ): CalibrationProbeMeasurement? = measure(input, params)
 
     fun cancel(taskId: String)
+
+    fun releaseCandidateResources() = Unit
 }
 
 data class InferenceCalibrationRequest(
@@ -207,10 +211,20 @@ enum class CalibrationFailureReason {
     PERSISTENCE_FAILED
 }
 
+enum class CalibrationDeferralReason {
+    THERMAL,
+    LOW_MEMORY,
+    RESOURCE_SAMPLE_UNAVAILABLE,
+    BUSY,
+    TIME_BUDGET
+}
+
 sealed interface CalibrationRunResult {
     data class Completed(val benchmark: InferenceBenchmarkResult) : CalibrationRunResult
 
     data class Failed(val reason: CalibrationFailureReason) : CalibrationRunResult
+
+    data class Deferred(val reason: CalibrationDeferralReason) : CalibrationRunResult
 
     data object TimedOut : CalibrationRunResult
 }
@@ -231,15 +245,27 @@ class InferenceCalibrationRunner(
     private val runtimePipelineDepthPolicy: RuntimePipelineDepthPolicy = RuntimePipelineDepthPolicy(),
     private val resourceSnapshotProvider: () -> CalibrationResourceSnapshot? = { null },
     private val resourceSampleIntervalMs: Long = DEFAULT_RESOURCE_SAMPLE_INTERVAL_MS,
+    private val candidateQuiescenceTimeoutMs: Long = CANDIDATE_QUIESCENCE_TIMEOUT_MS,
+    private val candidateQuiescencePollMs: Long = CANDIDATE_QUIESCENCE_POLL_MS,
     private val requireResourceMonitoring: Boolean = false,
     private val runtimePipelineSlotEstimator: RuntimePipelineSlotEstimator =
         CheckedRuntimePipelineSlotEstimator
 ) {
     private val watchdogSessions = ConcurrentHashMap<String, ResourceWatchdogSession>()
+    private val candidateResourceLock = Any()
+    private var activeCandidateIdentity: CalibrationCandidateIdentity? = null
+    private var activeCandidateTaskId: String? = null
+    private val candidateTaskSequence = AtomicLong(0L)
 
     init {
         require(timeoutMs == null || timeoutMs > 0L) { "Calibration timeout must be positive" }
         require(resourceSampleIntervalMs > 0L) { "Resource sample interval must be positive" }
+        require(candidateQuiescenceTimeoutMs > 0L) {
+            "Calibration candidate quiescence timeout must be positive"
+        }
+        require(candidateQuiescencePollMs > 0L) {
+            "Calibration candidate quiescence poll interval must be positive"
+        }
         require(ResolutionTier.entries.all(workloadOutputEdges::containsKey)) {
             "Calibration workload must define every resolution tier"
         }
@@ -286,14 +312,33 @@ class InferenceCalibrationRunner(
             return CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
         }
 
+        val initialThermal = runCatching { thermalLevelProvider() }
+        if (initialThermal.isFailure || initialThermal.getOrNull() == null) {
+            progress.note("温控检查", "↪ 无法取得初始温控样本，暂缓校准")
+            return CalibrationRunResult.Deferred(
+                CalibrationDeferralReason.RESOURCE_SAMPLE_UNAVAILABLE
+            )
+        }
+        if (initialThermal.getOrNull() in setOf(
+                ThermalLevel.MODERATE,
+                ThermalLevel.SEVERE,
+                ThermalLevel.CRITICAL
+            )
+        ) {
+            progress.note("温控检查", "↪ 初始温度为 Moderate 或更高，暂缓校准")
+            return CalibrationRunResult.Deferred(CalibrationDeferralReason.THERMAL)
+        }
+
         val resourceBaseline = runCatching { resourceSnapshotProvider() }.getOrNull()
         if (requireResourceMonitoring && resourceBaseline == null) {
-            progress.note("资源检查", "✗ 无法建立 PSS/Native Heap 校准基线")
-            return CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+            progress.note("资源检查", "↪ 无法建立 PSS/Native Heap 校准基线，暂缓校准")
+            return CalibrationRunResult.Deferred(
+                CalibrationDeferralReason.RESOURCE_SAMPLE_UNAVAILABLE
+            )
         }
         if (resourceBaseline?.isLowMemory == true) {
-            progress.note("资源检查", "✗ 系统已进入 low-memory 状态")
-            return CalibrationRunResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
+            progress.note("资源检查", "↪ 系统已进入 low-memory 状态，暂缓校准")
+            return CalibrationRunResult.Deferred(CalibrationDeferralReason.LOW_MEMORY)
         }
         resourceBaseline?.let { baseline ->
             progress.note(
@@ -303,28 +348,40 @@ class InferenceCalibrationRunner(
         }
 
         val executionLease = CalibrationExecutionGate.tryEnterCalibration()
-            ?: return CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
-                progress.note("校准队列", "✗ 另一个处理或校准任务正在运行")
+            ?: return CalibrationRunResult.Deferred(CalibrationDeferralReason.BUSY).also {
+                progress.note("校准队列", "↪ 另一个处理或校准任务正在运行，暂缓校准")
             }
         val taskId = "calibration-${UUID.randomUUID()}"
         val publicationGate = BenchmarkPublicationGate()
+        val latestSafeCheckpoint = AtomicReference<InferenceBenchmarkResult?>(null)
+        val publicationStarted = AtomicBoolean(false)
         val cancelSent = AtomicBoolean(false)
         fun cancelNativeOnce() {
             if (cancelSent.compareAndSet(false, true)) {
                 CalibrationProbeRuntime.scope.launch {
-                    runCatching { probe.cancel(taskId) }
+                    val nativeTaskId = synchronized(candidateResourceLock) {
+                        activeCandidateTaskId ?: taskId
+                    }
+                    runCatching { probe.cancel(nativeTaskId) }
                 }
             }
         }
         resourceBaseline?.let { baseline ->
             watchdogSessions[taskId] = ResourceWatchdogSession(
                 watchdog = CalibrationResourceWatchdog(baseline),
-                cancelNative = ::cancelNativeOnce
+                cancelNative = ::cancelNativeOnce,
+                baseline = baseline
             )
         }
         val operation = try {
             CalibrationProbeRuntime.scope.async {
-                publish(runBounded(request, taskId, progress), publicationGate, progress)
+                val prepared = runBounded(request, taskId, progress, latestSafeCheckpoint)
+                publicationStarted.set(true)
+                publish(
+                    prepared,
+                    publicationGate,
+                    progress
+                )
             }
         } catch (error: Exception) {
             executionLease.close()
@@ -332,6 +389,7 @@ class InferenceCalibrationRunner(
         }
         operation.invokeOnCompletion {
             watchdogSessions.remove(taskId)
+            releaseAllCandidateResources()
             executionLease.close()
         }
         fun cancelOperation() {
@@ -347,11 +405,29 @@ class InferenceCalibrationRunner(
             }
                 ?: run {
                     cancelOperation()
-                    progress.note(
-                        "校准超时",
-                        "✗ 已达到 ${effectiveTimeoutMs / 60_000L} 分钟校准预算"
-                    )
-                    CalibrationRunResult.TimedOut
+                    latestSafeCheckpoint.get()?.takeUnless { publicationStarted.get() }?.let { checkpoint ->
+                        reportResourceSummary(taskId, progress)
+                        progress.note(
+                            "校准预算回退",
+                            "↪ 已达到 ${effectiveTimeoutMs / 60_000L} 分钟预算 · 发布最后有效档位"
+                        )
+                        publish(
+                            CalibrationPreparation.Ready(checkpoint),
+                            BenchmarkPublicationGate(),
+                            progress
+                        )
+                    } ?: if (publicationStarted.get()) {
+                        CalibrationRunResult.TimedOut.also {
+                            progress.note("发布超时", "✗ 持久化阶段超过总预算")
+                        }
+                    } else {
+                        CalibrationRunResult.Deferred(CalibrationDeferralReason.TIME_BUDGET).also {
+                            progress.note(
+                                "校准暂缓",
+                                "↪ 基线阶段已达到 ${effectiveTimeoutMs / 60_000L} 分钟预算"
+                            )
+                        }
+                    }
                 }
         } catch (cancelled: CancellationException) {
             cancelOperation()
@@ -384,13 +460,20 @@ class InferenceCalibrationRunner(
     private suspend fun runBounded(
         request: InferenceCalibrationRequest,
         taskId: String,
-        progress: CalibrationProgressSession
+        progress: CalibrationProgressSession,
+        latestSafeCheckpoint: AtomicReference<InferenceBenchmarkResult?>
     ): CalibrationPreparation {
         val qualityResult = calibrateFp16Quality(request, taskId, progress)
         val fp16Quality = when (qualityResult) {
             is QualityProbeResult.Ready -> qualityResult.quality
             is QualityProbeResult.Rejected -> qualityResult.quality
-            is QualityProbeResult.Failed -> return CalibrationPreparation.Failed(qualityResult.reason)
+            is QualityProbeResult.Failed -> return if (
+                qualityResult.reason == CalibrationFailureReason.RESOURCE_CONSTRAINED
+            ) {
+                CalibrationPreparation.Deferred(CalibrationDeferralReason.LOW_MEMORY)
+            } else {
+                CalibrationPreparation.Failed(qualityResult.reason)
+            }
         }
         val qualityAccepted = qualityResult is QualityProbeResult.Ready
         progress.note(
@@ -399,10 +482,39 @@ class InferenceCalibrationRunner(
                 " SSIM=${formatMetric(fp16Quality.ssim)} · PSNR=${formatMetric(fp16Quality.psnrDb)}dB · P99=${fp16Quality.p99ChannelError}"
         )
         val vulkanTiers = linkedMapOf<ResolutionTier, CalibratedVulkanTier>()
+        val tierOutcomes = linkedMapOf<ResolutionTier, CalibrationTierOutcome>()
         val selectedCpuByTier = linkedMapOf<ResolutionTier, MeasuredCpuCandidate>()
-        for (tier in calibrationTiers(request.mode)) {
+        tierLoop@ for (tier in calibrationTiers(request.mode)) {
             if (qualityAccepted) {
-                when (val result = calibrateTier(request, taskId, tier, fp16Quality, progress)) {
+                when (
+                    val result = calibrateTier(
+                        request = request,
+                        taskId = taskId,
+                        tier = tier,
+                        quality = fp16Quality,
+                        progress = progress,
+                        onSafeBaseline = { baselineDurationNanos ->
+                            vulkanTiers[tier] = CalibratedVulkanTier(
+                                resolutionTier = tier,
+                                decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                                baselineDurationNanos = baselineDurationNanos,
+                                bestCandidateDurationNanos = baselineDurationNanos
+                            )
+                            tierOutcomes[tier] = CalibrationGradeEvaluator.stableVulkan(
+                                resolutionTier = tier,
+                                baselineDurationNanos = baselineDurationNanos
+                            )
+                            updateSafeCheckpoint(
+                                latestSafeCheckpoint,
+                                request,
+                                fp16Quality,
+                                vulkanTiers,
+                                tierOutcomes,
+                                selectedCpuByTier
+                            )
+                        }
+                    )
+                ) {
                     is CandidateProbeResult.Ready -> {
                         val profile = CalibratedVulkanProfile(
                             resolutionTier = tier,
@@ -418,9 +530,21 @@ class InferenceCalibrationRunner(
                             bestCandidateDurationNanos = result.candidate.durationNanos,
                             profile = profile
                         )
+                        val outcome = CalibrationGradeEvaluator.evaluateVulkan(
+                            resolutionTier = tier,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            candidateDurationNanos = result.candidateDurationNanos,
+                            usesExtraPipeline = result.candidate.commandBatchSize > 1 ||
+                                result.candidate.maxPipelineDepth > 1
+                        )
+                        tierOutcomes[tier] = outcome
                         progress.note(
                             "$tier Vulkan 档位",
-                            "✓ 已选择 $tier · tile=${result.candidate.tileSize} · " +
+                            "✓ 晋级 ${outcome.grade.name} · $tier · " +
+                                "baseline=${formatPerformanceDuration(result.baselineDurationNanos)} · " +
+                                "median=${formatPerformanceDuration(requireNotNull(outcome.selectedDurationNanos))} · " +
+                                "speedup=${formatSpeedup(result.baselineDurationNanos, requireNotNull(outcome.selectedDurationNanos))} · " +
+                                "tile=${result.candidate.tileSize} · " +
                                 "batch=${result.candidate.commandBatchSize} · " +
                                 "depth=${result.candidate.maxPipelineDepth}"
                         )
@@ -432,58 +556,179 @@ class InferenceCalibrationRunner(
                             baselineDurationNanos = result.baselineDurationNanos,
                             bestCandidateDurationNanos = result.bestCandidateDurationNanos
                         )
+                        tierOutcomes[tier] = CalibrationGradeEvaluator.stableVulkan(
+                            resolutionTier = tier,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            fallbackReason = CalibrationFallbackReason.PERFORMANCE_GATE
+                        )
+                    }
+                    is CandidateProbeResult.Fallback -> {
+                        vulkanTiers[tier] = CalibratedVulkanTier(
+                            resolutionTier = tier,
+                            decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            bestCandidateDurationNanos = result.baselineDurationNanos
+                        )
+                        tierOutcomes[tier] = CalibrationGradeEvaluator.stableVulkan(
+                            resolutionTier = tier,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            fallbackReason = result.reason
+                        )
+                        progress.note(
+                            "$tier Vulkan 分级回退",
+                            "↪ 已保留 FP32 安全基线 · ${result.reason.name}"
+                        )
                     }
                     is CandidateProbeResult.Skipped -> {
                         return CalibrationPreparation.Failed(
                             CalibrationFailureReason.RESOURCE_CONSTRAINED
                         )
                     }
-                    is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+                    is CandidateProbeResult.Stopped -> {
+                        if (tierOutcomes.containsKey(ResolutionTier.STANDARD)) {
+                            progress.note(
+                                "$tier 校准停止",
+                                "↪ ${result.reason.name} · 发布最后有效档位"
+                            )
+                            break@tierLoop
+                        }
+                        return CalibrationPreparation.Deferred(result.deferralReason)
+                    }
+                    is CandidateProbeResult.Failed -> {
+                        val cpuFallback = measureCompatibilityCpuTier(
+                            request = request,
+                            taskId = taskId,
+                            tier = tier,
+                            progress = progress
+                        )
+                        if (cpuFallback == null) {
+                            if (tierOutcomes.containsKey(ResolutionTier.STANDARD)) {
+                                progress.note(
+                                    "$tier 兼容回退",
+                                    "↪ Vulkan/CPU 基线不可用 · 保留此前已确认档位"
+                                )
+                                break@tierLoop
+                            }
+                            return if (result.reason == CalibrationFailureReason.RESOURCE_CONSTRAINED) {
+                                CalibrationPreparation.Deferred(CalibrationDeferralReason.LOW_MEMORY)
+                            } else {
+                                CalibrationPreparation.Failed(result.reason)
+                            }
+                        }
+                        selectedCpuByTier[tier] = cpuFallback
+                        vulkanTiers[tier] = CalibratedVulkanTier(
+                            resolutionTier = tier,
+                            decision = VulkanCalibrationDecision.BACKEND_UNAVAILABLE
+                        )
+                        tierOutcomes[tier] = CalibrationGradeEvaluator.compatibleCpu(
+                            resolutionTier = tier,
+                            durationNanos = cpuFallback.durationNanos,
+                            fallbackReason = CalibrationFallbackReason.BACKEND_UNAVAILABLE
+                        )
+                    }
                 }
             } else {
-                skipPlannedVulkanTier(
-                    request = request,
-                    taskId = taskId,
-                    tier = tier,
-                    progress = progress,
-                    reason = "FP16 质量门未通过"
-                )
-                vulkanTiers[tier] = CalibratedVulkanTier(
-                    resolutionTier = tier,
-                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
-                )
-            }
-            if (request.mode != CalibrationMode.QUICK && cpuCalibrationCandidates != null) {
                 when (
-                    val result = calibrateCpuTier(
+                    val result = calibrateTier(
+                        request = request,
+                        taskId = taskId,
+                        tier = tier,
+                        quality = fp16Quality,
+                        progress = progress,
+                        allowOptimized = false
+                    )
+                ) {
+                    is CandidateProbeResult.Fallback -> {
+                        vulkanTiers[tier] = CalibratedVulkanTier(
+                            resolutionTier = tier,
+                            decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                        )
+                        tierOutcomes[tier] = CalibrationGradeEvaluator.stableVulkan(
+                            resolutionTier = tier,
+                            baselineDurationNanos = result.baselineDurationNanos,
+                            fallbackReason = CalibrationFallbackReason.QUALITY_GATE
+                        )
+                    }
+                    is CandidateProbeResult.Failed -> return CalibrationPreparation.Failed(result.reason)
+                    is CandidateProbeResult.Stopped -> {
+                        if (tierOutcomes.containsKey(ResolutionTier.STANDARD)) break@tierLoop
+                        return CalibrationPreparation.Deferred(result.deferralReason)
+                    }
+                    else -> error("Safe-only Vulkan calibration returned an unexpected result")
+                }
+            }
+            updateSafeCheckpoint(
+                latestSafeCheckpoint,
+                request,
+                fp16Quality,
+                vulkanTiers,
+                tierOutcomes,
+                selectedCpuByTier
+            )
+            if (request.mode != CalibrationMode.QUICK && cpuCalibrationCandidates != null) {
+                val cpuResult = try {
+                    calibrateCpuTier(
                         request,
                         taskId,
                         tier,
                         cpuCalibrationCandidates,
                         progress
                     )
-                ) {
+                } catch (_: CalibrationThermalAbortException) {
+                    progress.note("$tier CPU 校准", "↪ 温控升高 · 保留已确认档位")
+                    break@tierLoop
+                } catch (failure: CalibrationResourceAbortException) {
+                    progress.note(
+                        "$tier CPU 校准",
+                        "↪ 资源门停止 CPU 可选搜索 · ${failure.violation.name}"
+                    )
+                    break@tierLoop
+                }
+                when (cpuResult) {
                     is CpuCandidateProbeResult.Ready -> {
-                        selectedCpuByTier[tier] = result.candidate
+                        selectedCpuByTier[tier] = cpuResult.candidate
                         progress.note(
                             "$tier CPU 档位",
-                            "✓ 已选择 $tier CPU · tile=${result.candidate.tileSize} · threads=${result.candidate.cpuThreads} · blocktime=${result.candidate.openmpBlocktimeMs}ms · post=${result.candidate.postprocessThreads}"
+                            "✓ 已选择 $tier CPU · tile=${cpuResult.candidate.tileSize} · threads=${cpuResult.candidate.cpuThreads} · blocktime=${cpuResult.candidate.openmpBlocktimeMs}ms · post=${cpuResult.candidate.postprocessThreads}"
                         )
                     }
                     is CpuCandidateProbeResult.Failed -> {
-                        return CalibrationPreparation.Failed(result.reason)
+                        progress.note(
+                            "$tier CPU 校准",
+                            "↪ CPU 可选搜索失败 · ${cpuResult.reason.name} · 保留已确认档位"
+                        )
                     }
                 }
+                updateSafeCheckpoint(
+                    latestSafeCheckpoint,
+                    request,
+                    fp16Quality,
+                    vulkanTiers,
+                    tierOutcomes,
+                    selectedCpuByTier
+                )
             }
         }
 
         val shouldCalibrateTta = request.mode != CalibrationMode.QUICK && request.supportsTta
         val ttaProfiles = if (shouldCalibrateTta && qualityAccepted) {
-            when (val result = calibrateTta(request, taskId, progress)) {
-                is TtaCandidateProbeResult.Ready -> listOfNotNull(result.profile)
-                is TtaCandidateProbeResult.Failed -> {
-                    return CalibrationPreparation.Failed(result.reason)
+            try {
+                when (val result = calibrateTta(request, taskId, progress)) {
+                    is TtaCandidateProbeResult.Ready -> listOfNotNull(result.profile)
+                    is TtaCandidateProbeResult.Failed -> {
+                        progress.note(
+                            "TTA 校准",
+                            "↪ TTA 可选校准失败 · ${result.reason.name} · 保留已确认档位"
+                        )
+                        emptyList()
+                    }
                 }
+            } catch (_: CalibrationThermalAbortException) {
+                progress.note("TTA 校准", "↪ 温控升高 · 跳过 TTA 并保留已确认档位")
+                emptyList()
+            } catch (failure: CalibrationResourceAbortException) {
+                progress.note("TTA 校准", "↪ 资源门停止 TTA · ${failure.violation.name}")
+                emptyList()
             }
         } else {
             if (shouldCalibrateTta) {
@@ -497,13 +742,54 @@ class InferenceCalibrationRunner(
             emptyList()
         }
 
-        ensureCalibrationThermallySafe()
+        val benchmark = buildBenchmark(
+            request,
+            fp16Quality,
+            vulkanTiers,
+            tierOutcomes,
+            selectedCpuByTier,
+            ttaProfiles
+        )
+        reportResourceSummary(taskId, progress)
+        return CalibrationPreparation.Ready(benchmark)
+    }
+
+    private fun updateSafeCheckpoint(
+        checkpoint: AtomicReference<InferenceBenchmarkResult?>,
+        request: InferenceCalibrationRequest,
+        fp16Quality: Fp16QualityMetrics,
+        vulkanTiers: Map<ResolutionTier, CalibratedVulkanTier>,
+        tierOutcomes: Map<ResolutionTier, CalibrationTierOutcome>,
+        selectedCpuByTier: Map<ResolutionTier, MeasuredCpuCandidate>
+    ) {
+        if (!tierOutcomes.containsKey(ResolutionTier.STANDARD)) return
+        checkpoint.set(
+            buildBenchmark(
+                request = request,
+                fp16Quality = fp16Quality,
+                vulkanTiers = vulkanTiers,
+                tierOutcomes = tierOutcomes,
+                selectedCpuByTier = selectedCpuByTier,
+                ttaProfiles = emptyList()
+            )
+        )
+    }
+
+    private fun buildBenchmark(
+        request: InferenceCalibrationRequest,
+        fp16Quality: Fp16QualityMetrics,
+        vulkanTiers: Map<ResolutionTier, CalibratedVulkanTier>,
+        tierOutcomes: Map<ResolutionTier, CalibrationTierOutcome>,
+        selectedCpuByTier: Map<ResolutionTier, MeasuredCpuCandidate>,
+        ttaProfiles: List<CalibratedTtaProfile>
+    ): InferenceBenchmarkResult {
         val enabledProfiles = vulkanTiers.values.mapNotNull(CalibratedVulkanTier::profile)
         val standardBatchSize = enabledProfiles
             .singleOrNull { it.resolutionTier == ResolutionTier.STANDARD }
             ?.commandBatchSize
             ?: 1
-        val benchmark = InferenceBenchmarkResult(
+        val outcomes = tierOutcomes.values.toList()
+        return InferenceBenchmarkResult(
             identity = request.identity,
             fp16Quality = fp16Quality,
             recommendedCommandBatchSize = standardBatchSize,
@@ -521,9 +807,10 @@ class InferenceCalibrationRunner(
                 )
             },
             ttaProfiles = ttaProfiles,
-            calibrationMode = request.mode
+            calibrationMode = request.mode,
+            tierOutcomes = outcomes,
+            overallGrade = CalibrationGradeEvaluator.overallGrade(outcomes)
         )
-        return CalibrationPreparation.Ready(benchmark)
     }
 
     private fun skipPlannedVulkanTier(
@@ -531,7 +818,8 @@ class InferenceCalibrationRunner(
         taskId: String,
         tier: ResolutionTier,
         progress: CalibrationProgressSession,
-        reason: String
+        reason: String,
+        includeBaseline: Boolean = true
     ) {
         val inputEdge = calibrationInputEdge(tier, request.baseParams.scale)
         val outputEdge = inputEdge * request.baseParams.scale
@@ -550,7 +838,9 @@ class InferenceCalibrationRunner(
             inferencePrecision = InferencePrecision.FP16
         )
         val steps = buildList {
-            add("$tier Vulkan FP32" to safeParams)
+            if (includeBaseline) {
+                add("$tier Vulkan FP32" to safeParams)
+            }
             tuningCandidates(request).forEach { tuning ->
                 add(
                     "$tier Vulkan tuning=${tuning.toNativeFlags()}" to
@@ -565,10 +855,12 @@ class InferenceCalibrationRunner(
             }
             add("$tier Vulkan FP32 复测" to safeParams)
             add("$tier Vulkan FP16 复测" to optimizedBase)
+            add("$tier Vulkan FP16 稳定复测" to optimizedBase)
             add("$tier Vulkan depth=2" to optimizedBase.copy(maxPipelineDepth = 2))
             add("$tier Vulkan depth=2 复测" to optimizedBase.copy(maxPipelineDepth = 2))
         }
-        check(steps.size == plannedVulkanStepsPerTier(request))
+        val expectedStepCount = plannedVulkanStepsPerTier(request) - if (includeBaseline) 0 else 1
+        check(steps.size == expectedStepCount)
         steps.forEach { (title, params) ->
             progress.skipStep(
                 title = title,
@@ -653,7 +945,7 @@ class InferenceCalibrationRunner(
             workMultiplier = GPU_WORK_MULTIPLIER
         )
         val safeOutput = runWithResourceWatchdog(safeParams.taskId) {
-            probe.run(pattern, safeParams)
+            runProbe(pattern, safeParams)
         }
             ?: return QualityProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("FP32 质量基准", "探针失败")
@@ -684,7 +976,7 @@ class InferenceCalibrationRunner(
             workMultiplier = GPU_WORK_MULTIPLIER
         )
         val optimizedOutput = runWithResourceWatchdog(optimizedParams.taskId) {
-            probe.run(pattern, optimizedParams)
+            runProbe(pattern, optimizedParams)
         }
             ?: return QualityProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("FP16 质量候选", "探针失败")
@@ -744,7 +1036,7 @@ class InferenceCalibrationRunner(
             workMultiplier = TTA_WORK_MULTIPLIER
         )
         val safeOutput = runWithResourceWatchdog(safeParams.taskId) {
-            probe.run(qualityPattern, safeParams)
+            runProbe(qualityPattern, safeParams)
         }
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("TTA FP32 质量基准", "探针失败")
@@ -776,7 +1068,7 @@ class InferenceCalibrationRunner(
             workMultiplier = TTA_WORK_MULTIPLIER
         )
         val optimizedOutput = runWithResourceWatchdog(optimizedParams.taskId) {
-            probe.run(qualityPattern, optimizedParams)
+            runProbe(qualityPattern, optimizedParams)
         }
             ?: return TtaCandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED).also {
                 progress.failStep("TTA FP16 质量候选", "探针失败")
@@ -893,6 +1185,65 @@ class InferenceCalibrationRunner(
         )
         return TtaCandidateProbeResult.Ready(
             profile.takeIf { AdaptiveInferencePolicy.isTtaProfileEligible(request.device, it) }
+        )
+    }
+
+    private suspend fun measureCompatibilityCpuTier(
+        request: InferenceCalibrationRequest,
+        taskId: String,
+        tier: ResolutionTier,
+        progress: CalibrationProgressSession
+    ): MeasuredCpuCandidate? {
+        val inputEdge = calibrationInputEdge(tier, request.baseParams.scale)
+        val pattern = calibrationPatternFactory(
+            inputEdge,
+            inputEdge,
+            CPU_PATTERN_SEED xor tier.ordinal.toLong()
+        )
+        val cpuThreads = AdaptiveInferencePolicy.chooseCpuThreads(
+            request.device,
+            DEFAULT_CPU_THREADS
+        )
+        val params = request.baseParams.copy(
+            taskId = taskId,
+            accelerationMode = AccelerationMode.CPU,
+            nativeBackend = NativeBackend.LEGACY_SAFE,
+            inferencePrecision = InferencePrecision.FP32,
+            cpuThreads = cpuThreads,
+            commandBatchSize = 1,
+            modelCacheCapacity = CALIBRATION_MODEL_CACHE_CAPACITY,
+            maxPipelineDepth = 1,
+            tta = false,
+            pipelinePasses = emptyList()
+        )
+        progress.note(
+            "$tier CPU 兼容基线",
+            "> Vulkan 安全基线不可用，验证 CPU/LEGACY_SAFE"
+        )
+        val measurement = runCatching {
+            measureSteadyState(
+                input = pattern,
+                params = params,
+                title = "$tier CPU 兼容基线",
+                progress = progress
+            )
+        }.getOrNull() ?: return null
+        if (!measurement.hasExpectedShape(pattern, params.scale) ||
+            measurement.durationNanos <= 0L
+        ) {
+            return null
+        }
+        progress.note(
+            "$tier CPU 兼容基线",
+            "✓ CPU 安全基线已验证 · ${formatPerformanceDuration(measurement.durationNanos)}"
+        )
+        return MeasuredCpuCandidate(
+            tileSize = params.tileSize,
+            cpuThreads = cpuThreads,
+            openmpBlocktimeMs = params.openmpBlocktimeMs,
+            postprocessThreads = params.postprocessThreads,
+            durationNanos = measurement.durationNanos,
+            quality = PERFECT_CPU_REFERENCE_QUALITY
         )
     }
 
@@ -1142,10 +1493,19 @@ class InferenceCalibrationRunner(
         taskId: String,
         tier: ResolutionTier,
         quality: Fp16QualityMetrics,
-        progress: CalibrationProgressSession
+        progress: CalibrationProgressSession,
+        allowOptimized: Boolean = true,
+        onSafeBaseline: (Long) -> Unit = {}
     ): CandidateProbeResult {
         currentCoroutineContext().ensureActive()
-        ensureCalibrationThermallySafe()
+        try {
+            ensureCalibrationThermallySafe()
+        } catch (_: CalibrationThermalAbortException) {
+            return CandidateProbeResult.Stopped(
+                CalibrationFallbackReason.THERMAL_LIMIT,
+                CalibrationDeferralReason.THERMAL
+            )
+        }
         if (!hasSufficientHeapFor(tier)) {
             return CandidateProbeResult.Failed(CalibrationFailureReason.RESOURCE_CONSTRAINED)
         }
@@ -1156,7 +1516,14 @@ class InferenceCalibrationRunner(
             PATTERN_SEED xor tier.ordinal.toLong()
         )
         currentCoroutineContext().ensureActive()
-        ensureCalibrationThermallySafe()
+        try {
+            ensureCalibrationThermallySafe()
+        } catch (_: CalibrationThermalAbortException) {
+            return CandidateProbeResult.Stopped(
+                CalibrationFallbackReason.THERMAL_LIMIT,
+                CalibrationDeferralReason.THERMAL
+            )
+        }
         val referenceParams = request.baseParams.copy(
             taskId = taskId,
             nativeBackend = NativeBackend.LEGACY_SAFE,
@@ -1196,12 +1563,29 @@ class InferenceCalibrationRunner(
             durationNanos = reference.durationNanos
         )
         currentCoroutineContext().ensureActive()
-        ensureCalibrationThermallySafe()
         if (!reference.hasExpectedShape(pattern, referenceParams.scale) || reference.durationNanos <= 0L) {
             return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
         }
+        onSafeBaseline(reference.durationNanos)
 
-        val measuredTuningCandidates = mutableListOf<MeasuredVulkanCandidate>()
+        if (!allowOptimized) {
+            skipPlannedVulkanTier(
+                request = request,
+                taskId = taskId,
+                tier = tier,
+                progress = progress,
+                reason = "FP16 质量门未通过",
+                includeBaseline = false
+            )
+            return CandidateProbeResult.Fallback(
+                baselineDurationNanos = reference.durationNanos,
+                reason = CalibrationFallbackReason.QUALITY_GATE
+            )
+        }
+
+        try {
+            ensureCalibrationThermallySafe()
+            val measuredTuningCandidates = mutableListOf<MeasuredVulkanCandidate>()
         for (tuning in tuningCandidates(request)) {
             val measured = when (
                 val result = measureCandidate(
@@ -1222,6 +1606,8 @@ class InferenceCalibrationRunner(
                 is CandidateProbeResult.Ready -> result.candidate
                 is CandidateProbeResult.Skipped -> continue
                 is CandidateProbeResult.Rejected -> return result
+                is CandidateProbeResult.Fallback -> return result
+                is CandidateProbeResult.Stopped -> return result
                 is CandidateProbeResult.Failed -> return result
             }
             measuredTuningCandidates += measured
@@ -1257,6 +1643,8 @@ class InferenceCalibrationRunner(
                 is CandidateProbeResult.Ready -> result.candidate
                 is CandidateProbeResult.Skipped -> continue
                 is CandidateProbeResult.Rejected -> return result
+                is CandidateProbeResult.Fallback -> return result
+                is CandidateProbeResult.Stopped -> return result
                 is CandidateProbeResult.Failed -> return result
             }
             tileCandidates += measured
@@ -1301,6 +1689,8 @@ class InferenceCalibrationRunner(
                 is CandidateProbeResult.Ready -> result.candidate
                 is CandidateProbeResult.Skipped -> continue
                 is CandidateProbeResult.Rejected -> return result
+                is CandidateProbeResult.Fallback -> return result
+                is CandidateProbeResult.Stopped -> return result
                 is CandidateProbeResult.Failed -> return result
             }
             batchCandidates += measured
@@ -1396,28 +1786,49 @@ class InferenceCalibrationRunner(
                 )
             )
         }
-        val stableBaselineDuration = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
-        val stableCandidateDuration = maxOf(selected.durationNanos, selectedRecheck.durationNanos)
-        if (request.mode != CalibrationMode.LEGACY &&
-            !AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
-                safeDurationNanos = stableBaselineDuration,
-                optimizedDurationNanos = stableCandidateDuration
-            )
+        val selectedStabilityRecheck = measureRecordedStep(
+            input = pattern,
+            params = selectedParams,
+            title = "$tier Vulkan FP16 稳定复测",
+            progress = progress,
+            workMultiplier = GPU_WORK_MULTIPLIER
+        ) ?: return CandidateProbeResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+        if (!selectedStabilityRecheck.hasSameShape(reference) ||
+            selectedStabilityRecheck.durationNanos <= 0L
         ) {
+            return CandidateProbeResult.Failed(CalibrationFailureReason.INVALID_OUTPUT)
+        }
+        val stableBaselineDuration = maxOf(reference.durationNanos, referenceRecheck.durationNanos)
+        val stableCandidateSamples = listOf(
+            selected.durationNanos,
+            selectedRecheck.durationNanos,
+            selectedStabilityRecheck.durationNanos
+        )
+        val stabilityOutcome = CalibrationGradeEvaluator.evaluateVulkan(
+            resolutionTier = tier,
+            baselineDurationNanos = stableBaselineDuration,
+            candidateDurationNanos = stableCandidateSamples,
+            usesExtraPipeline = false
+        )
+        if (stabilityOutcome.grade == CalibrationPerformanceGrade.STABLE) {
             skipVulkanTailSteps(
                 tier = tier,
                 pattern = pattern,
                 referenceParams = referenceParams,
                 selectedParams = selectedParams,
                 includeStabilityRechecks = false,
+                includeFinalStabilityRecheck = false,
                 progress = progress,
-                reason = "Adreno 最终性能门未达到 10%"
+                reason = "三样本稳定性或 5% 性能门未通过"
             )
             return CandidateProbeResult.Rejected(
                 baselineDurationNanos = stableBaselineDuration,
-                bestCandidateDurationNanos = stableCandidateDuration
+                bestCandidateDurationNanos = requireNotNull(
+                    stabilityOutcome.selectedDurationNanos
+                )
             )
         }
+        val stableCandidateDuration = requireNotNull(stabilityOutcome.selectedDurationNanos)
         val selectedDepth = calibratePipelineDepth(
             tier = tier,
             pattern = pattern,
@@ -1433,8 +1844,28 @@ class InferenceCalibrationRunner(
                 maxPipelineDepth = selectedDepth,
                 durationNanos = stableCandidateDuration
             ),
-            baselineDurationNanos = stableBaselineDuration
+            baselineDurationNanos = stableBaselineDuration,
+            candidateDurationNanos = stableCandidateSamples
         )
+        } catch (failure: CalibrationResourceAbortException) {
+            progress.note(
+                "$tier Vulkan 资源回退",
+                "↪ 可选候选已停止 · ${failure.violation.name} · 保留 FP32 安全基线"
+            )
+            return CandidateProbeResult.Fallback(
+                baselineDurationNanos = reference.durationNanos,
+                reason = CalibrationFallbackReason.RESOURCE_LIMIT
+            )
+        } catch (_: CalibrationThermalAbortException) {
+            progress.note(
+                "$tier Vulkan 温控回退",
+                "↪ 温度达到 Moderate 或更高 · 保留 FP32 安全基线"
+            )
+            return CandidateProbeResult.Fallback(
+                baselineDurationNanos = reference.durationNanos,
+                reason = CalibrationFallbackReason.THERMAL_LIMIT
+            )
+        }
     }
 
     private suspend fun measureRecordedStep(
@@ -1478,6 +1909,7 @@ class InferenceCalibrationRunner(
         referenceParams: UpscaleParams,
         selectedParams: UpscaleParams,
         includeStabilityRechecks: Boolean,
+        includeFinalStabilityRecheck: Boolean = true,
         progress: CalibrationProgressSession,
         reason: String
     ) {
@@ -1485,6 +1917,9 @@ class InferenceCalibrationRunner(
             if (includeStabilityRechecks) {
                 add("$tier Vulkan FP32 复测" to referenceParams)
                 add("$tier Vulkan FP16 复测" to selectedParams)
+            }
+            if (includeFinalStabilityRecheck) {
+                add("$tier Vulkan FP16 稳定复测" to selectedParams)
             }
             add("$tier Vulkan depth=2" to selectedParams.copy(maxPipelineDepth = 2))
             add("$tier Vulkan depth=2 复测" to selectedParams.copy(maxPipelineDepth = 2))
@@ -1703,7 +2138,7 @@ class InferenceCalibrationRunner(
         maxPipelineDepth: Int = 1
     ): CalibrationProbeMeasurement? {
         val first = runWithResourceWatchdog(params.taskId) {
-            probe.measure(input, params, maxPipelineDepth)
+            measureProbe(input, params, maxPipelineDepth)
         } ?: return null
         if (first.telemetry?.cacheHit != false) {
             reportProbeTelemetry(title, first, progress)
@@ -1716,7 +2151,7 @@ class InferenceCalibrationRunner(
         currentCoroutineContext().ensureActive()
         ensureCalibrationThermallySafe()
         val retry = runWithResourceWatchdog(params.taskId) {
-            probe.measure(input, params, maxPipelineDepth)
+            measureProbe(input, params, maxPipelineDepth)
         } ?: return null
         if (retry.telemetry?.cacheHit == false) {
             progress.note(
@@ -1749,6 +2184,102 @@ class InferenceCalibrationRunner(
         )
     }
 
+    private suspend fun runProbe(
+        input: RgbImage,
+        params: UpscaleParams
+    ): CalibrationProbeOutput? {
+        val candidateParams = prepareCandidateResources(input, params)
+        return probe.run(input, candidateParams)
+    }
+
+    private suspend fun measureProbe(
+        input: RgbImage,
+        params: UpscaleParams,
+        maxPipelineDepth: Int
+    ): CalibrationProbeMeasurement? {
+        val candidateParams = prepareCandidateResources(input, params)
+        return probe.measure(input, candidateParams, maxPipelineDepth)
+    }
+
+    private suspend fun prepareCandidateResources(
+        input: RgbImage,
+        params: UpscaleParams
+    ): UpscaleParams {
+        val next = CalibrationCandidateIdentity.from(input, params)
+        val (shouldRelease, candidateTaskId) = synchronized(candidateResourceLock) {
+            val previous = activeCandidateIdentity
+            if (previous != next || activeCandidateTaskId == null) {
+                activeCandidateIdentity = next
+                activeCandidateTaskId =
+                    "${params.taskId}-candidate-${candidateTaskSequence.incrementAndGet()}"
+            }
+            (previous != null && previous != next) to requireNotNull(activeCandidateTaskId)
+        }
+        if (shouldRelease) {
+            probe.releaseCandidateResources()
+            awaitCandidateResourceQuiescence(params.taskId)
+        }
+        return params.copy(taskId = candidateTaskId)
+    }
+
+    private suspend fun awaitCandidateResourceQuiescence(taskId: String) {
+        val session = watchdogSessions[taskId] ?: return
+        val watchdog = session.watchdog
+        session.candidateReleases.incrementAndGet()
+        val startedAtNanos = System.nanoTime()
+        while (true) {
+            val snapshot = runCatching { resourceSnapshotProvider() }.getOrNull()
+                ?: throw CalibrationResourceAbortException(
+                    CalibrationResourceViolation.SAMPLE_FAILED
+                )
+            session.record(snapshot)
+            if (watchdog.isCandidateMemoryQuiescent(snapshot)) {
+                session.quiescentReleases.incrementAndGet()
+                return
+            }
+            val elapsedMs = (System.nanoTime() - startedAtNanos).coerceAtLeast(0L) / 1_000_000L
+            if (elapsedMs >= candidateQuiescenceTimeoutMs) {
+                session.failedReleases.incrementAndGet()
+                throw CalibrationResourceAbortException(
+                    violation = if (snapshot.isLowMemory) {
+                        CalibrationResourceViolation.SYSTEM_LOW_MEMORY
+                    } else {
+                        CalibrationResourceViolation.PSS_DELTA_EXCEEDED
+                    },
+                    snapshot = snapshot
+                )
+            }
+            delay(candidateQuiescencePollMs)
+        }
+    }
+
+    private fun releaseAllCandidateResources() {
+        val shouldRelease = synchronized(candidateResourceLock) {
+            val hadCandidate = activeCandidateIdentity != null
+            activeCandidateIdentity = null
+            activeCandidateTaskId = null
+            hadCandidate
+        }
+        if (shouldRelease) {
+            runCatching { probe.releaseCandidateResources() }
+        }
+    }
+
+    private fun reportResourceSummary(
+        taskId: String,
+        progress: CalibrationProgressSession
+    ) {
+        val session = watchdogSessions[taskId] ?: return
+        progress.note(
+            "资源峰值与缓存清理",
+            "# peakPssDelta=${session.peakPssDeltaBytes.get()}B · " +
+                "peakNativeHeapDelta=${session.peakNativeHeapDeltaBytes.get()}B · " +
+                "cacheReleases=${session.candidateReleases.get()} · " +
+                "quiescent=${session.quiescentReleases.get()} · " +
+                "failed=${session.failedReleases.get()}"
+        )
+    }
+
     private fun formatPerformanceDuration(durationNanos: Long): String = String.format(
         Locale.US,
         "%.2fs",
@@ -1778,6 +2309,7 @@ class InferenceCalibrationRunner(
                 val snapshot = runCatching { resourceSnapshotProvider() }
                 val thermal = runCatching { thermalLevelProvider() }
                 val currentSnapshot = snapshot.getOrNull()
+                currentSnapshot?.let(session::record)
                 val reason = when {
                     snapshot.isFailure || thermal.isFailure ->
                         CalibrationResourceViolation.SAMPLE_FAILED
@@ -1846,7 +2378,11 @@ class InferenceCalibrationRunner(
     private fun calibrationTiers(mode: CalibrationMode): List<ResolutionTier> = when (mode) {
         CalibrationMode.QUICK -> listOf(ResolutionTier.STANDARD)
         CalibrationMode.LEGACY,
-        CalibrationMode.DEEP -> ResolutionTier.entries
+        CalibrationMode.DEEP -> listOf(
+            ResolutionTier.STANDARD,
+            ResolutionTier.SMALL,
+            ResolutionTier.LARGE
+        )
     }
 
     private fun plannedStepCount(request: InferenceCalibrationRequest): Int {
@@ -1948,8 +2484,11 @@ class InferenceCalibrationRunner(
             is CalibrationPreparation.Failed -> CalibrationRunResult.Failed(prepared.reason).also {
                 progress.note("校准失败", "✗ 校准未通过 · ${prepared.reason.name}")
             }
+            is CalibrationPreparation.Deferred ->
+                CalibrationRunResult.Deferred(prepared.reason).also {
+                    progress.note("校准暂缓", "↪ ${prepared.reason.name}")
+                }
             is CalibrationPreparation.Ready -> try {
-                ensureCalibrationThermallySafe()
                 if (repository.publish(prepared.benchmark, publicationGate)) {
                     CalibrationRunResult.Completed(prepared.benchmark).also {
                         progress.note("校准完成", "✓ 校准结果已发布")
@@ -2016,7 +2555,9 @@ class InferenceCalibrationRunner(
         const val DEFAULT_TIMEOUT_MS = 5L * 60L * 1_000L
         const val QUICK_TIMEOUT_MS = 3L * 60L * 1_000L
         const val DEEP_TIMEOUT_MS = 8L * 60L * 1_000L
-        const val DEFAULT_RESOURCE_SAMPLE_INTERVAL_MS = 1_000L
+        const val DEFAULT_RESOURCE_SAMPLE_INTERVAL_MS = 250L
+        const val CANDIDATE_QUIESCENCE_TIMEOUT_MS = 5_000L
+        const val CANDIDATE_QUIESCENCE_POLL_MS = 50L
         const val VALIDITY_MS = 30L * 24L * 60L * 60L * 1_000L
         private const val PATTERN_SEED = 0x4c756d615352L
         private const val QUALITY_PATTERN_SEED = 0x465031364c756d61L
@@ -2026,13 +2567,13 @@ class InferenceCalibrationRunner(
         private const val QUALITY_OUTPUT_EDGE = 512
         private const val QUALITY_STEP_COUNT = 2
         private const val TTA_STEP_COUNT = 4
-        private const val VULKAN_STABILITY_RECHECK_COUNT = 2
+        private const val VULKAN_STABILITY_RECHECK_COUNT = 3
         private const val PIPELINE_DEPTH_CHECK_COUNT = 2
         private const val GPU_WORK_MULTIPLIER = 1L
         private const val CPU_WORK_MULTIPLIER = 5L
         private const val TTA_WORK_MULTIPLIER = 8L
         private const val MAX_UPGRADE_DURATION_RATIO = 0.95
-        private const val CALIBRATION_MODEL_CACHE_CAPACITY = 3
+        private const val CALIBRATION_MODEL_CACHE_CAPACITY = 1
         private const val DEFAULT_CPU_THREADS = 4
         private const val MEBIBYTE = 1_024L * 1_024L
         private val PERFECT_CPU_REFERENCE_QUALITY = Fp16QualityMetrics(
@@ -2083,12 +2624,15 @@ class InferenceCalibrationRunner(
 
         data class Failed(val reason: CalibrationFailureReason) : CalibrationPreparation
 
+        data class Deferred(val reason: CalibrationDeferralReason) : CalibrationPreparation
+
     }
 
     private sealed interface CandidateProbeResult {
         data class Ready(
             val candidate: MeasuredVulkanCandidate,
-            val baselineDurationNanos: Long
+            val baselineDurationNanos: Long,
+            val candidateDurationNanos: List<Long> = listOf(candidate.durationNanos)
         ) : CandidateProbeResult
 
         data class Rejected(
@@ -2096,7 +2640,17 @@ class InferenceCalibrationRunner(
             val bestCandidateDurationNanos: Long
         ) : CandidateProbeResult
 
+        data class Fallback(
+            val baselineDurationNanos: Long,
+            val reason: CalibrationFallbackReason
+        ) : CandidateProbeResult
+
         data class Skipped(val reason: String) : CandidateProbeResult
+
+        data class Stopped(
+            val reason: CalibrationFallbackReason,
+            val deferralReason: CalibrationDeferralReason
+        ) : CandidateProbeResult
 
         data class Failed(val reason: CalibrationFailureReason) : CandidateProbeResult
     }
@@ -2332,15 +2886,72 @@ class InferenceCalibrationRunner(
 
     private class CalibrationThermalAbortException : RuntimeException()
 
-    private data class ResourceWatchdogSession(
+    private class ResourceWatchdogSession(
         val watchdog: CalibrationResourceWatchdog,
-        val cancelNative: () -> Unit
-    )
+        val cancelNative: () -> Unit,
+        private val baseline: CalibrationResourceSnapshot
+    ) {
+        val peakPssDeltaBytes = AtomicLong(0L)
+        val peakNativeHeapDeltaBytes = AtomicLong(0L)
+        val candidateReleases = AtomicInteger(0)
+        val quiescentReleases = AtomicInteger(0)
+        val failedReleases = AtomicInteger(0)
+
+        fun record(snapshot: CalibrationResourceSnapshot) {
+            recordMaximum(
+                peakPssDeltaBytes,
+                (snapshot.pssBytes - baseline.pssBytes).coerceAtLeast(0L)
+            )
+            recordMaximum(
+                peakNativeHeapDeltaBytes,
+                (snapshot.nativeHeapBytes - baseline.nativeHeapBytes).coerceAtLeast(0L)
+            )
+        }
+
+        private fun recordMaximum(target: AtomicLong, candidate: Long) {
+            var current = target.get()
+            while (candidate > current && !target.compareAndSet(current, candidate)) {
+                current = target.get()
+            }
+        }
+    }
 
     private data class ResourceViolationEvidence(
         val violation: CalibrationResourceViolation,
         val snapshot: CalibrationResourceSnapshot?
     )
+
+    private data class CalibrationCandidateIdentity(
+        val inputWidth: Int,
+        val inputHeight: Int,
+        val modelDir: String,
+        val modelFileBase: String?,
+        val accelerationMode: AccelerationMode,
+        val nativeBackend: NativeBackend,
+        val inferencePrecision: InferencePrecision,
+        val cpuThreads: Int,
+        val openmpBlocktimeMs: Int,
+        val postprocessThreads: Int,
+        val vulkanTuning: VulkanExecutionTuning,
+        val tta: Boolean
+    ) {
+        companion object {
+            fun from(input: RgbImage, params: UpscaleParams) = CalibrationCandidateIdentity(
+                inputWidth = input.width,
+                inputHeight = input.height,
+                modelDir = params.modelDir,
+                modelFileBase = params.modelFileBase,
+                accelerationMode = params.accelerationMode,
+                nativeBackend = params.nativeBackend,
+                inferencePrecision = params.inferencePrecision,
+                cpuThreads = params.cpuThreads,
+                openmpBlocktimeMs = params.openmpBlocktimeMs,
+                postprocessThreads = params.postprocessThreads,
+                vulkanTuning = params.vulkanTuning,
+                tta = params.tta
+            )
+        }
+    }
 
     private class CalibrationResourceAbortException(
         val violation: CalibrationResourceViolation,

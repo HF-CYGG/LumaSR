@@ -16,6 +16,7 @@ import java.io.File
 class NativeBitmapCalibrationProbe(
     private val processor: NativeBitmapRegionProcessor,
     private val cancelNative: (String) -> Unit,
+    private val releaseNativeResources: () -> Unit = {},
     private val directory: File,
     private val bitmapFactory: (RgbImage) -> Bitmap? = ::createBitmap,
     private val outputDecoder: (File) -> RgbImage? = ::decodeRgb,
@@ -87,6 +88,10 @@ class NativeBitmapCalibrationProbe(
 
     override fun cancel(taskId: String) {
         cancelNative(taskId)
+    }
+
+    override fun releaseCandidateResources() {
+        releaseNativeResources()
     }
 
     private fun NativePerformanceSnapshot.toCalibrationTelemetry() = CalibrationProbeTelemetry(
