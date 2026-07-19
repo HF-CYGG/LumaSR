@@ -43,6 +43,8 @@ app/src/main/assets/            model_manifest.json 与内置模型文件
 app/src/test/                   Manifest、参数映射、处理状态等 JVM 测试
 docs/                           Native 推理和模型打包说明
 scripts/download-deps.ps1       国内镜像依赖与模型安装脚本
+scripts/build-fixed-release.ps1 固定证书签名与规范 Release 资产构建脚本
+scripts/publish-github-release.ps1 GitHub Release 发布前校验与显式发布入口
 ```
 
 ## 内置模型
@@ -102,12 +104,18 @@ app/build/outputs/apk/debug/app-debug.apk
 
 建议在 Android 10 或更新版本的真机/模拟器上手动验证：选择图片、切换模型与参数、开始处理、取消处理、完成后查看输出图片、保存并分享 PNG 结果、深色模式下控件不遮挡。
 
+## 正式发布
+
+正式版本使用不可变的 `vX.Y.Z` 数字标签和唯一的 `LumaSR.apk` 附件。固定签名构建、SHA-256、标签门禁、GitHub Release 发布及发布后回查步骤见 [docs/release-process.md](docs/release-process.md)。
+
+应用内更新检查直接读取 GitHub 最新正式 Release，不使用自建服务器；国内下载入口会为通过仓库白名单校验的原始 APK 地址添加 `https://gh.jasonzeng.dev/` 前缀。
+
 ## 后续计划
 
 - 增加批量队列和历史记录。
 - 提供更细的 tile 大小、线程数和显存策略控制。
 - 补充不同机型上的 Vulkan 兼容性与性能基准。
-- 完善发布签名、版本更新说明和正式包分发流程。
+- 补充更多真实设备上的覆盖升级与下载链路验证记录。
 
 ## 许可与来源
 

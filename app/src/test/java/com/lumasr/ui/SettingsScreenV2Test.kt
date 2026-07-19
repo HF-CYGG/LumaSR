@@ -1,6 +1,8 @@
 package com.lumasr.ui
 
 import com.lumasr.domain.CalibrationReportOutcome
+import com.lumasr.domain.AppVersion
+import com.lumasr.domain.AvailableUpdate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -94,5 +96,48 @@ class SettingsScreenV2Test {
         assertTrue(source.contains("onRunDeepCalibration"))
         assertTrue(source.contains("state.calibrationReports"))
         assertTrue(source.contains("onOpenCalibrationReport"))
+    }
+
+    @Test
+    fun exposesAutomaticAndManualGitHubUpdateControls() {
+        val source = File("src/main/java/com/lumasr/ui/SettingsScreenV2.kt").readText()
+
+        assertTrue(source.contains("updateState: UpdateUiState"))
+        assertTrue(source.contains("onAutomaticUpdateCheckChanged"))
+        assertTrue(source.contains("onCheckForUpdates"))
+        assertTrue(source.contains("软件更新"))
+        assertTrue(source.contains("自动检查更新"))
+        assertTrue(source.contains("检查更新"))
+        assertTrue(source.contains("更新检查仅请求 GitHub 版本元数据"))
+    }
+
+    @Test
+    fun formatsStableUpdateStatusSubtitles() {
+        val availableUpdate = AvailableUpdate(
+            version = AppVersion.parse("0.3.2")!!,
+            title = "LumaSR v0.3.2",
+            notes = "Changes",
+            pageUrl = "https://github.com/HF-CYGG/LumaSR/releases/tag/v0.3.2",
+            assetName = "LumaSR.apk",
+            assetSizeBytes = 128L,
+            digest = null,
+            originalDownloadUrl = "https://github.com/HF-CYGG/LumaSR/releases/download/v0.3.2/LumaSR.apk",
+            acceleratedDownloadUrl = "https://gh.jasonzeng.dev/https://github.com/HF-CYGG/LumaSR/releases/download/v0.3.2/LumaSR.apk"
+        )
+
+        assertEquals("每天自动检查，也可立即检查", updateStatusSubtitle(UpdateStatus.Idle))
+        assertEquals("正在检查 GitHub Release…", updateStatusSubtitle(UpdateStatus.Checking))
+        assertEquals(
+            "已是最新版本 0.3.1",
+            updateStatusSubtitle(UpdateStatus.UpToDate(AppVersion.parse("0.3.1")!!))
+        )
+        assertEquals(
+            "发现新版本 0.3.2",
+            updateStatusSubtitle(UpdateStatus.Available(availableUpdate))
+        )
+        assertEquals(
+            "网络连接失败，请稍后重试。",
+            updateStatusSubtitle(UpdateStatus.Failure("网络连接失败，请稍后重试。"))
+        )
     }
 }

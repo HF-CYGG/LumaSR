@@ -54,7 +54,7 @@ function Find-ApkSigner {
 if ($PSCmdlet.ParameterSetName -eq 'Apk') {
     $resolvedApk = (Resolve-Path -LiteralPath $ApkPath).Path
     $apkSigner = Find-ApkSigner
-    $verificationOutput = & $apkSigner verify --print-certs $resolvedApk 2>&1
+    $verificationOutput = & $apkSigner verify --verbose --print-certs $resolvedApk 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "apksigner rejected APK: $resolvedApk"
     }

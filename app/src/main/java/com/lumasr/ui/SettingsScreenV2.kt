@@ -22,6 +22,7 @@ import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -29,6 +30,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -65,6 +67,9 @@ fun SettingsScreenV2(
     onRunQuickCalibration: () -> Unit = onRunCalibration,
     onRunDeepCalibration: () -> Unit = onRunCalibration,
     onOpenCalibrationReport: (String) -> Unit = {},
+    updateState: UpdateUiState = UpdateUiState(),
+    onAutomaticUpdateCheckChanged: (Boolean) -> Unit = {},
+    onCheckForUpdates: () -> Unit = {},
     appVersionLabel: String? = null
 ) {
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
@@ -176,11 +181,33 @@ fun SettingsScreenV2(
             }
 
             SectionDivider()
+            SettingsGroupTitleV2("软件更新")
+            SettingsSwitchRowV2(
+                icon = Icons.Rounded.SystemUpdate,
+                title = "自动检查更新",
+                subtitle = "前台启动时每天最多检查一次",
+                checked = updateState.automaticEnabled,
+                onCheckedChange = onAutomaticUpdateCheckChanged
+            )
+            SettingsClickableRowV2(
+                icon = Icons.Rounded.SystemUpdate,
+                title = "检查更新",
+                subtitle = updateStatusSubtitle(updateState.status),
+                enabled = updateState.status !is UpdateStatus.Checking,
+                onClick = onCheckForUpdates
+            )
+
+            SectionDivider()
             SettingsGroupTitleV2("隐私与输出")
             SettingsInfoRowV2(
                 icon = Icons.Rounded.CloudOff,
                 title = "云端上传",
                 subtitle = "关闭。所有图片仅在本机处理"
+            )
+            SettingsInfoRowV2(
+                icon = Icons.Rounded.CloudOff,
+                title = "更新网络访问",
+                subtitle = "更新检查仅请求 GitHub 版本元数据；图片不会上传"
             )
             Spacer(modifier = Modifier.height(20.dp))
             Text(
@@ -199,6 +226,14 @@ fun SettingsScreenV2(
 
 internal fun formatSettingsVersion(versionName: String, versionCode: Long): String {
     return "\u7248\u672c $versionName ($versionCode)"
+}
+
+internal fun updateStatusSubtitle(status: UpdateStatus): String = when (status) {
+    UpdateStatus.Idle -> "每天自动检查，也可立即检查"
+    UpdateStatus.Checking -> "正在检查 GitHub Release…"
+    is UpdateStatus.UpToDate -> "已是最新版本 ${status.installedVersion}"
+    is UpdateStatus.Available -> "发现新版本 ${status.update.version}"
+    is UpdateStatus.Failure -> status.message
 }
 
 internal fun calibrationReportOutcomeText(outcome: CalibrationReportOutcome): String = when (outcome) {
@@ -336,6 +371,27 @@ private fun SettingsInfoRowV2(
     subtitle: String
 ) {
     SettingsRowFrame(icon = icon, title = title, subtitle = subtitle)
+}
+
+@Composable
+private fun SettingsSwitchRowV2(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    SettingsRowFrame(
+        icon = icon,
+        title = title,
+        subtitle = subtitle,
+        trailing = {
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange
+            )
+        }
+    )
 }
 
 @Composable

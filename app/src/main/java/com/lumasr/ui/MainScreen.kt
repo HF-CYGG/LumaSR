@@ -3,6 +3,8 @@
  */
 package com.lumasr.ui
 
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -85,6 +87,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.lumasr.domain.CalibrationMode
+import com.lumasr.domain.AvailableUpdate
 import kotlinx.coroutines.delay
 
 /**
@@ -96,10 +99,14 @@ sealed class BottomNavItem(val route: String, val title: String, val icon: Image
 }
 
 @Composable
-fun MainScreen(viewModel: LumaViewModel) {
+fun MainScreen(
+    viewModel: LumaViewModel,
+    updateViewModel: UpdateViewModel
+) {
     val context = LocalContext.current
     val navController = rememberNavController()
     val state by viewModel.uiState.collectAsState()
+    val updateState by updateViewModel.uiState.collectAsState()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route ?: BottomNavItem.Process.route
     val showBottomBar = state.screen == LumaScreen.EDITING
@@ -124,6 +131,17 @@ fun MainScreen(viewModel: LumaViewModel) {
         slideInVertically(animationSpec = tween(220)) { it } + fadeIn(tween(160))
     } else {
         EnterTransition.None
+    }
+    val openUpdateUrl: (String) -> Unit = { url ->
+        updateViewModel.dismissUpdateDialog()
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    .addCategory(Intent.CATEGORY_BROWSABLE)
+            )
+        }.onFailure {
+            updateViewModel.reportLinkOpenFailure()
+        }
     }
 
     LaunchedEffect(showBottomBar) {
@@ -164,6 +182,9 @@ fun MainScreen(viewModel: LumaViewModel) {
                         navController = navController,
                         viewModel = viewModel,
                         state = state,
+                        updateState = updateState,
+                        onAutomaticUpdateCheckChanged = updateViewModel::setAutomaticEnabled,
+                        onCheckForUpdates = updateViewModel::checkNow,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -227,7 +248,59 @@ fun MainScreen(viewModel: LumaViewModel) {
             onDismiss = viewModel::dismissCalibrationReport
         )
     }
+    val availableUpdate = (updateState.status as? UpdateStatus.Available)?.update
+    if (
+        updateState.showUpdateDialog &&
+        availableUpdate != null &&
+        !state.showCalibrationPrompt &&
+        state.calibrationDialog == null &&
+        state.selectedCalibrationReport == null
+    ) {
+        UpdateAvailableDialog(
+            update = availableUpdate,
+            onDomesticDownload = { openUpdateUrl(availableUpdate.acceleratedDownloadUrl) },
+            onOriginalDownload = { openUpdateUrl(availableUpdate.originalDownloadUrl) },
+            onDismiss = updateViewModel::dismissUpdateDialog
+        )
+    }
 }
+
+@Composable
+private fun UpdateAvailableDialog(
+    update: AvailableUpdate,
+    onDomesticDownload: () -> Unit,
+    onOriginalDownload: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("发现新版本 ${update.version}") },
+        text = {
+            Text(
+                update.notes
+                    .ifBlank { "新版本已发布，可前往 GitHub 查看完整更新说明。" }
+                    .take(MaxReleaseNotesCharacters)
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onDomesticDownload) {
+                Text("国内加速下载")
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onOriginalDownload) {
+                    Text("GitHub 原始下载")
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("稍后")
+                }
+            }
+        }
+    )
+}
+
+private const val MaxReleaseNotesCharacters = 1_000
 
 internal fun shouldAnimateBottomBarEnter(
     hasShownEditingBottomBar: Boolean,
@@ -431,6 +504,9 @@ private fun LumaNavHost(
     navController: NavHostController,
     viewModel: LumaViewModel,
     state: LumaUiState,
+    updateState: UpdateUiState,
+    onAutomaticUpdateCheckChanged: (Boolean) -> Unit,
+    onCheckForUpdates: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     NavHost(
@@ -468,7 +544,10 @@ private fun LumaNavHost(
                 onRunCalibration = { viewModel.runCalibration(CalibrationMode.LEGACY) },
                 onRunQuickCalibration = { viewModel.runCalibration(CalibrationMode.QUICK) },
                 onRunDeepCalibration = { viewModel.runCalibration(CalibrationMode.DEEP) },
-                onOpenCalibrationReport = viewModel::openCalibrationReport
+                onOpenCalibrationReport = viewModel::openCalibrationReport,
+                updateState = updateState,
+                onAutomaticUpdateCheckChanged = onAutomaticUpdateCheckChanged,
+                onCheckForUpdates = onCheckForUpdates
             )
         }
     }
