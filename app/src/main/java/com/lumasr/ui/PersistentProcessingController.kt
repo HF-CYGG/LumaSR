@@ -205,7 +205,7 @@ class PersistentProcessingController(
         val snapshotRecords = incoming.map { snapshot ->
             val current = currentById[snapshot.task.id]
             PersistentTaskRecord(
-                task = preserveCancelled(current?.task, snapshot.task),
+                task = snapshot.task,
                 workSpec = current?.workSpec ?: workSpecRepository.find(snapshot.task.id),
                 progress = snapshot.progress
             )
@@ -278,9 +278,11 @@ class PersistentProcessingController(
         incoming.forEach { candidate ->
             val previous = merged[candidate.task.id]
             val chosenTask = chooseTask(previous?.task, candidate.task)
-            val chosePrevious = previous != null && chosenTask === previous.task
+            // Progress-only snapshots reuse the current task instance, so matching the previous
+            // reference does not mean the candidate snapshot itself was rejected.
+            val candidateTaskAccepted = chosenTask === candidate.task
             merged[candidate.task.id] = when {
-                chosePrevious -> requireNotNull(previous).copy(
+                previous != null && !candidateTaskAccepted -> previous.copy(
                     workSpec = previous.workSpec ?: candidate.workSpec
                 )
 
@@ -289,11 +291,6 @@ class PersistentProcessingController(
         }
         return merged.values.toList()
     }
-
-    private fun preserveCancelled(
-        previous: ProcessingTask?,
-        candidate: ProcessingTask
-    ): ProcessingTask = chooseTask(previous, candidate)
 
     private fun chooseTask(previous: ProcessingTask?, candidate: ProcessingTask): ProcessingTask {
         if (previous == null) return candidate

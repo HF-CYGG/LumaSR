@@ -11,6 +11,8 @@ import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.ProcessingWorkSpecRepository
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
+import com.lumasr.domain.UpscaleProgress
+import com.lumasr.domain.UpscaleStage
 import com.lumasr.service.ForegroundFallbackReason
 import com.lumasr.service.ProcessingServiceStartResult
 import java.io.File
@@ -207,6 +209,110 @@ class PersistentProcessingControllerTest {
     }
 
     @Test
+    fun sameRunningTaskInstancePublishesEveryProgressSnapshot() = runBlocking {
+        val fixture = Fixture()
+        val running = task(
+            id = "progress",
+            state = ProcessingTaskState.RUNNING,
+            updatedAt = 2_000L
+        )
+        fixture.work.save(spec("progress"))
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            fixture.controller.startObserving(scope)
+            withTimeout(2_000L) {
+                while (fixture.snapshots.subscriptionCount.value == 0) yield()
+            }
+
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = running, progress = null)
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.none { it.task === running }) yield()
+            }
+
+            val first = progress("progress", fraction = 0.3f, completedTiles = 3)
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = running, progress = first)
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.single().progress != first) yield()
+            }
+
+            val second = progress("progress", fraction = 0.7f, completedTiles = 7)
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = running, progress = second)
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.single().progress != second) yield()
+            }
+
+            assertEquals(second, fixture.controller.state.value.records.single().progress)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun staleTaskVersionCannotOverwriteNewerProgress() = runBlocking {
+        val fixture = Fixture()
+        fixture.work.save(spec("progress"))
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            fixture.controller.startObserving(scope)
+            withTimeout(2_000L) {
+                while (fixture.snapshots.subscriptionCount.value == 0) yield()
+            }
+
+            val newerProgress = progress("progress", fraction = 0.8f, completedTiles = 8)
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(
+                    task = task(
+                        id = "progress",
+                        state = ProcessingTaskState.RUNNING,
+                        updatedAt = 3_000L
+                    ),
+                    progress = newerProgress
+                )
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.singleOrNull()?.progress != newerProgress) yield()
+            }
+
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(
+                    task = task(
+                        id = "progress",
+                        state = ProcessingTaskState.RUNNING,
+                        updatedAt = 2_000L
+                    ),
+                    progress = progress("progress", fraction = 0.2f, completedTiles = 2)
+                ),
+                ProcessingTaskSnapshot(
+                    task = task(
+                        id = "stale-progress-marker",
+                        state = ProcessingTaskState.COMPLETED,
+                        updatedAt = 3_000L
+                    ),
+                    progress = null
+                )
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.none { it.task.id == "stale-progress-marker" }) {
+                    yield()
+                }
+            }
+
+            assertEquals(
+                newerProgress,
+                fixture.controller.state.value.records.single { it.task.id == "progress" }.progress
+            )
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun staleActiveSnapshotsCannotOverwriteNewerCompletedOrFailedRecords() = runBlocking {
         val fixture = Fixture()
         fixture.tasks.save(task("completed", state = ProcessingTaskState.COMPLETED, updatedAt = 3_000L))
@@ -223,11 +329,11 @@ class PersistentProcessingControllerTest {
             fixture.snapshots.value = listOf(
                 ProcessingTaskSnapshot(
                     task = task("completed", state = ProcessingTaskState.RUNNING, updatedAt = 2_000L),
-                    progress = null
+                    progress = progress("completed", fraction = 0.2f, completedTiles = 2)
                 ),
                 ProcessingTaskSnapshot(
                     task = task("failed", state = ProcessingTaskState.QUEUED, updatedAt = 2_000L),
-                    progress = null
+                    progress = progress("failed", fraction = 0.1f, completedTiles = 1)
                 ),
                 ProcessingTaskSnapshot(
                     task = task(
@@ -245,9 +351,11 @@ class PersistentProcessingControllerTest {
                 }
             }
 
-            val states = fixture.controller.state.value.records.associate { it.task.id to it.task.state }
-            assertEquals(ProcessingTaskState.COMPLETED, states["completed"])
-            assertEquals(ProcessingTaskState.FAILED, states["failed"])
+            val records = fixture.controller.state.value.records.associateBy { it.task.id }
+            assertEquals(ProcessingTaskState.COMPLETED, records["completed"]?.task?.state)
+            assertEquals(null, records["completed"]?.progress)
+            assertEquals(ProcessingTaskState.FAILED, records["failed"]?.task?.state)
+            assertEquals(null, records["failed"]?.progress)
         } finally {
             scope.cancel()
         }
@@ -478,5 +586,16 @@ class PersistentProcessingControllerTest {
                 )
             )
         }
+
+        fun progress(id: String, fraction: Float, completedTiles: Int) = UpscaleProgress(
+            taskId = id,
+            stage = UpscaleStage.PROCESSING_TILE,
+            progress = fraction,
+            currentTile = completedTiles,
+            totalTiles = 10,
+            completedTiles = completedTiles,
+            message = "Processing tile $completedTiles/10",
+            estimatedRemainingMs = null
+        )
     }
 }
