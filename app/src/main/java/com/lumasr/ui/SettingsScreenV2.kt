@@ -17,6 +17,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Security
@@ -30,7 +32,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +52,7 @@ import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.availableTargetScales
 
 internal const val SettingsFooterBottomSpacerDp = 128
+internal const val CalibrationReportsInitiallyExpanded = false
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,6 +79,9 @@ fun SettingsScreenV2(
             packageInfo.versionCode.toLong()
         }
         formatSettingsVersion(versionName, versionCode)
+    }
+    var calibrationReportsExpanded by rememberSaveable {
+        mutableStateOf(CalibrationReportsInitiallyExpanded)
     }
 
     Scaffold(
@@ -136,14 +146,23 @@ fun SettingsScreenV2(
             )
             if (state.calibrationReports.isNotEmpty()) {
                 SectionDivider()
-                SettingsGroupTitleV2("最近校准报告")
-                state.calibrationReports.forEach { report ->
-                    SettingsClickableRowV2(
-                        icon = Icons.Rounded.Memory,
-                        title = "${report.mode.name} · ${calibrationReportOutcomeText(report.outcome)}",
-                        subtitle = "${formatCalibrationDuration(report.elapsedMs)} · ${report.summary}",
-                        onClick = { onOpenCalibrationReport(report.id) }
-                    )
+                SettingsCalibrationReportsHeaderV2(
+                    reportCount = state.calibrationReports.size,
+                    expanded = calibrationReportsExpanded,
+                    onClick = {
+                        calibrationReportsExpanded =
+                            calibrationReportsExpandedAfterToggle(calibrationReportsExpanded)
+                    }
+                )
+                if (calibrationReportsExpanded) {
+                    state.calibrationReports.forEach { report ->
+                        SettingsClickableRowV2(
+                            icon = Icons.Rounded.Memory,
+                            title = "${report.mode.name} · ${calibrationReportOutcomeText(report.outcome)}",
+                            subtitle = "${formatCalibrationDuration(report.elapsedMs)} · ${report.summary}",
+                            onClick = { onOpenCalibrationReport(report.id) }
+                        )
+                    }
                 }
             }
             SectionDivider()
@@ -190,6 +209,11 @@ internal fun calibrationReportOutcomeText(outcome: CalibrationReportOutcome): St
     CalibrationReportOutcome.TIMED_OUT -> "已超时"
     CalibrationReportOutcome.UNSUPPORTED -> "不支持"
 }
+
+internal fun calibrationReportsExpandedAfterToggle(current: Boolean): Boolean = !current
+
+internal fun calibrationReportsDisclosureAction(expanded: Boolean): String =
+    if (expanded) "收起最近校准报告" else "展开最近校准报告"
 
 @Composable
 private fun SettingsTileSizeSelector(
@@ -244,6 +268,40 @@ private fun SettingsGroupTitleV2(title: String) {
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
     )
+}
+
+@Composable
+private fun SettingsCalibrationReportsHeaderV2(
+    reportCount: Int,
+    expanded: Boolean,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "最近校准报告",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = "$reportCount 条",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Icon(
+            imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+            contentDescription = calibrationReportsDisclosureAction(expanded),
+            modifier = Modifier.size(20.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
 }
 
 @Composable
