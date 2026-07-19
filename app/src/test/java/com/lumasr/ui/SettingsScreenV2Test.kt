@@ -72,6 +72,21 @@ class SettingsScreenV2Test {
     }
 
     @Test
+    fun calibrationReportsStartCollapsedAndToggleWithAccessibleActions() {
+        assertFalse(CalibrationReportsInitiallyExpanded)
+        assertTrue(calibrationReportsExpandedAfterToggle(CalibrationReportsInitiallyExpanded))
+        assertFalse(calibrationReportsExpandedAfterToggle(true))
+        assertEquals("展开最近校准报告", calibrationReportsDisclosureAction(expanded = false))
+        assertEquals("收起最近校准报告", calibrationReportsDisclosureAction(expanded = true))
+
+        val source = File("src/main/java/com/lumasr/ui/SettingsScreenV2.kt").readText()
+        assertTrue(source.contains("var calibrationReportsExpanded by rememberSaveable"))
+        assertTrue(source.contains("mutableStateOf(CalibrationReportsInitiallyExpanded)"))
+        assertTrue(source.contains("calibrationReportsExpandedAfterToggle(calibrationReportsExpanded)"))
+        assertTrue(source.contains("if (calibrationReportsExpanded)"))
+    }
+
+    @Test
     fun exposesQuickDeepCalibrationAndPersistentReportHistory() {
         val source = File("src/main/java/com/lumasr/ui/SettingsScreenV2.kt").readText()
 
