@@ -32,3 +32,16 @@
 -keep class com.lumasr.processor.QnnProgressSink {
     *;
 }
+
+# The external QAIRT adapter reads this runtime-control callback and its returned values by name.
+-keep class com.lumasr.domain.RuntimeInferenceControlProvider {
+    *;
+}
+
+-keep class com.lumasr.domain.RuntimeInferenceControl {
+    *;
+}
+
+-keep class com.lumasr.domain.QnnPerformanceMode {
+    *;
+}
