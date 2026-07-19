@@ -9,6 +9,7 @@ constexpr SuperResExecutionProfileRequest kOptimizedRequest{
     SuperResInferencePrecision::Fp16,
     8,
     130,
+    99,
     12,
     7
 };
@@ -21,8 +22,10 @@ constexpr SuperResExecutionProfile kSanitizedCpuProfile = sanitize_execution_pro
 );
 static_assert(kSanitizedCpuProfile.cpuThreads == 4);
 static_assert(kSanitizedCpuProfile.openmpBlocktimeMs == 100);
+static_assert(kSanitizedCpuProfile.postprocessThreads == 64);
 static_assert(kSanitizedCpuProfile.commandBatchSize == 8);
 static_assert(kSanitizedCpuProfile.modelCacheCapacity == 2);
+static_assert(kSanitizedCpuProfile.vulkanTuningFlags == kSuperResVulkanTuningAll);
 static_assert(kSanitizedCpuProfile.effectivePrecision == SuperResInferencePrecision::Fp32);
 static_assert(kSanitizedCpuProfile.fallbackReason == SuperResNativeFallbackReason::CpuRequiresFp32);
 
@@ -60,6 +63,10 @@ static_assert(kOptimizedFp16Key != SuperResExecutionCacheIdentity{
 });
 static_assert(cache_entries_to_trim(3, 1) == 2);
 static_assert(cache_entries_to_trim(1, 2) == 0);
+static_assert(sanitize_vulkan_tuning_flags(-1) == kSuperResVulkanTuningAll);
+static_assert(sanitize_vulkan_tuning_flags(0b1'1010) == 0b1010);
+static_assert(has_vulkan_tuning_flag(0b1010, kSuperResVulkanTuningShaderLocalMemory));
+static_assert(!has_vulkan_tuning_flag(0b1010, kSuperResVulkanTuningSubgroupOps));
 
 static_assert(sanitize_gpu_headroom_percent(-1) == 0);
 static_assert(sanitize_gpu_headroom_percent(0) == 0);
@@ -101,8 +108,9 @@ bool run_execution_profile_runtime_checks() {
     profile.effectivePrecision = SuperResInferencePrecision::Fp16;
     profile.cpuThreads = 4;
     profile.openmpBlocktimeMs = 20;
+    profile.vulkanTuningFlags = 10;
     return serialize_execution_cache_identity(false, profile) ==
-            "device=cpu|backend=1|precision=1|threads=4|blocktime_ms=20" &&
+            "device=cpu|backend=1|precision=1|threads=4|blocktime_ms=20|vulkan_tuning=10" &&
         serialize_execution_cache_identity(true, profile) ==
-            "device=vulkan|backend=1|precision=1|threads=4|blocktime_ms=20";
+            "device=vulkan|backend=1|precision=1|threads=4|blocktime_ms=20|vulkan_tuning=10";
 }

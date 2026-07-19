@@ -17,6 +17,8 @@ import com.lumasr.data.FileProcessingTaskMaintenance
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.AndroidThermalSignalSource
+import com.lumasr.data.AndroidRuntimeResourceSource
+import com.lumasr.processor.AndroidAdpfHintSessionFactory
 import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
 import com.lumasr.domain.ProcessingCoordinator
@@ -64,14 +66,17 @@ class SuperResolutionService : Service() {
         val taskDirectory = File(noBackupFilesDir, TASK_DIRECTORY_NAME)
         val taskRepository = FileProcessingTaskRepository(taskDirectory)
         val workSpecRepository = FileProcessingWorkSpecRepository(taskDirectory)
+        val runtimeResourceSource = AndroidRuntimeResourceSource(this)
         coordinator = ProcessingCoordinator(
             taskRepository = taskRepository,
             workSpecRepository = workSpecRepository,
-            runner = SuperResProcessingTaskRunner(
+            runner = createRuntimeAwareTaskRunner(
                 thermalLevelProvider = ThermalSampler(
                     AndroidThermalSignalSource(this)
                 )::sampleLevel,
-                executionProfileResolver = createInferenceExecutionProfileResolver(this)
+                runtimeResourceProvider = runtimeResourceSource,
+                executionProfileResolver = createInferenceExecutionProfileResolver(this),
+                adpfHintSessionFactory = AndroidAdpfHintSessionFactory(this)
             ),
             maintenance = FileProcessingTaskMaintenance(
                 taskRoot = taskDirectory,

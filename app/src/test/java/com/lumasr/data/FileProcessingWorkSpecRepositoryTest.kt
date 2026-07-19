@@ -3,12 +3,16 @@ package com.lumasr.data
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.ExportMode
 import com.lumasr.domain.InferencePrecision
+import com.lumasr.domain.InferenceRuntimeBackend
 import com.lumasr.domain.NativeBackend
 import com.lumasr.domain.NativeOutputMode
 import com.lumasr.domain.OutputFormat
 import com.lumasr.domain.ProcessingTask
 import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
+import com.lumasr.domain.QnnExecutionConfig
+import com.lumasr.domain.QnnPerformanceMode
+import com.lumasr.domain.QnnPrecision
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.UpscaleParams
 import kotlinx.coroutines.runBlocking
@@ -37,7 +41,89 @@ class FileProcessingWorkSpecRepositoryTest {
         val restored = repository.find(expected.taskId)
         assertEquals(expected, restored)
         assertEquals(expected.toUpscaleParams(), restored?.toUpscaleParams())
+        assertEquals(96_000_000L, restored?.outputPixels)
         assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+    }
+
+    @Test
+    fun readsSchemaV1WorkSpecWithSafeNcnnRuntimeDefaults() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-schema-v1")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText()
+                .replace("\"schemaVersion\":2", "\"schemaVersion\":1")
+                .replace(",\"runtimeBackend\":\"QNN_HTP\"", "")
+                .replace(Regex(",\"qnnExecutionConfig\":\\{[^}]+}"), "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(InferenceRuntimeBackend.NCNN, restored?.params?.runtimeBackend)
+        assertNull(restored?.params?.qnnExecutionConfig)
+    }
+
+    @Test
+    fun readsLegacyWorkSpecWithoutOutputPixels() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-output-pixels")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText().replace("\"outputPixels\":96000000,", "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(expected.modelId, restored?.modelId)
+        assertEquals(expected.params, restored?.params)
+        assertNull(restored?.outputPixels)
+        assertTrue(sidecar.exists())
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
+    fun readsLegacyWorkSpecWithoutPostprocessThreadsUsingSafeDefault() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-postprocess-threads")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText()
+                .replace(",\"postprocessThreads\":5", "")
+                .replace(",\"postprocessThreads\":3", "")
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(1, restored?.params?.postprocessThreads)
+        assertTrue(restored?.params?.pipelinePasses.orEmpty().all { it.postprocessThreads == 1 })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
+    }
+
+    @Test
+    fun readsLegacyWorkSpecWithoutPipelineDepthUsingSafeDefault() = runBlocking {
+        val root = temporaryFolder.newFolder("legacy-without-pipeline-depth")
+        val repository = FileProcessingWorkSpecRepository(root)
+        val expected = workSpec()
+        repository.save(expected)
+        val sidecar = root.listFiles().orEmpty().single { it.extension == "work" }
+        sidecar.writeText(
+            sidecar.readText().replace(
+                ",\"maxPipelineDepth\":2,\"runtimeBackend\"",
+                ",\"runtimeBackend\""
+            )
+        )
+
+        val restored = repository.find(expected.taskId)
+
+        assertEquals(1, restored?.params?.maxPipelineDepth)
+        assertTrue(restored?.params?.pipelinePasses.orEmpty().all { it.maxPipelineDepth == 1 })
+        assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".corrupt") })
     }
 
     @Test
@@ -99,8 +185,10 @@ class FileProcessingWorkSpecRepositoryTest {
             inferencePrecision = InferencePrecision.FP32,
             cpuThreads = 3,
             openmpBlocktimeMs = 31,
+            postprocessThreads = 3,
             commandBatchSize = 2,
-            modelCacheCapacity = 2
+            modelCacheCapacity = 2,
+            maxPipelineDepth = 2
         )
         val params = UpscaleParams(
             taskId = "task-1",
@@ -132,10 +220,24 @@ class FileProcessingWorkSpecRepositoryTest {
             inferencePrecision = InferencePrecision.FP16,
             cpuThreads = 6,
             openmpBlocktimeMs = 45,
+            postprocessThreads = 5,
             commandBatchSize = 4,
-            modelCacheCapacity = 3
+            modelCacheCapacity = 3,
+            maxPipelineDepth = 2,
+            runtimeBackend = InferenceRuntimeBackend.QNN_HTP,
+            qnnExecutionConfig = QnnExecutionConfig(
+                graphKey = "realesrgan-x4-fp16-v73",
+                precision = QnnPrecision.FP16,
+                tileSize = 256,
+                maxPipelineDepth = 2,
+                performanceMode = QnnPerformanceMode.SUSTAINED_HIGH_PERFORMANCE
+            )
         )
-        return ProcessingWorkSpec.fromParams(modelId = "realesrgan-x4plus", params = params)
+        return ProcessingWorkSpec.fromParams(
+            modelId = "realesrgan-x4plus",
+            params = params,
+            outputPixels = 96_000_000L
+        )
     }
 
     private fun task(): ProcessingTask {

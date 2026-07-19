@@ -1,6 +1,7 @@
 #pragma once
 
 #include "superres_capability.h"
+#include "superres_rgb_image.h"
 #include "superres_runtime_control.h"
 
 #include <functional>
@@ -18,7 +19,8 @@ enum class SuperResNativeCode {
     InvalidParams = 6,
     OutOfMemory = 7,
     VulkanFailed = 8,
-    TileOutputMismatch = 9
+    TileOutputMismatch = 9,
+    PipelineFallbackRequired = 10
 };
 
 enum class SuperResNativeStage {
@@ -57,8 +59,10 @@ struct SuperResNativeParams {
     int inferencePrecision = 0;
     int cpuThreads = 0;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
+    int vulkanTuningFlags = 0x0f;
 };
 
 struct SuperResRawTile {
@@ -69,6 +73,17 @@ struct SuperResRawTile {
     int height;
 };
 
+struct SuperResExtremePngTile {
+    int index;
+    int outputX;
+    int outputY;
+    int outputWidth;
+    int outputHeight;
+};
+
+// This snapshot is delivered before final-path publication so JNI callback failure cannot leave a
+// successful-looking output. saveMs/encodeMs include complete staging-file creation; totalMs ends
+// before the callback and atomic rename. Native post-publish logs carry publishMs/actualTotalMs.
 struct SuperResNativePerformance {
     bool hasValue = false;
     long long decodeMs = 0;
@@ -93,6 +108,16 @@ struct SuperResNativePerformance {
     int effectiveBackend = 0;
     int effectivePrecision = 0;
     int fallbackReason = -1;
+    int requestedMaxPipelineDepth = 1;
+    int effectivePipelineDepth = 1;
+    int peakOccupiedPipelineSlots = 0;
+    long long producerWaitMs = 0;
+    long long consumerWaitMs = 0;
+    long long pipelineOverlapMs = 0;
+    long long peakPipelineSlotBytes = 0;
+    bool pipelineCacheHit = false;
+    long long pipelineCacheBytes = 0;
+    bool pipelineCacheRebuilt = false;
 };
 
 using SuperResProgressCallback = std::function<void(
@@ -111,6 +136,22 @@ SuperResNativeCode process_superres(
     const SuperResProgressCallback& onProgress,
     const SuperResRuntimeControlCallback& runtimeControl
 );
+SuperResNativeCode process_superres_pipeline(
+    const std::string& rootTaskId,
+    const std::vector<SuperResNativeParams>& passes,
+    size_t transportBudgetBytes,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
+
+// Returns the current ncnn Vulkan heap budget in MiB, or zero when unavailable.
+long long read_superres_gpu_heap_budget_mib();
+SuperResNativeCode process_superres_rgb(
+    const SuperResNativeParams& params,
+    SuperResRgbImage image,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
 SuperResNativeCode process_superres_rgb(
     const SuperResNativeParams& params,
     int width,
@@ -122,6 +163,7 @@ SuperResNativeCode process_superres_rgb(
 );
 void cancel_superres(const std::string& taskId);
 void clear_superres_cache();
+bool configure_superres_pipeline_cache(const std::string& rootDirectory, bool enabled);
 SuperResNativeCapabilitySnapshot read_superres_native_capability_snapshot();
 SuperResNativeCode merge_raw_tiles_to_png(
     const std::string& outputPath,
@@ -135,3 +177,20 @@ SuperResNativeCode merge_raw_tiles_to_png_streaming(
     int outputHeight,
     const std::vector<SuperResRawTile>& tiles
 );
+uint64_t begin_extreme_png_session(
+    const std::string& taskId,
+    const std::string& outputPath,
+    int outputWidth,
+    int outputHeight,
+    int maximumBandHeight,
+    const std::vector<SuperResExtremePngTile>& tiles
+);
+SuperResNativeCode process_extreme_png_session_rgb(
+    uint64_t handle,
+    const SuperResNativeParams& params,
+    SuperResRgbImage image,
+    const SuperResProgressCallback& onProgress,
+    const SuperResRuntimeControlCallback& runtimeControl
+);
+SuperResNativeCode finish_extreme_png_session(uint64_t handle);
+void abort_extreme_png_session(uint64_t handle);

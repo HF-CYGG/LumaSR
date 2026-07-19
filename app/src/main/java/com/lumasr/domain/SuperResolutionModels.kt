@@ -9,7 +9,8 @@ enum class SuperResEngine {
 enum class AccelerationMode {
     AUTO,
     VULKAN,
-    CPU
+    CPU,
+    QNN_HTP
 }
 
 enum class OutputFormat {
@@ -85,8 +86,13 @@ data class UpscaleParams(
     val inferencePrecision: InferencePrecision = InferencePrecision.FP32,
     val cpuThreads: Int = 0,
     val openmpBlocktimeMs: Int = 20,
+    val postprocessThreads: Int = 1,
     val commandBatchSize: Int = 1,
-    val modelCacheCapacity: Int = 1
+    val modelCacheCapacity: Int = 1,
+    val maxPipelineDepth: Int = 1,
+    val vulkanTuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT,
+    val runtimeBackend: InferenceRuntimeBackend = InferenceRuntimeBackend.NCNN,
+    val qnnExecutionConfig: QnnExecutionConfig? = null
 )
 
 data class UpscalePipelinePlan(
@@ -119,6 +125,11 @@ data class UpscaleProgress(
     val performanceSnapshot: NativePerformanceSnapshot? = null
 )
 
+/**
+ * Safe pre-publish native timing snapshot. [saveMs] and [encodeMs] include complete temporary-file
+ * staging, while [totalMs] ends before the progress callback and atomic final-path publication.
+ * Native logs report post-publish `publishMs` and `actualTotalMs` separately.
+ */
 data class NativePerformanceSnapshot(
     val decodeMs: Long,
     val modelLoadMs: Long,
@@ -141,7 +152,17 @@ data class NativePerformanceSnapshot(
     val encodeMs: Long = saveMs,
     val effectiveBackend: NativeBackend = NativeBackend.LEGACY_SAFE,
     val effectivePrecision: InferencePrecision = InferencePrecision.FP32,
-    val fallbackReason: NativeFallbackReason? = null
+    val fallbackReason: NativeFallbackReason? = null,
+    val requestedMaxPipelineDepth: Int = 1,
+    val effectivePipelineDepth: Int = 1,
+    val peakOccupiedSlots: Int = 0,
+    val peakSlotBytes: Long = 0,
+    val producerWaitMs: Long = 0,
+    val consumerWaitMs: Long = 0,
+    val overlapMs: Long = 0,
+    val pipelineCacheHit: Boolean = false,
+    val pipelineCacheBytes: Long = 0,
+    val pipelineCacheRebuilt: Boolean = false
 )
 
 enum class NativeFallbackReason {
@@ -173,14 +194,17 @@ data class UpscaleResult(
 data class RuntimeInferenceControl(
     val commandBatchSize: Int,
     val thermalHeadroomPercent: Int,
-    val shouldPause: Boolean
+    val shouldPause: Boolean,
+    val maxPipelineDepth: Int = 1,
+    val qnnPerformanceMode: QnnPerformanceMode? = null
 ) {
     fun sanitized(): RuntimeInferenceControl = copy(
         commandBatchSize = commandBatchSize.coerceIn(MIN_COMMAND_BATCH_SIZE, MAX_COMMAND_BATCH_SIZE),
         thermalHeadroomPercent = thermalHeadroomPercent.coerceIn(
             MIN_THERMAL_HEADROOM_PERCENT,
             MAX_THERMAL_HEADROOM_PERCENT
-        )
+        ),
+        maxPipelineDepth = maxPipelineDepth.coerceIn(MIN_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH)
     )
 
     private companion object {
@@ -188,11 +212,18 @@ data class RuntimeInferenceControl(
         const val MAX_COMMAND_BATCH_SIZE = 8
         const val MIN_THERMAL_HEADROOM_PERCENT = 0
         const val MAX_THERMAL_HEADROOM_PERCENT = 25
+        const val MIN_PIPELINE_DEPTH = 1
+        const val MAX_PIPELINE_DEPTH = 2
     }
 }
 
 fun interface RuntimeInferenceControlProvider {
     fun current(): RuntimeInferenceControl
+}
+
+enum class InferenceStopReason {
+    USER_REQUEST,
+    THERMAL_CRITICAL_PAUSE
 }
 
 interface SuperResProcessor {
@@ -208,4 +239,6 @@ interface SuperResProcessor {
     ): UpscaleResult
 
     fun cancel(taskId: String)
+
+    fun cancel(taskId: String, reason: InferenceStopReason) = cancel(taskId)
 }

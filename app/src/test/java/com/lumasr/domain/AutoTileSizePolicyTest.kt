@@ -18,6 +18,20 @@ class AutoTileSizePolicyTest {
     }
 
     @Test
+    fun retainsLastSafeAutoTileWhenRestoredImageDimensionsAreUnavailable() {
+        assertEquals(
+            256,
+            AutoTileSizePolicy.resolve(
+                imageWidth = null,
+                imageHeight = null,
+                model = waifu2xModel(),
+                scale = 2,
+                fallbackTileSize = 256
+            )
+        )
+    }
+
+    @Test
     fun usesLargerTilesForSafeSmallRealEsrganImages() {
         assertEquals(
             256,

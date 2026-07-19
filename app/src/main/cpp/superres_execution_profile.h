@@ -20,13 +20,25 @@ enum class SuperResNativeFallbackReason {
     Fp16Unsupported = 2
 };
 
+constexpr int kSuperResVulkanTuningSubgroupOps = 1 << 0;
+constexpr int kSuperResVulkanTuningShaderLocalMemory = 1 << 1;
+constexpr int kSuperResVulkanTuningWinogradConvolution = 1 << 2;
+constexpr int kSuperResVulkanTuningSgemmConvolution = 1 << 3;
+constexpr int kSuperResVulkanTuningAll =
+    kSuperResVulkanTuningSubgroupOps |
+    kSuperResVulkanTuningShaderLocalMemory |
+    kSuperResVulkanTuningWinogradConvolution |
+    kSuperResVulkanTuningSgemmConvolution;
+
 struct SuperResExecutionProfileRequest {
     SuperResNativeBackend backend = SuperResNativeBackend::LegacySafe;
     SuperResInferencePrecision precision = SuperResInferencePrecision::Fp32;
     int cpuThreads = 0;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
+    int vulkanTuningFlags = kSuperResVulkanTuningAll;
 };
 
 struct SuperResExecutionProfile {
@@ -34,13 +46,23 @@ struct SuperResExecutionProfile {
     SuperResInferencePrecision effectivePrecision = SuperResInferencePrecision::Fp32;
     int cpuThreads = 1;
     int openmpBlocktimeMs = 20;
+    int postprocessThreads = 1;
     int commandBatchSize = 1;
     int modelCacheCapacity = 1;
+    int vulkanTuningFlags = kSuperResVulkanTuningAll;
     SuperResNativeFallbackReason fallbackReason = SuperResNativeFallbackReason::None;
 };
 
 constexpr int clamp_execution_value(int value, int minimum, int maximum) {
     return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+
+constexpr int sanitize_vulkan_tuning_flags(int value) {
+    return value & kSuperResVulkanTuningAll;
+}
+
+constexpr bool has_vulkan_tuning_flag(int flags, int flag) {
+    return (sanitize_vulkan_tuning_flags(flags) & flag) != 0;
 }
 
 constexpr int sanitize_cpu_threads(
@@ -88,8 +110,10 @@ constexpr SuperResExecutionProfile sanitize_execution_profile(
         effectivePrecision,
         sanitize_cpu_threads(request.cpuThreads, useVulkan, bigCoreCount, physicalCoreCount),
         clamp_execution_value(request.openmpBlocktimeMs, 0, 100),
+        clamp_execution_value(request.postprocessThreads, 1, 64),
         clamp_execution_value(request.commandBatchSize, 1, 8),
         clamp_execution_value(request.modelCacheCapacity, 1, 2),
+        sanitize_vulkan_tuning_flags(request.vulkanTuningFlags),
         fallbackReason
     };
 }
@@ -183,7 +207,8 @@ inline std::string serialize_execution_cache_identity(
         "|backend=" + std::to_string(static_cast<int>(profile.effectiveBackend)) +
         "|precision=" + std::to_string(static_cast<int>(profile.effectivePrecision)) +
         "|threads=" + std::to_string(profile.cpuThreads) +
-        "|blocktime_ms=" + std::to_string(profile.openmpBlocktimeMs);
+        "|blocktime_ms=" + std::to_string(profile.openmpBlocktimeMs) +
+        "|vulkan_tuning=" + std::to_string(profile.vulkanTuningFlags);
 }
 
 bool run_execution_profile_runtime_checks();

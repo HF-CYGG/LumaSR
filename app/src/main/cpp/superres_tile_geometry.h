@@ -174,8 +174,8 @@ constexpr bool should_retry_cpu_after_gpu_code(int accelerationMode, int nativeC
 }
 
 constexpr bool should_force_cpu_before_vulkan_model_load(int engineType) {
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
     constexpr int engineRealEsrgan = 2;
-#if defined(__i386__) || defined(__x86_64__)
     return engineType == engineRealEsrgan;
 #else
     (void)engineType;

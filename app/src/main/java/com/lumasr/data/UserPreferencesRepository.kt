@@ -70,6 +70,42 @@ class UserPreferencesRepository(
             .apply()
     }
 
+    fun shouldShowCalibrationPrompt(acceleratorCalibrationKey: String?): Boolean =
+        CalibrationPromptHistory.shouldShow(
+            preferences.getStringSet(KEY_HANDLED_CALIBRATION_KEYS, emptySet()).orEmpty(),
+            acceleratorCalibrationKey
+        )
+
+    fun wasCalibrationSkipped(acceleratorCalibrationKey: String?): Boolean =
+        acceleratorCalibrationKey != null &&
+            preferences.getStringSet(KEY_SKIPPED_CALIBRATION_KEYS, emptySet())
+                .orEmpty()
+                .contains(acceleratorCalibrationKey)
+
+    fun markCalibrationPromptHandled(
+        acceleratorCalibrationKey: String?,
+        skipped: Boolean
+    ) {
+        if (acceleratorCalibrationKey.isNullOrBlank()) return
+        val handled = CalibrationPromptHistory.markHandled(
+            preferences.getStringSet(KEY_HANDLED_CALIBRATION_KEYS, emptySet()).orEmpty(),
+            acceleratorCalibrationKey
+        )
+        val skippedKeys = preferences.getStringSet(KEY_SKIPPED_CALIBRATION_KEYS, emptySet())
+            .orEmpty()
+            .toMutableSet()
+            .apply {
+                if (skipped) add(acceleratorCalibrationKey) else remove(acceleratorCalibrationKey)
+            }
+        preferences.edit()
+            .putStringSet(KEY_HANDLED_CALIBRATION_KEYS, handled)
+            .putStringSet(
+                KEY_SKIPPED_CALIBRATION_KEYS,
+                skippedKeys.toList().takeLast(CalibrationPromptHistory.MAX_KEYS).toSet()
+            )
+            .apply()
+    }
+
     private fun Int.sanitizeTileSize(): Int = UpscaleParamsFactory.sanitizeTileSize(this)
 
     companion object {
@@ -80,6 +116,8 @@ class UserPreferencesRepository(
         private const val KEY_DISABLED_EXTREME_GPU_KEYS = "disabled_extreme_gpu_keys"
         private const val KEY_CALIBRATION_PROMPT_HANDLED = "calibration_prompt_handled"
         private const val KEY_CALIBRATION_SKIPPED = "calibration_skipped"
+        private const val KEY_HANDLED_CALIBRATION_KEYS = "handled_calibration_keys_v1"
+        private const val KEY_SKIPPED_CALIBRATION_KEYS = "skipped_calibration_keys_v1"
 
         fun fromContext(context: Context): UserPreferencesRepository {
             return UserPreferencesRepository(
@@ -87,4 +125,15 @@ class UserPreferencesRepository(
             )
         }
     }
+}
+
+internal object CalibrationPromptHistory {
+    const val MAX_KEYS = 16
+
+    fun shouldShow(handledKeys: Set<String>, acceleratorCalibrationKey: String?): Boolean =
+        !acceleratorCalibrationKey.isNullOrBlank() && acceleratorCalibrationKey !in handledKeys
+
+    fun markHandled(handledKeys: Set<String>, acceleratorCalibrationKey: String): Set<String> =
+        (handledKeys.filterNot { it == acceleratorCalibrationKey }.takeLast(MAX_KEYS - 1) +
+            acceleratorCalibrationKey).toSet()
 }

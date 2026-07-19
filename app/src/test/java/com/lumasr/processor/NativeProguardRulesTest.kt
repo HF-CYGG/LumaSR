@@ -20,4 +20,26 @@ class NativeProguardRulesTest {
             )
         )
     }
+
+    @Test
+    fun keepsQnnRuntimeControlCallbackAbiForExternalAdapter() {
+        val rules = File("proguard-rules.pro").readText().replace("\r\n", "\n")
+
+        listOf(
+            "com.lumasr.domain.RuntimeInferenceControlProvider",
+            "com.lumasr.domain.RuntimeInferenceControl",
+            "com.lumasr.domain.QnnPerformanceMode"
+        ).forEach { className ->
+            assertTrue(
+                "$className is read by the external QNN adapter and must survive R8.",
+                rules.contains(
+                    """
+                    -keep class $className {
+                        *;
+                    }
+                    """.trimIndent()
+                )
+            )
+        }
+    }
 }

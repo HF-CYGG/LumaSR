@@ -9,11 +9,37 @@ import org.junit.Test
 
 class OnDeviceCalibrationCoordinatorTest {
     @Test
+    fun forwardsProgressReporterToTheRequestExecutor() = runBlocking {
+        var forwardedReporter: CalibrationProgressReporter? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = object : CalibrationRequestExecutor {
+                override suspend fun execute(
+                    request: InferenceCalibrationRequest,
+                    progressReporter: CalibrationProgressReporter
+                ): CalibrationRunResult {
+                    forwardedReporter = progressReporter
+                    return CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+                }
+            },
+            device = device(),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+        val reporter = CalibrationProgressReporter { }
+
+        coordinator.run(model(), File("build/models/waifu").absolutePath, reporter)
+
+        assertTrue(forwardedReporter === reporter)
+    }
+
+    @Test
     fun buildsModelSpecificLocalRequestWithCompleteIdentity() = runBlocking {
         var captured: InferenceCalibrationRequest? = null
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = FakeRepository(),
-            executor = CalibrationRequestExecutor { request ->
+            executor = CalibrationRequestExecutor { request, _ ->
                 captured = request
                 CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
             },
@@ -37,6 +63,87 @@ class OnDeviceCalibrationCoordinatorTest {
         assertEquals(File("build/models/waifu").absolutePath, request.baseParams.modelDir)
         assertEquals(AccelerationMode.VULKAN, request.baseParams.accelerationMode)
         assertFalse(request.baseParams.tta)
+        assertTrue(request.supportsTta)
+    }
+
+    @Test
+    fun exposesAdrenoIdentityAndForwardsRequestedCalibrationMode() = runBlocking {
+        var captured: InferenceCalibrationRequest? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = CalibrationRequestExecutor { request, _ ->
+                captured = request
+                CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+            },
+            device = adrenoDevice(),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+
+        coordinator.run(
+            model = model(),
+            resolvedModelDir = File("build/models/waifu").absolutePath,
+            mode = CalibrationMode.DEEP
+        )
+
+        assertTrue(coordinator.supportsAdrenoCalibration)
+        assertEquals(adrenoDevice().acceleratorCalibrationKey, coordinator.acceleratorCalibrationKey)
+        assertEquals(CalibrationMode.DEEP, requireNotNull(captured).mode)
+    }
+
+    @Test
+    fun deepCalibrationReusesValidQuickStandardProfileAsSeed() = runBlocking {
+        val repository = FakeRepository()
+        val device = adrenoDevice()
+        val model = model()
+        val identity = BenchmarkIdentityFactory.create(
+            modelId = model.id,
+            engine = model.engine,
+            modelArtifactHash = ModelArtifactIdentityFactory.create(model),
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            device = device,
+            rawDeviceFingerprint = "fingerprint"
+        )
+        val tuning = VulkanExecutionTuning(
+            useSubgroupOps = false,
+            useShaderLocalMemory = true,
+            useWinogradConvolution = true,
+            useSgemmConvolution = true
+        )
+        val profile = CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.STANDARD,
+            tileSize = 256,
+            commandBatchSize = 2,
+            tuning = tuning
+        )
+        repository.value = InferenceBenchmarkResult(
+            identity = identity,
+            fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
+            recommendedCommandBatchSize = 2,
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 3_000L,
+            vulkanProfiles = listOf(profile),
+            calibrationMode = CalibrationMode.QUICK
+        )
+        var captured: InferenceCalibrationRequest? = null
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = repository,
+            executor = CalibrationRequestExecutor { request, _ ->
+                captured = request
+                CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
+            },
+            device = device,
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile,
+            clock = { 2_000L }
+        )
+
+        coordinator.run(model, File("build/models").absolutePath, CalibrationMode.DEEP)
+
+        assertEquals(256, requireNotNull(captured).baseParams.tileSize)
+        assertEquals(tuning, requireNotNull(captured).baseParams.vulkanTuning)
     }
 
     @Test
@@ -44,7 +151,7 @@ class OnDeviceCalibrationCoordinatorTest {
         val repository = FakeRepository()
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = repository,
-            executor = CalibrationRequestExecutor { error("not used") },
+            executor = CalibrationRequestExecutor { _, _ -> error("not used") },
             device = device(),
             rawDeviceFingerprint = "fingerprint",
             runtimeBuildKey = "app-1:test:arm64-v8a",
@@ -63,11 +170,18 @@ class OnDeviceCalibrationCoordinatorTest {
             identity = identity,
             fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
             recommendedCommandBatchSize = 4,
+            vulkanTiers = ResolutionTier.entries.map { tier ->
+                CalibratedVulkanTier(
+                    resolutionTier = tier,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
+            },
             measuredAtEpochMs = 1_000L,
             validUntilEpochMs = 1_500L
         )
 
         assertTrue(coordinator.hasValidCalibration(model()))
+        assertEquals(CalibrationPerformanceGrade.COMPATIBLE, coordinator.calibrationGrade(model()))
         assertFalse(coordinator.hasValidCalibration(model().copy(id = "another-model")))
     }
 
@@ -76,7 +190,7 @@ class OnDeviceCalibrationCoordinatorTest {
         var invoked = false
         val coordinator = OnDeviceCalibrationCoordinator(
             repository = FakeRepository(),
-            executor = CalibrationRequestExecutor {
+            executor = CalibrationRequestExecutor { _, _ ->
                 invoked = true
                 error("must not run")
             },
@@ -94,6 +208,63 @@ class OnDeviceCalibrationCoordinatorTest {
             result
         )
         assertFalse(invoked)
+    }
+
+    @Test
+    fun deepCalibrationWithConfirmedStandardCheckpointRemainsValid() = runBlocking {
+        val repository = FakeRepository()
+        val coordinator = coordinator(repository = repository, clock = { 1_500L })
+        val model = model()
+        repository.value = InferenceBenchmarkResult(
+            identity = BenchmarkIdentityFactory.create(
+                modelId = model.id,
+                engine = model.engine,
+                modelArtifactHash = ModelArtifactIdentityFactory.create(model),
+                runtimeBuildKey = "app-1:test:arm64-v8a",
+                device = device(),
+                rawDeviceFingerprint = "fingerprint"
+            ),
+            fp16Quality = Fp16QualityMetrics(0.999, 48.0, 1),
+            recommendedCommandBatchSize = 1,
+            vulkanTiers = listOf(
+                CalibratedVulkanTier(
+                    resolutionTier = ResolutionTier.STANDARD,
+                    decision = VulkanCalibrationDecision.PERFORMANCE_REJECTED,
+                    baselineDurationNanos = 1_000L,
+                    bestCandidateDurationNanos = 1_000L
+                )
+            ),
+            measuredAtEpochMs = 1_000L,
+            validUntilEpochMs = 2_000L,
+            calibrationMode = CalibrationMode.DEEP
+        )
+
+        assertTrue(coordinator.hasValidCalibration(model))
+    }
+
+    @Test
+    fun lowGpuRoughScoreDoesNotPreemptSafetyCalibration() = runBlocking {
+        var invoked = false
+        val coordinator = OnDeviceCalibrationCoordinator(
+            repository = FakeRepository(),
+            executor = CalibrationRequestExecutor { _, _ ->
+                invoked = true
+                CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED)
+            },
+            device = device().copy(gpuRoughScore = 21),
+            rawDeviceFingerprint = "fingerprint",
+            runtimeBuildKey = "app-1:test:arm64-v8a",
+            calibrationDirectory = File("build/on-device-calibration").absoluteFile
+        )
+
+        val result = coordinator.run(model(), File("build/models").absolutePath)
+
+        assertTrue(coordinator.isSupported)
+        assertTrue(invoked)
+        assertEquals(
+            CalibrationRunResult.Failed(CalibrationFailureReason.QUALITY_REJECTED),
+            result
+        )
     }
 
     @Test
@@ -124,7 +295,7 @@ class OnDeviceCalibrationCoordinatorTest {
     }
 
     @Test
-    fun validCalibrationRequiresFp16QualityEligibility() = runBlocking {
+    fun validSafeOnlyCalibrationDoesNotRequireFp16QualityEligibility() = runBlocking {
         val repository = FakeRepository()
         val coordinator = coordinator(repository = repository, clock = { 1_500L })
         repository.value = InferenceBenchmarkResult(
@@ -138,11 +309,17 @@ class OnDeviceCalibrationCoordinatorTest {
             ),
             fp16Quality = Fp16QualityMetrics(0.99, 39.0, 4),
             recommendedCommandBatchSize = 4,
+            vulkanTiers = ResolutionTier.entries.map { tier ->
+                CalibratedVulkanTier(
+                    resolutionTier = tier,
+                    decision = VulkanCalibrationDecision.QUALITY_REJECTED
+                )
+            },
             measuredAtEpochMs = 1_000L,
             validUntilEpochMs = 2_000L
         )
 
-        assertFalse(coordinator.hasValidCalibration(model()))
+        assertTrue(coordinator.hasValidCalibration(model()))
     }
 
     private fun coordinator(
@@ -152,7 +329,7 @@ class OnDeviceCalibrationCoordinatorTest {
         clock: () -> Long = { 1_500L }
     ) = OnDeviceCalibrationCoordinator(
         repository = repository,
-        executor = CalibrationRequestExecutor {
+        executor = CalibrationRequestExecutor { _, _ ->
             error("unsupported calibration must not invoke executor")
         },
         device = device,
@@ -199,6 +376,29 @@ class OnDeviceCalibrationCoordinatorTest {
         supportsVulkan = true,
         supportsFp16Storage = true,
         supportsFp16Arithmetic = true
+    )
+
+    private fun adrenoDevice() = device().copy(
+        gpuVendor = "Qualcomm",
+        gpuDevice = "Adreno",
+        vulkanCapabilities = VulkanDeviceCapabilities(
+            vendorId = VulkanDeviceCapabilities.QUALCOMM_VENDOR_ID,
+            deviceId = 1L,
+            apiVersion = 1L,
+            driverId = 1L,
+            driverVersion = 1L,
+            pipelineCacheUuid = "0123456789abcdef0123456789abcdef",
+            subgroupSize = 64,
+            subgroupMinSize = 64,
+            subgroupMaxSize = 128,
+            computeQueueCount = 1,
+            maxComputeSharedMemoryBytes = 32_768L,
+            supportsSubgroupOps = true,
+            supportsSubgroupSizeControl = true,
+            supportsComputeFullSubgroups = true,
+            driverQuirks = VulkanDriverQuirks(false, false, false, false)
+        ),
+        acceleratorCalibrationKey = "adreno-capability-v1:${"a".repeat(64)}"
     )
 
     private class FakeRepository : InferenceBenchmarkRepository {

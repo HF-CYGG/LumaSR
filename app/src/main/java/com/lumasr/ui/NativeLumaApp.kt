@@ -304,7 +304,7 @@ private fun ParameterSlider(title: String, value: Int, values: List<Int>, onChan
 @OptIn(ExperimentalLayoutApi::class)
 private fun AccelerationChips(selected: AccelerationMode, onSelected: (AccelerationMode) -> Unit) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        AccelerationMode.entries.forEach { mode ->
+        AccelerationMode.entries.filterNot { it == AccelerationMode.QNN_HTP }.forEach { mode ->
             FilterChip(selected = selected == mode, onClick = { onSelected(mode) }, label = { Text(mode.labelCn()) })
         }
     }

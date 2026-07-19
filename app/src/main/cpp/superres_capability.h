@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 
@@ -49,10 +50,47 @@ struct SuperResNativeCapabilitySnapshot {
     std::string gpuDevice;
     std::string gpuDriverVersion;
     int gpuRoughScore = -1;
+    long long gpuVendorId = -1;
+    long long gpuDeviceId = -1;
+    long long gpuApiVersion = -1;
+    long long gpuDriverId = -1;
+    long long gpuDriverVersionRaw = -1;
+    std::string pipelineCacheUuid;
+    int subgroupSize = -1;
+    int subgroupMinSize = -1;
+    int subgroupMaxSize = -1;
+    int computeQueueCount = -1;
+    long long maxComputeSharedMemoryBytes = -1;
+    bool supportsSubgroupOps = false;
+    bool supportsSubgroupSizeControl = false;
+    bool supportsComputeFullSubgroups = false;
+    bool corruptedOnlinePipelineCache = false;
+    bool storageBufferNoL1 = false;
+    bool bufferImageLoadZero = false;
+    bool implicitFp16Arithmetic = false;
     bool supportsVulkan = false;
     bool supportsFp16Storage = false;
     bool supportsFp16Arithmetic = false;
 };
+
+constexpr bool is_qualcomm_vulkan_vendor(std::uint32_t vendorId) {
+    return vendorId == 0x5143u;
+}
+
+constexpr long long vulkan_uint32_to_int64(std::uint32_t value) {
+    return static_cast<long long>(value);
+}
+
+inline std::string pipeline_cache_uuid_hex(const unsigned char* uuid) {
+    if (uuid == nullptr) return {};
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded(32, '0');
+    for (std::size_t index = 0; index < 16; ++index) {
+        encoded[index * 2] = kHex[(uuid[index] >> 4) & 0x0f];
+        encoded[index * 2 + 1] = kHex[uuid[index] & 0x0f];
+    }
+    return encoded;
+}
 
 constexpr SuperResCpuTopology normalize_cpu_topology(
     int physicalCoreCount,

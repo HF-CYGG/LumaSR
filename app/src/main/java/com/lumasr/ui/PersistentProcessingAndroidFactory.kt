@@ -1,13 +1,17 @@
 package com.lumasr.ui
 
 import android.content.Context
+import com.lumasr.data.AndroidRuntimeResourceSource
+import com.lumasr.data.AndroidThermalSignalSource
 import com.lumasr.data.FileProcessingTaskRepository
 import com.lumasr.data.FileProcessingWorkSpecRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ProcessingTaskSubmissionStore
-import com.lumasr.data.AndroidThermalSignalSource
 import com.lumasr.data.ThermalSampler
 import com.lumasr.domain.ApplicationProcessingSnapshotBridge
+import com.lumasr.domain.ProcessingExecutionProfileResolver
+import com.lumasr.domain.RuntimePipelineResourceProvider
+import com.lumasr.domain.ThermalLevel
 import com.lumasr.service.ApplicationForegroundProcessingRuntime
 import com.lumasr.service.ForegroundProcessingRuntime
 import com.lumasr.service.ProcessingServiceClient
@@ -29,11 +33,14 @@ internal fun createPersistentProcessingController(context: Context): PersistentP
         serviceClient = serviceClient
     )
     val thermalSampler = ThermalSampler(AndroidThermalSignalSource(appContext))
+    val runtimeResourceSource = AndroidRuntimeResourceSource(appContext)
     val executionProfileResolver = createInferenceExecutionProfileResolver(appContext)
-    val foregroundRuntime = ApplicationForegroundProcessingRuntime.getOrCreate(
+    val foregroundRuntime = createPersistentForegroundRuntime(
         taskDirectory = taskDirectory,
         thermalLevelProvider = thermalSampler::sampleLevel,
-        executionProfileResolver = executionProfileResolver
+        runtimeResourceProvider = runtimeResourceSource,
+        executionProfileResolver = executionProfileResolver,
+        runtimeFactory = ApplicationForegroundProcessingRuntime::getOrCreate
     )
     return PersistentProcessingController(
         taskRepository = taskRepository,
@@ -44,6 +51,24 @@ internal fun createPersistentProcessingController(context: Context): PersistentP
         snapshots = ApplicationProcessingSnapshotBridge.snapshots
     )
 }
+
+internal fun <T> createPersistentForegroundRuntime(
+    taskDirectory: File,
+    thermalLevelProvider: () -> ThermalLevel?,
+    runtimeResourceProvider: RuntimePipelineResourceProvider,
+    executionProfileResolver: ProcessingExecutionProfileResolver?,
+    runtimeFactory: (
+        File,
+        () -> ThermalLevel?,
+        RuntimePipelineResourceProvider,
+        ProcessingExecutionProfileResolver?
+    ) -> T
+): T = runtimeFactory(
+    taskDirectory,
+    thermalLevelProvider,
+    runtimeResourceProvider,
+    executionProfileResolver
+)
 
 private class AndroidPersistentProcessingServiceGateway(
     private val client: ProcessingServiceClient

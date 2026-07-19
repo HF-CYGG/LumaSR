@@ -33,6 +33,12 @@ android {
             matchingFallbacks += listOf("release")
         }
     }
+
+    sourceSets {
+        getByName("main").java.srcDir(
+            rootProject.file("benchmark-shared/src/main/kotlin")
+        )
+    }
 }
 
 dependencies {

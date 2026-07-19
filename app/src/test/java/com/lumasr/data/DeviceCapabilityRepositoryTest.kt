@@ -1,5 +1,6 @@
 package com.lumasr.data
 
+import com.lumasr.domain.QnnCapabilitySnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -9,6 +10,61 @@ import org.junit.Test
 import java.io.File
 
 class DeviceCapabilityRepositoryTest {
+    @Test
+    fun disabledAndroidQnnProbeNeverLoadsProprietaryAdapter() {
+        var reads = 0
+        val probe = AndroidQnnCapabilityProbe(
+            enabledProvider = { false },
+            sdkIntProvider = { 35 },
+            isArm64Provider = { true },
+            recordReader = {
+                reads += 1
+                NativeQnnCapabilityRecord("provider", "v73", true, false)
+            }
+        )
+
+        val snapshot = probe.snapshot()
+
+        assertFalse(snapshot.isAvailable)
+        assertEquals(0, reads)
+        assertEquals("QNN runtime not packaged", snapshot.unavailableReason)
+    }
+
+    @Test
+    fun malformedAndroidQnnProbeResultFailsClosed() {
+        val probe = AndroidQnnCapabilityProbe(
+            enabledProvider = { true },
+            sdkIntProvider = { 35 },
+            isArm64Provider = { true },
+            recordReader = { NativeQnnCapabilityRecord(" provider ", "htp-v73", true, false) }
+        )
+
+        val snapshot = probe.snapshot()
+
+        assertFalse(snapshot.isAvailable)
+        assertEquals("QNN capability probe failed", snapshot.unavailableReason)
+    }
+
+    @Test
+    fun publishesQnnCapabilityAndInvalidatesProfileWhenProviderBuildChanges() {
+        fun qnn(providerBuildId: String) = QnnCapabilitySnapshot(
+            isAvailable = true,
+            sdkInt = 35,
+            isArm64 = true,
+            providerBuildId = providerBuildId,
+            htpArchitecture = "v73",
+            supportsFp16 = true,
+            supportsA16W8 = false
+        )
+
+        val first = repository(qnnSnapshot = qnn("2.31.0.250130" )).loadProfile()
+        val second = repository(qnnSnapshot = qnn("2.32.0.250228")).loadProfile()
+
+        assertEquals("v73", first.qnnCapabilities?.htpArchitecture)
+        assertTrue(first.qnnCapabilities?.supportsFp16 == true)
+        assertNotEquals(first.profileKey, second.profileKey)
+    }
+
     @Test
     fun assemblesLowRamStateAndStableMemoryBucket() {
         val profile = repository(
@@ -50,6 +106,75 @@ class DeviceCapabilityRepositoryTest {
         assertTrue(profile.supportsVulkan)
         assertTrue(profile.supportsFp16Storage)
         assertTrue(profile.supportsFp16Arithmetic)
+    }
+
+    @Test
+    fun publishesStructuredAdrenoCapabilitiesAndDedicatedCalibrationIdentity() {
+        val profile = repository(
+            nativeSnapshot = NativeCapabilitySnapshot(
+                physicalCoreCount = 8,
+                gpuVendor = "vendor=0x00005143",
+                gpuDevice = "Adreno 840",
+                gpuDriverVersion = "id=0x00000003 version=0x08010000",
+                gpuVendorId = 0x5143L,
+                gpuDeviceId = 0x0840L,
+                gpuApiVersion = 0x00403000L,
+                gpuDriverId = 3L,
+                gpuDriverVersionRaw = 0x08010000L,
+                pipelineCacheUuid = "00112233445566778899aabbccddeeff",
+                subgroupSize = 64,
+                subgroupMinSize = 32,
+                subgroupMaxSize = 128,
+                computeQueueCount = 2,
+                maxComputeSharedMemoryBytes = 32_768L,
+                supportsSubgroupOps = true,
+                supportsSubgroupSizeControl = true,
+                supportsComputeFullSubgroups = true,
+                corruptedOnlinePipelineCache = false,
+                storageBufferNoL1 = true,
+                bufferImageLoadZero = false,
+                implicitFp16Arithmetic = false,
+                supportsVulkan = true,
+                supportsFp16Storage = true,
+                supportsFp16Arithmetic = true
+            )
+        ).loadProfile()
+
+        assertTrue(profile.isQualcommAdreno)
+        assertEquals(0x5143L, profile.vulkanCapabilities?.vendorId)
+        assertEquals(64, profile.vulkanCapabilities?.subgroupSize)
+        assertEquals(2, profile.vulkanCapabilities?.computeQueueCount)
+        assertTrue(profile.vulkanCapabilities?.driverQuirks?.storageBufferNoL1 == true)
+        assertTrue(profile.acceleratorCalibrationKey.orEmpty().startsWith("adreno-capability-v1:"))
+        assertFalse(profile.acceleratorCalibrationKey.orEmpty().contains("Adreno"))
+    }
+
+    @Test
+    fun structuredDriverChangesOnlyAdrenoIdentityAndNonQualcommStaysCompatible() {
+        fun snapshot(vendorId: Long, driverVersion: Long) = NativeCapabilitySnapshot(
+            physicalCoreCount = 8,
+            gpuVendor = if (vendorId == 0x5143L) "Qualcomm" else "ARM",
+            gpuDevice = if (vendorId == 0x5143L) "Adreno" else "Mali",
+            gpuDriverVersion = "stable-display-string",
+            gpuVendorId = vendorId,
+            gpuDeviceId = 7L,
+            gpuDriverId = 3L,
+            gpuDriverVersionRaw = driverVersion,
+            supportsVulkan = true,
+            supportsFp16Storage = true,
+            supportsFp16Arithmetic = true
+        )
+
+        val adrenoV1 = repository(nativeSnapshot = snapshot(0x5143L, 1L)).loadProfile()
+        val adrenoV2 = repository(nativeSnapshot = snapshot(0x5143L, 2L)).loadProfile()
+        val maliV1 = repository(nativeSnapshot = snapshot(0x13B5L, 1L)).loadProfile()
+        val maliV2 = repository(nativeSnapshot = snapshot(0x13B5L, 2L)).loadProfile()
+
+        assertEquals(adrenoV1.profileKey, adrenoV2.profileKey)
+        assertNotEquals(adrenoV1.acceleratorCalibrationKey, adrenoV2.acceleratorCalibrationKey)
+        assertEquals(maliV1.profileKey, maliV2.profileKey)
+        assertNull(maliV1.acceleratorCalibrationKey)
+        assertNull(maliV2.acceleratorCalibrationKey)
     }
 
     @Test
@@ -103,7 +228,8 @@ class DeviceCapabilityRepositoryTest {
             rules.contains(
                 "public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer," +
                     "java.lang.String,java.lang.String,java.lang.String,java.lang.Integer," +
-                    "boolean,boolean,boolean);"
+                    "long,long,long,long,long,java.lang.String,int,int,int,int,long," +
+                    "boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean);"
             )
         )
     }
@@ -171,10 +297,21 @@ class DeviceCapabilityRepositoryTest {
             supportsVulkan = true,
             supportsFp16Storage = true,
             supportsFp16Arithmetic = true
+        ),
+        qnnSnapshot: QnnCapabilitySnapshot = QnnCapabilitySnapshot(
+            isAvailable = false,
+            sdkInt = androidSnapshot.sdkInt,
+            isArm64 = true,
+            providerBuildId = null,
+            htpArchitecture = null,
+            supportsFp16 = false,
+            supportsA16W8 = false,
+            unavailableReason = "QNN runtime not packaged"
         )
     ) = DeviceCapabilityRepository(
         androidSource = AndroidCapabilitySource { androidSnapshot },
-        nativeProbe = NativeCapabilityProbe { nativeSnapshot }
+        nativeProbe = NativeCapabilityProbe { nativeSnapshot },
+        qnnProbe = QnnCapabilityProbe { qnnSnapshot }
     )
 
     private fun androidSnapshot(

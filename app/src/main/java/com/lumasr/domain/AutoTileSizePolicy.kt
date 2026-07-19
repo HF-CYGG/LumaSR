@@ -11,10 +11,11 @@ object AutoTileSizePolicy {
         resourceProfile: ProcessingResourceProfile = ProcessingResourceProfile(
             imageWidth = imageWidth,
             imageHeight = imageHeight
-        )
+        ),
+        fallbackTileSize: Int = UpscaleParamsFactory.DEFAULT_TILE_SIZE
     ): Int {
         if (model == null || imageWidth == null || imageHeight == null || imageWidth <= 0 || imageHeight <= 0) {
-            return UpscaleParamsFactory.DEFAULT_TILE_SIZE
+            return UpscaleParamsFactory.sanitizeTileSize(fallbackTileSize)
         }
 
         val outputPixels = resourceProfile.outputPixelsFor(model.sanitizeTargetScale(scale))

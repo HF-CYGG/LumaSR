@@ -2,22 +2,99 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(localsr)
 
+if(NOT ANDROID)
+    include(CTest)
+    find_package(Threads REQUIRED)
+    if(NOT DEFINED SUPERRES_STB_INCLUDE_DIR)
+        set(SUPERRES_STB_INCLUDE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.deps/sources/waifu2x-ncnn-vulkan/src"
+        )
+    endif()
+    if(NOT EXISTS "${SUPERRES_STB_INCLUDE_DIR}/stb_image.h")
+        message(FATAL_ERROR
+            "stb_image.h not found for host checks. Set SUPERRES_STB_INCLUDE_DIR."
+        )
+    endif()
+    add_executable(superres_rgb_image_checks_host
+        superres_atomic_publish.cpp
+        superres_extreme_session.cpp
+        superres_output_finalizer.cpp
+        superres_pipeline_internal.cpp
+        superres_pipeline_cache_store.cpp
+        superres_process_internal.cpp
+        superres_rgb_image.cpp
+        superres_rgb_output_target.cpp
+        superres_rgb_output_target_writer.cpp
+        superres_png_writer.cpp
+        superres_stbi_decode.cpp
+        superres_task_registry.cpp
+        superres_rgb_image_checks.cpp
+        superres_extreme_session_checks.cpp
+        superres_rgb_output_target_checks.cpp
+        superres_rgb_transport_checks.cpp
+        superres_pipeline_internal_checks.cpp
+        superres_pipeline_cache_store_checks.cpp
+        superres_execution_profile_checks.cpp
+        superres_ncnn_stage_contract_checks.cpp
+        superres_ordered_pipeline.cpp
+        superres_ordered_pipeline_checks.cpp
+        superres_tta_micro_batch_checks.cpp
+        superres_host_checks.cpp
+        tests/stb_image_host.cpp
+        tests/superres_rgb_image_checks_main.cpp
+        tests/zlib_stub.cpp
+    )
+    target_compile_features(superres_rgb_image_checks_host PRIVATE cxx_std_17)
+    target_include_directories(superres_rgb_image_checks_host PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${SUPERRES_STB_INCLUDE_DIR}
+    )
+    target_link_libraries(superres_rgb_image_checks_host PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(superres_rgb_image_checks_host PRIVATE /W4 /WX)
+    else()
+        target_compile_options(superres_rgb_image_checks_host PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME superres_rgb_image_checks COMMAND superres_rgb_image_checks_host)
+    return()
+endif()
+
 if(NOT DEFINED NCNN_ROOT)
     set(NCNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.deps/native/ncnn")
 endif()
 
 add_library(localsr SHARED
     superres_jni.cpp
+    superres_extreme_session.cpp
     superres_engine.cpp
+    superres_process_internal.cpp
+    superres_rgb_image.cpp
+    superres_rgb_image_checks.cpp
+    superres_extreme_session_checks.cpp
+    superres_rgb_output_target.cpp
+    superres_rgb_output_target_writer.cpp
+    superres_rgb_output_target_checks.cpp
+    superres_rgb_transport_checks.cpp
+    superres_pipeline_internal.cpp
+    superres_pipeline_cache_store.cpp
+    superres_pipeline_internal_checks.cpp
+    superres_pipeline_cache_store_checks.cpp
+    superres_stbi_decode.cpp
     superres_capability_checks.cpp
     superres_execution_profile_checks.cpp
     superres_runtime_control_checks.cpp
     superres_png_streamer.cpp
     superres_atomic_publish.cpp
+    superres_output_finalizer.cpp
     superres_atomic_publish_checks.cpp
     superres_task_registry.cpp
     superres_task_registry_checks.cpp
     superres_d4_tta_checks.cpp
+    superres_ncnn_stage_contract_checks.cpp
+    superres_ordered_pipeline.cpp
+    superres_ordered_pipeline_checks.cpp
+    superres_tta_micro_batch_checks.cpp
     superres_tile_geometry_checks.cpp
     superres_pixel_io_checks.cpp
     superres_png_writer.cpp

@@ -154,6 +154,15 @@ unsigned int next_random(unsigned int& state) {
 }  // namespace
 
 bool run_pixel_io_runtime_checks() {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (superres_pixel_io_simd_lane_count() != 16) {
+        return false;
+    }
+#else
+    if (superres_pixel_io_simd_lane_count() != 1) {
+        return false;
+    }
+#endif
     const std::array<unsigned char, 12> boundarySource{
         0, 17, 255,
         63, 127, 191,

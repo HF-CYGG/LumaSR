@@ -2,6 +2,7 @@ package com.lumasr.processor
 
 import com.lumasr.domain.AccelerationMode
 import com.lumasr.domain.OutputFormat
+import com.lumasr.domain.InferenceStopReason
 import com.lumasr.domain.RuntimeInferenceControl
 import com.lumasr.domain.RuntimeInferenceControlProvider
 import com.lumasr.domain.SuperResEngine
@@ -80,6 +81,22 @@ class MockSuperResProcessorTest {
         )
 
         assertEquals(1, completedTiles)
+        assertEquals(UpscaleStage.CANCELLED, result.stage)
+    }
+
+    @Test
+    fun thermalPauseReasonMarksTaskAsCancelled() = runBlocking {
+        val processor = MockSuperResProcessor(tileCount = 8, delayMs = 1)
+
+        val result = processor.process(defaultParams()) { progress ->
+            if (progress.currentTile == 2) {
+                processor.cancel(
+                    progress.taskId,
+                    InferenceStopReason.THERMAL_CRITICAL_PAUSE
+                )
+            }
+        }
+
         assertEquals(UpscaleStage.CANCELLED, result.stage)
     }
 

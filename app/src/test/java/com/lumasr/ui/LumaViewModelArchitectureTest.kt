@@ -26,10 +26,11 @@ class LumaViewModelArchitectureTest {
     fun resolvesCalibratedExecutionFieldsBeforePersistingEveryWorkSpec() {
         val source = File("src/main/java/com/lumasr/ui/LumaViewModel.kt").readText()
         val resolveIndex = source.indexOf("executionProfileResolver.resolve(")
-        val persistIndex = source.indexOf("ProcessingWorkSpec.fromParams(model.id, params)")
+        val persistIndex = source.indexOf("ProcessingWorkSpec.fromParams(")
 
         assertTrue(resolveIndex >= 0)
         assertTrue(persistIndex > resolveIndex)
+        assertTrue(source.contains("outputPixels = profile.outputPixelsFor(budgetDecision.scale)"))
     }
 
     @Test
@@ -37,9 +38,18 @@ class LumaViewModelArchitectureTest {
         val source = File("src/main/java/com/lumasr/ui/LumaViewModel.kt").readText()
 
         assertTrue(source.contains("fun skipCalibrationPrompt()"))
-        assertTrue(source.contains("fun runCalibration()"))
+        assertTrue(source.contains("fun runCalibration("))
+        assertTrue(source.contains("mode: CalibrationMode"))
         assertTrue(source.contains("withContext(ioDispatcher)"))
         assertTrue(source.contains("calibrationCoordinator.run("))
+        assertTrue(source.contains("CalibrationProgressReporter"))
+        assertTrue(source.contains("calibrationTickerJob"))
+        assertTrue(source.contains("applyCalibrationProgress"))
+        assertTrue(source.contains("finishCalibrationDialog"))
+        assertTrue(source.contains("fun dismissCalibrationDialog()"))
+        assertTrue(source.contains("FileCalibrationReportRepository"))
+        assertTrue(source.contains("calibrationReportRepository.save"))
+        assertTrue(source.contains("acceleratorCalibrationKey"))
     }
 
     @Test

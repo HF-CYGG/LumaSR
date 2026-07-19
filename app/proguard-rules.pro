@@ -13,5 +13,35 @@
 }
 
 -keep class com.lumasr.data.NativeCapabilitySnapshot {
-    public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer,java.lang.String,java.lang.String,java.lang.String,java.lang.Integer,boolean,boolean,boolean);
+    public <init>(java.lang.Integer,java.lang.Integer,java.lang.Integer,java.lang.String,java.lang.String,java.lang.String,java.lang.Integer,long,long,long,long,long,java.lang.String,int,int,int,int,long,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean);
+}
+
+# Optional QAIRT adapter uses name-based JNI only when the external QNN package is enabled.
+-keep class com.lumasr.data.QnnCapabilityJni {
+    native <methods>;
+}
+
+-keep class com.lumasr.data.NativeQnnCapabilityRecord {
+    public <init>(java.lang.String,java.lang.String,boolean,boolean);
+}
+
+-keep class com.lumasr.processor.JniQnnProcessBridge {
+    private native <methods>;
+}
+
+-keep class com.lumasr.processor.QnnProgressSink {
+    *;
+}
+
+# The external QAIRT adapter reads this runtime-control callback and its returned values by name.
+-keep class com.lumasr.domain.RuntimeInferenceControlProvider {
+    *;
+}
+
+-keep class com.lumasr.domain.RuntimeInferenceControl {
+    *;
+}
+
+-keep class com.lumasr.domain.QnnPerformanceMode {
+    *;
 }

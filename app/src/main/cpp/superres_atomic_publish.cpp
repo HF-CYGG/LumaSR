@@ -3,12 +3,20 @@
 #include <cstdio>
 #include <filesystem>
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
 bool sync_parent_directory(const std::string& outputPath) {
+#if defined(_WIN32)
+    // Host checks exercise the production rename path. Android keeps the durable directory fsync
+    // below; the Windows CRT has no portable equivalent for syncing a directory handle.
+    (void)outputPath;
+    return true;
+#else
     try {
         std::filesystem::path parent = std::filesystem::path(outputPath).parent_path();
         if (parent.empty()) parent = ".";
@@ -20,6 +28,7 @@ bool sync_parent_directory(const std::string& outputPath) {
     } catch (...) {
         return false;
     }
+#endif
 }
 
 } // namespace

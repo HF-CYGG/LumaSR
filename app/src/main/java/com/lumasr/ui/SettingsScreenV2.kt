@@ -40,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lumasr.domain.AccelerationMode
+import com.lumasr.domain.CalibrationReportOutcome
 import com.lumasr.domain.SuperResEngine
 import com.lumasr.domain.TileSizeMode
 import com.lumasr.domain.availableTargetScales
@@ -54,6 +55,9 @@ fun SettingsScreenV2(
     onTileSizeChanged: (Int) -> Unit,
     onTileSizeAutoSelected: () -> Unit,
     onRunCalibration: () -> Unit,
+    onRunQuickCalibration: () -> Unit = onRunCalibration,
+    onRunDeepCalibration: () -> Unit = onRunCalibration,
+    onOpenCalibrationReport: (String) -> Unit = {},
     appVersionLabel: String? = null
 ) {
     val gpuEnabled = state.accelerationMode != AccelerationMode.CPU
@@ -91,13 +95,30 @@ fun SettingsScreenV2(
                     onAccelerationChanged(if (gpuEnabled) AccelerationMode.CPU else AccelerationMode.AUTO)
                 }
             )
-            SettingsClickableRowV2(
-                icon = Icons.Rounded.Memory,
-                title = "本机性能校准",
-                subtitle = calibrationStatusText(state.calibrationStatus),
-                enabled = isCalibrationActionEnabled(state.calibrationStatus),
-                onClick = onRunCalibration
-            )
+            if (state.adrenoCalibrationAvailable) {
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Memory,
+                    title = "快速性能校准",
+                    subtitle = "约 3 分钟 · STANDARD Vulkan · ${calibrationStatusText(state.calibrationStatus)}",
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunQuickCalibration
+                )
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Tune,
+                    title = "深度性能校准",
+                    subtitle = "约 8 分钟 · 三档 Vulkan / CPU / TTA",
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunDeepCalibration
+                )
+            } else {
+                SettingsClickableRowV2(
+                    icon = Icons.Rounded.Memory,
+                    title = "本机性能校准",
+                    subtitle = calibrationStatusText(state.calibrationStatus),
+                    enabled = isCalibrationActionEnabled(state.calibrationStatus),
+                    onClick = onRunCalibration
+                )
+            }
             SettingsInfoRowV2(
                 icon = Icons.Rounded.Tune,
                 title = "分块大小",
@@ -113,6 +134,18 @@ fun SettingsScreenV2(
                 onTileSizeChanged = onTileSizeChanged,
                 onTileSizeAutoSelected = onTileSizeAutoSelected
             )
+            if (state.calibrationReports.isNotEmpty()) {
+                SectionDivider()
+                SettingsGroupTitleV2("最近校准报告")
+                state.calibrationReports.forEach { report ->
+                    SettingsClickableRowV2(
+                        icon = Icons.Rounded.Memory,
+                        title = "${report.mode.name} · ${calibrationReportOutcomeText(report.outcome)}",
+                        subtitle = "${formatCalibrationDuration(report.elapsedMs)} · ${report.summary}",
+                        onClick = { onOpenCalibrationReport(report.id) }
+                    )
+                }
+            }
             SectionDivider()
             SettingsGroupTitleV2("内置模型")
             state.models.forEach { model ->
@@ -147,6 +180,15 @@ fun SettingsScreenV2(
 
 internal fun formatSettingsVersion(versionName: String, versionCode: Long): String {
     return "\u7248\u672c $versionName ($versionCode)"
+}
+
+internal fun calibrationReportOutcomeText(outcome: CalibrationReportOutcome): String = when (outcome) {
+    CalibrationReportOutcome.SUCCEEDED -> "校准完成"
+    CalibrationReportOutcome.COMPLETED_WITH_FALLBACK -> "带回退完成"
+    CalibrationReportOutcome.DEFERRED -> "暂缓"
+    CalibrationReportOutcome.FAILED -> "校准失败"
+    CalibrationReportOutcome.TIMED_OUT -> "已超时"
+    CalibrationReportOutcome.UNSUPPORTED -> "不支持"
 }
 
 @Composable

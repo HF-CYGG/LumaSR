@@ -1,17 +1,42 @@
 package com.lumasr.domain
 
 import java.io.File
+import kotlinx.coroutines.CancellationException
 
 fun interface CalibrationRequestExecutor {
-    suspend fun execute(request: InferenceCalibrationRequest): CalibrationRunResult
+    suspend fun execute(
+        request: InferenceCalibrationRequest,
+        progressReporter: CalibrationProgressReporter
+    ): CalibrationRunResult
 }
 
 interface DeviceCalibrationCoordinator {
     val isSupported: Boolean
 
-    suspend fun run(model: ModelPack, resolvedModelDir: String): CalibrationRunResult
+    val supportsAdrenoCalibration: Boolean
+        get() = false
+
+    val acceleratorCalibrationKey: String?
+        get() = null
+
+    suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        progressReporter: CalibrationProgressReporter = CalibrationProgressReporter.NONE
+    ): CalibrationRunResult
+
+    suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        mode: CalibrationMode,
+        progressReporter: CalibrationProgressReporter = CalibrationProgressReporter.NONE
+    ): CalibrationRunResult = run(model, resolvedModelDir, progressReporter)
 
     suspend fun hasValidCalibration(model: ModelPack): Boolean
+
+    suspend fun hasEnabledCalibration(model: ModelPack): Boolean = hasValidCalibration(model)
+
+    suspend fun calibrationGrade(model: ModelPack): CalibrationPerformanceGrade? = null
 }
 
 class OnDeviceCalibrationCoordinator(
@@ -32,29 +57,67 @@ class OnDeviceCalibrationCoordinator(
             device.physicalCoreCount > 0 &&
             device.supportsVulkan &&
             device.supportsFp16Storage &&
-            device.supportsFp16Arithmetic &&
-            device.gpuRoughScore?.let {
-                it >= AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE
-            } == true
+            device.supportsFp16Arithmetic
+
+    override val supportsAdrenoCalibration: Boolean
+        get() = isSupported && device.isQualcommAdreno && acceleratorCalibrationKey != null
+
+    override val acceleratorCalibrationKey: String?
+        get() = device.acceleratorCalibrationKey?.takeIf { device.isQualcommAdreno }
 
     override suspend fun run(
         model: ModelPack,
-        resolvedModelDir: String
+        resolvedModelDir: String,
+        progressReporter: CalibrationProgressReporter
+    ): CalibrationRunResult = run(
+        model = model,
+        resolvedModelDir = resolvedModelDir,
+        mode = CalibrationMode.LEGACY,
+        progressReporter = progressReporter
+    )
+
+    override suspend fun run(
+        model: ModelPack,
+        resolvedModelDir: String,
+        mode: CalibrationMode,
+        progressReporter: CalibrationProgressReporter
     ): CalibrationRunResult {
-        if (!isSupported) {
+        if (!isSupported || (mode != CalibrationMode.LEGACY && !supportsAdrenoCalibration)) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.UNSUPPORTED_DEVICE)
         }
         val measuredAt = clock()
         if (measuredAt < 0L) {
             return CalibrationRunResult.Failed(CalibrationFailureReason.PROBE_FAILED)
         }
+        val benchmarkIdentity = identity(model)
+        val quickSeed = if (mode == CalibrationMode.DEEP) {
+            try {
+                repository.findValid(benchmarkIdentity, measuredAt)
+                    ?.takeIf { it.calibrationMode == CalibrationMode.QUICK }
+                    ?.vulkanProfiles
+                    ?.singleOrNull { it.resolutionTier == ResolutionTier.STANDARD }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+        val baseParams = calibrationParams(model, resolvedModelDir).let { params ->
+            quickSeed?.let { seed ->
+                params.copy(tileSize = seed.tileSize, vulkanTuning = seed.tuning)
+            } ?: params
+        }
         val request = InferenceCalibrationRequest(
-            identity = identity(model),
+            identity = benchmarkIdentity,
             device = device,
-            baseParams = calibrationParams(model, resolvedModelDir),
-            measuredAtEpochMs = measuredAt
+            baseParams = baseParams,
+            measuredAtEpochMs = measuredAt,
+            supportsTta = model.supportsTta,
+            mode = mode
         )
-        return executor.execute(request)
+        return executor.execute(request, progressReporter)
     }
 
     override suspend fun hasValidCalibration(model: ModelPack): Boolean {
@@ -62,8 +125,24 @@ class OnDeviceCalibrationCoordinator(
         val now = clock()
         if (now < 0L) return false
         val result = repository.findValid(identity(model), now) ?: return false
+        val measuredTiers = result.vulkanTiers.map(CalibratedVulkanTier::resolutionTier)
         return result.recommendedCommandBatchSize in SUPPORTED_BATCH_SIZES &&
-            AdaptiveInferencePolicy.isFp16Eligible(device, result.fp16Quality)
+            measuredTiers.distinct().size == measuredTiers.size &&
+            ResolutionTier.STANDARD in measuredTiers
+    }
+
+    override suspend fun hasEnabledCalibration(model: ModelPack): Boolean {
+        if (!hasValidCalibration(model)) return false
+        val now = clock()
+        if (now < 0L) return false
+        return repository.findValid(identity(model), now)?.hasEnabledOptimizations == true
+    }
+
+    override suspend fun calibrationGrade(model: ModelPack): CalibrationPerformanceGrade? {
+        if (!hasValidCalibration(model)) return null
+        val now = clock()
+        if (now < 0L) return null
+        return repository.findValid(identity(model), now)?.overallGrade
     }
 
     private fun identity(model: ModelPack): BenchmarkIdentity = BenchmarkIdentityFactory.create(

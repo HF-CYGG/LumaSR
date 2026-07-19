@@ -386,14 +386,25 @@ class AdaptiveInferencePolicyTest {
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity.copy(),
             currentSafeTileSize = 512,
-            nowEpochMs = NOW_EPOCH_MS
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = standardVulkanProfile(
+                commandBatchSize = 2,
+                tuning = VulkanExecutionTuning(
+                    useSubgroupOps = false,
+                    useShaderLocalMemory = true,
+                    useWinogradConvolution = false,
+                    useSgemmConvolution = true
+                )
+            )
         )
 
         assertEquals(NativeBackend.OPTIMIZED, optimized.backend)
         assertEquals(AccelerationMode.VULKAN, optimized.accelerationMode)
         assertEquals(InferencePrecision.FP16, optimized.precision)
-        assertEquals(3, optimized.commandBatchSize)
+        assertEquals(2, optimized.commandBatchSize)
         assertEquals(2, optimized.modelCacheCapacity)
+        assertFalse(optimized.vulkanTuning.useSubgroupOps)
+        assertFalse(optimized.vulkanTuning.useWinogradConvolution)
 
         val stale = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -402,7 +413,8 @@ class AdaptiveInferencePolicyTest {
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity.copy(gpuDriverVersion = "driver-v2"),
             currentSafeTileSize = 512,
-            nowEpochMs = NOW_EPOCH_MS
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = standardVulkanProfile(commandBatchSize = 2)
         )
 
         assertEquals(NativeBackend.LEGACY_SAFE, stale.backend)
@@ -418,7 +430,6 @@ class AdaptiveInferencePolicyTest {
             device().copy(supportsVulkan = false) to passingBenchmark,
             device().copy(supportsFp16Storage = false) to passingBenchmark,
             device().copy(supportsFp16Arithmetic = false) to passingBenchmark,
-            device().copy(gpuRoughScore = null) to passingBenchmark,
             device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(ssim = 0.9949)),
             device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(psnrDb = 39.99)),
             device() to passingBenchmark.copy(fp16Quality = passingQuality().copy(p99ChannelError = 4))
@@ -432,7 +443,8 @@ class AdaptiveInferencePolicyTest {
                 benchmarkResult = benchmark,
                 currentBenchmarkIdentity = identity,
                 currentSafeTileSize = 256,
-                nowEpochMs = NOW_EPOCH_MS
+                nowEpochMs = NOW_EPOCH_MS,
+                calibratedVulkanProfile = standardVulkanProfile()
             )
 
             assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
@@ -470,7 +482,8 @@ class AdaptiveInferencePolicyTest {
                 benchmarkResult = benchmark,
                 currentBenchmarkIdentity = identity,
                 currentSafeTileSize = 256,
-                nowEpochMs = NOW_EPOCH_MS
+                nowEpochMs = NOW_EPOCH_MS,
+                calibratedVulkanProfile = standardVulkanProfile()
             )
 
             assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
@@ -487,7 +500,8 @@ class AdaptiveInferencePolicyTest {
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = 256,
-            nowEpochMs = NOW_EPOCH_MS
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = standardVulkanProfile()
         )
         assertEquals(AccelerationMode.CPU, explicitCpu.accelerationMode)
     }
@@ -512,7 +526,8 @@ class AdaptiveInferencePolicyTest {
                 benchmarkResult = benchmarkResult(identity),
                 currentBenchmarkIdentity = identity,
                 currentSafeTileSize = 256,
-                nowEpochMs = NOW_EPOCH_MS
+                nowEpochMs = NOW_EPOCH_MS,
+                calibratedVulkanProfile = standardVulkanProfile()
             )
 
             assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
@@ -532,7 +547,8 @@ class AdaptiveInferencePolicyTest {
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = 512,
-            nowEpochMs = NOW_EPOCH_MS
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = standardVulkanProfile()
         )
         val uncalibrated = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -553,7 +569,7 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
-    fun ttaKeepsSelectionButForcesSafeTileAndSingleCommandBatch() {
+    fun ordinaryBenchmarkForcesTtaOntoSafeTileAndSingleCommandBatch() {
         val identity = benchmarkIdentity()
         val selected = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device(),
@@ -565,8 +581,8 @@ class AdaptiveInferencePolicyTest {
             nowEpochMs = NOW_EPOCH_MS
         )
 
-        assertEquals(NativeBackend.OPTIMIZED, selected.backend)
-        assertEquals(InferencePrecision.FP16, selected.precision)
+        assertEquals(NativeBackend.LEGACY_SAFE, selected.backend)
+        assertEquals(InferencePrecision.FP32, selected.precision)
         assertTrue(selected.tta)
         assertEquals(256, selected.tileSize)
         assertEquals(1, selected.commandBatchSize)
@@ -574,32 +590,80 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
-    fun gpuRoughScoreThresholdIsInclusiveAt75() {
+    fun validMeasuredTierProfileOverridesLowGpuRoughScoreButMissingProfileStaysSafe() {
         val identity = benchmarkIdentity()
-        val belowThreshold = AdaptiveInferencePolicy.selectExecutionProfile(
-            device = device().copy(gpuRoughScore = AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE - 1),
+        val benchmark = benchmarkResult(identity)
+        val measuredProfile = CalibratedVulkanProfile(
+            resolutionTier = ResolutionTier.STANDARD,
+            tileSize = 128,
+            commandBatchSize = 2
+        )
+        val calibrated = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = 21),
             accelerationMode = AccelerationMode.VULKAN,
             ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = measuredProfile
+        )
+        val missingTierEvidence = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = 21),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = false,
+            benchmarkResult = benchmark,
+            currentBenchmarkIdentity = identity,
+            currentSafeTileSize = 512,
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedVulkanProfile = null
+        )
+
+        assertEquals(NativeBackend.OPTIMIZED, calibrated.backend)
+        assertEquals(InferencePrecision.FP16, calibrated.precision)
+        assertEquals(128, calibrated.tileSize)
+        assertEquals(2, calibrated.commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, missingTierEvidence.backend)
+        assertEquals(InferencePrecision.FP32, missingTierEvidence.precision)
+    }
+
+    @Test
+    fun validTtaEvidenceOverridesLowGpuRoughScoreButOrdinaryBenchmarkDoesNot() {
+        val identity = benchmarkIdentity()
+        val ttaProfile = CalibratedTtaProfile(
+            scale = 2,
+            noise = 0,
+            tileSize = 256,
+            passBatchSize = CalibratedTtaProfile.OPTIMIZED_TTA_PASS_BATCH_SIZE,
+            quality = passingQuality(),
+            safeDurationNanos = 1_000L,
+            optimizedDurationNanos = 900L
+        )
+        val calibrated = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = 21),
+            accelerationMode = AccelerationMode.VULKAN,
+            ttaEnabled = true,
             benchmarkResult = benchmarkResult(identity),
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = 512,
-            nowEpochMs = NOW_EPOCH_MS
+            nowEpochMs = NOW_EPOCH_MS,
+            calibratedTtaProfile = ttaProfile
         )
-        val atThreshold = AdaptiveInferencePolicy.selectExecutionProfile(
-            device = device().copy(gpuRoughScore = AdaptiveInferencePolicy.MIN_OPTIMIZED_GPU_ROUGH_SCORE),
+        val missingTtaEvidence = AdaptiveInferencePolicy.selectExecutionProfile(
+            device = device().copy(gpuRoughScore = 21),
             accelerationMode = AccelerationMode.VULKAN,
-            ttaEnabled = false,
+            ttaEnabled = true,
             benchmarkResult = benchmarkResult(identity),
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = 512,
             nowEpochMs = NOW_EPOCH_MS
         )
 
-        assertEquals(NativeBackend.LEGACY_SAFE, belowThreshold.backend)
-        assertEquals(InferencePrecision.FP32, belowThreshold.precision)
-        assertEquals(1, belowThreshold.commandBatchSize)
-        assertEquals(NativeBackend.OPTIMIZED, atThreshold.backend)
-        assertEquals(InferencePrecision.FP16, atThreshold.precision)
+        assertEquals(NativeBackend.OPTIMIZED, calibrated.backend)
+        assertEquals(InferencePrecision.FP16, calibrated.precision)
+        assertEquals(2, calibrated.commandBatchSize)
+        assertEquals(NativeBackend.LEGACY_SAFE, missingTtaEvidence.backend)
+        assertEquals(InferencePrecision.FP32, missingTtaEvidence.precision)
     }
 
     @Test
@@ -618,7 +682,8 @@ class AdaptiveInferencePolicyTest {
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = 512,
-            nowEpochMs = nowEpochMs
+            nowEpochMs = nowEpochMs,
+            calibratedVulkanProfile = standardVulkanProfile()
         )
 
         assertEquals(NativeBackend.OPTIMIZED, selectAt(1_000L).backend)
@@ -646,9 +711,9 @@ class AdaptiveInferencePolicyTest {
     }
 
     @Test
-    fun clampsMeasuredCommandBatchRecommendationToNativeBounds() {
+    fun measuredTierProfileOverridesLegacyBatchRecommendation() {
         val identity = benchmarkIdentity()
-        listOf(0 to 1, 1 to 1, 8 to 8, 9 to 8).forEach { (recommended, expected) ->
+        listOf(0, 1, 8, 9).forEach { recommended ->
             val selected = AdaptiveInferencePolicy.selectExecutionProfile(
                 device = device(),
                 accelerationMode = AccelerationMode.VULKAN,
@@ -659,12 +724,39 @@ class AdaptiveInferencePolicyTest {
                 ),
                 currentBenchmarkIdentity = identity,
                 currentSafeTileSize = 512,
-                nowEpochMs = NOW_EPOCH_MS
+                nowEpochMs = NOW_EPOCH_MS,
+                calibratedVulkanProfile = standardVulkanProfile(commandBatchSize = 2)
             )
 
             assertEquals(NativeBackend.OPTIMIZED, selected.backend)
-            assertEquals(expected, selected.commandBatchSize)
+            assertEquals(2, selected.commandBatchSize)
         }
+    }
+
+    @Test
+    fun tenPercentSpeedGateRoundsUpRequiredImprovementForNonDivisibleDurations() {
+        assertTrue(AdaptiveInferencePolicy.isAtLeastTenPercentFaster(101L, 90L))
+        assertFalse(AdaptiveInferencePolicy.isAtLeastTenPercentFaster(101L, 91L))
+    }
+
+    @Test
+    fun tenPercentSpeedGateDoesNotOverflowNearLongMaximum() {
+        val safeDurationNanos = Long.MAX_VALUE
+        val requiredImprovement = safeDurationNanos / 10L + 1L
+        val optimizedBoundaryNanos = safeDurationNanos - requiredImprovement
+
+        assertTrue(
+            AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos,
+                optimizedBoundaryNanos
+            )
+        )
+        assertFalse(
+            AdaptiveInferencePolicy.isAtLeastTenPercentFaster(
+                safeDurationNanos,
+                optimizedBoundaryNanos + 1L
+            )
+        )
     }
 
     private fun executionProfile(
@@ -716,6 +808,17 @@ class AdaptiveInferencePolicyTest {
         ssim = 0.995,
         psnrDb = 40.0,
         p99ChannelError = 3
+    )
+
+    private fun standardVulkanProfile(
+        tileSize: Int = 256,
+        commandBatchSize: Int = 4,
+        tuning: VulkanExecutionTuning = VulkanExecutionTuning.DEFAULT
+    ) = CalibratedVulkanProfile(
+        resolutionTier = ResolutionTier.STANDARD,
+        tileSize = tileSize,
+        commandBatchSize = commandBatchSize,
+        tuning = tuning
     )
 
     private fun benchmarkResult(

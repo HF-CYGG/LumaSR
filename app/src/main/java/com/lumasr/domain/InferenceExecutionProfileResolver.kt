@@ -17,7 +17,7 @@ object DeviceFingerprintHasher {
 }
 
 object BenchmarkIdentityFactory {
-    const val SCHEMA_KEY = "inference-benchmark-v2"
+    const val SCHEMA_KEY = "inference-benchmark-v3"
 
     fun create(
         modelId: String,
@@ -34,7 +34,9 @@ object BenchmarkIdentityFactory {
             engineKey = "ncnn:${engine.name}:${DeviceFingerprintHasher.sha256Hex(modelId)}",
             modelArtifactHash = modelArtifactHash,
             runtimeBuildKey = runtimeBuildKey,
-            profileHash = device.profileKey,
+            profileHash = device.acceleratorCalibrationKey?.let { acceleratorKey ->
+                DeviceFingerprintHasher.sha256Hex("${device.profileKey}\n$acceleratorKey")
+            } ?: device.profileKey,
             deviceFingerprint = DeviceFingerprintHasher.sha256(rawDeviceFingerprint),
             gpuDriverVersion = device.gpuDriverVersion
         )
@@ -73,8 +75,14 @@ object InferenceExecutionProfileMapper {
         nativeBackend = profile.backend,
         inferencePrecision = profile.precision,
         cpuThreads = profile.cpuThreads,
+        openmpBlocktimeMs = profile.openmpBlocktimeMs,
+        postprocessThreads = profile.postprocessThreads,
         commandBatchSize = profile.commandBatchSize,
-        modelCacheCapacity = profile.modelCacheCapacity
+        modelCacheCapacity = profile.modelCacheCapacity,
+        maxPipelineDepth = profile.maxPipelineDepth.coerceIn(1, 2),
+        vulkanTuning = profile.vulkanTuning,
+        runtimeBackend = profile.runtimeBackend,
+        qnnExecutionConfig = profile.qnnConfig
     )
 
     fun from(params: UpscaleParams): InferenceExecutionProfile = InferenceExecutionProfile(
@@ -82,18 +90,35 @@ object InferenceExecutionProfileMapper {
         accelerationMode = params.accelerationMode,
         precision = params.inferencePrecision,
         cpuThreads = params.cpuThreads.coerceAtLeast(1),
+        openmpBlocktimeMs = params.openmpBlocktimeMs.coerceIn(0, 100),
+        postprocessThreads = params.postprocessThreads.coerceIn(1, 64),
         tileSize = UpscaleParamsFactory.sanitizeTileSize(params.tileSize),
         commandBatchSize = params.commandBatchSize.coerceIn(1, 8),
         gpuHeadroomPercent = UpscaleParamsFactory.sanitizeGpuHeadroomPercent(
             params.gpuHeadroomPercent
         ),
         modelCacheCapacity = params.modelCacheCapacity.coerceIn(1, 2),
-        tta = params.tta
+        tta = params.tta,
+        maxPipelineDepth = params.maxPipelineDepth.coerceIn(1, 2),
+        vulkanTuning = params.vulkanTuning,
+        runtimeBackend = params.runtimeBackend,
+        qnnConfig = params.qnnExecutionConfig
     )
 }
 
 fun interface ProcessingExecutionProfileResolver {
-    suspend fun resolve(modelId: String, params: UpscaleParams, nowEpochMs: Long): UpscaleParams
+    suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long
+    ): UpscaleParams
+
+    suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
+    ): UpscaleParams = resolve(modelId, params, nowEpochMs)
 }
 
 class LazyProcessingExecutionProfileResolver(
@@ -117,12 +142,31 @@ class LazyProcessingExecutionProfileResolver(
         }
     }
 
+    override suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
+    ): UpscaleParams = withContext(ioDispatcher) {
+        try {
+            resolver().resolve(modelId, params, nowEpochMs, outputPixels)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            failClosed(params)
+        }
+    }
+
     private suspend fun resolver(): ProcessingExecutionProfileResolver = resolverMutex.withLock {
         resolver ?: resolverFactory().also { resolver = it }
     }
 
     private fun failClosed(params: UpscaleParams): UpscaleParams = params.copy(
-        tileSize = UpscaleParamsFactory.sanitizeTileSize(params.tileSize),
+        tileSize = if (params.tta) {
+            AdaptiveInferencePolicy.ttaExecutionTileSize(params.tileSize)
+        } else {
+            UpscaleParamsFactory.sanitizeTileSize(params.tileSize)
+        },
         gpuHeadroomPercent = UpscaleParamsFactory.sanitizeGpuHeadroomPercent(
             params.gpuHeadroomPercent
         ),
@@ -131,6 +175,7 @@ class LazyProcessingExecutionProfileResolver(
         cpuThreads = params.cpuThreads.coerceAtLeast(1),
         commandBatchSize = 1,
         modelCacheCapacity = 1,
+        maxPipelineDepth = 1,
         pipelinePasses = params.pipelinePasses.map(::failClosed)
     )
 }
@@ -146,6 +191,13 @@ class InferenceExecutionProfileResolver(
         modelId: String,
         params: UpscaleParams,
         nowEpochMs: Long
+    ): UpscaleParams = resolve(modelId, params, nowEpochMs, outputPixels = null)
+
+    override suspend fun resolve(
+        modelId: String,
+        params: UpscaleParams,
+        nowEpochMs: Long,
+        outputPixels: Long?
     ): UpscaleParams {
         require(nowEpochMs >= 0L) { "Profile resolution time must be non-negative" }
         if (params.pipelinePasses.isNotEmpty()) {
@@ -170,23 +222,63 @@ class InferenceExecutionProfileResolver(
             )
         }.getOrNull() ?: return selectAndApply(params, benchmark = null)
         val benchmark = repository.findValid(identity, nowEpochMs)
-        return selectAndApply(params, benchmark, identity, nowEpochMs)
+        return selectAndApply(params, benchmark, identity, nowEpochMs, outputPixels)
     }
 
     private fun selectAndApply(
         params: UpscaleParams,
         benchmark: InferenceBenchmarkResult?,
         identity: BenchmarkIdentity? = null,
-        nowEpochMs: Long = 0L
+        nowEpochMs: Long = 0L,
+        outputPixels: Long? = null
     ): UpscaleParams {
-        val profile = AdaptiveInferencePolicy.selectExecutionProfile(
+        val resolutionTier = runCatching {
+            ResolutionTier.fromOutputPixels(outputPixels)
+        }.getOrNull()
+        val calibratedVulkanProfile = resolutionTier?.let { tier ->
+            benchmark?.vulkanProfiles?.singleOrNull { it.resolutionTier == tier }
+        }
+        val calibratedTtaProfile = benchmark?.ttaProfiles?.singleOrNull { profile ->
+            profile.matches(
+                scale = params.scale,
+                noise = params.noise,
+                tileSize = AdaptiveInferencePolicy.ttaExecutionTileSize(params.tileSize)
+            )
+        }
+        val calibratedCpuProfile = resolutionTier?.let { tier ->
+            benchmark?.cpuProfiles?.singleOrNull { it.resolutionTier == tier }
+        }?.takeIf {
+            benchmark != null &&
+                identity != null &&
+                AdaptiveInferencePolicy.isBenchmarkValid(benchmark.identity, identity) &&
+                nowEpochMs in benchmark.measuredAtEpochMs..benchmark.validUntilEpochMs
+        }
+        val calibratedQnnProfile = resolutionTier?.let { tier ->
+            benchmark?.qnnProfiles?.singleOrNull { it.resolutionTier == tier }
+        }
+        val selectedProfile = AdaptiveInferencePolicy.selectExecutionProfile(
             device = device,
             accelerationMode = params.accelerationMode,
             ttaEnabled = params.tta,
             benchmarkResult = benchmark,
             currentBenchmarkIdentity = identity,
             currentSafeTileSize = params.tileSize,
-            nowEpochMs = nowEpochMs
+            nowEpochMs = nowEpochMs,
+            calibratedVulkanProfile = calibratedVulkanProfile,
+            calibratedTtaProfile = calibratedTtaProfile,
+            calibratedQnnProfile = calibratedQnnProfile
+        )
+        val profile = selectedProfile.copy(
+            tileSize = if (!params.tta && params.accelerationMode == AccelerationMode.CPU) {
+                calibratedCpuProfile?.tileSize ?: selectedProfile.tileSize
+            } else {
+                selectedProfile.tileSize
+            },
+            cpuThreads = calibratedCpuProfile?.cpuThreads ?: params.cpuThreads,
+            openmpBlocktimeMs = calibratedCpuProfile?.openmpBlocktimeMs
+                ?: params.openmpBlocktimeMs,
+            postprocessThreads = calibratedCpuProfile?.postprocessThreads
+                ?: params.postprocessThreads
         )
         return InferenceExecutionProfileMapper.apply(params, profile)
     }

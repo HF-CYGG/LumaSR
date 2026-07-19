@@ -217,11 +217,17 @@ private fun EditorScreen(
                 // 加速模式选择
                 Text("加速模式", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    AccelerationMode.entries.forEachIndexed { index, mode ->
+                    val selectableModes = AccelerationMode.entries.filterNot {
+                        it == AccelerationMode.QNN_HTP
+                    }
+                    selectableModes.forEachIndexed { index, mode ->
                         SegmentedButton(
                             selected = state.accelerationMode == mode,
                             onClick = { onAccelerationChanged(mode) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = AccelerationMode.entries.size)
+                            shape = SegmentedButtonDefaults.itemShape(
+                                index = index,
+                                count = selectableModes.size
+                            )
                         ) {
                             Text(mode.labelCn())
                         }
@@ -685,6 +691,7 @@ fun AccelerationMode.labelCn(): String {
         AccelerationMode.AUTO -> "GPU"
         AccelerationMode.VULKAN -> "Vulkan"
         AccelerationMode.CPU -> "CPU"
+        AccelerationMode.QNN_HTP -> "QNN HTP"
     }
 }
 
