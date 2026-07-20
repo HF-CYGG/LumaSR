@@ -37,6 +37,10 @@ android {
         compose = true
     }
 
+    androidResources {
+        noCompress += listOf("bin", "param")
+    }
+
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.11"
     }

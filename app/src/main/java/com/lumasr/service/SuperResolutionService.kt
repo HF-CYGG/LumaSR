@@ -47,6 +47,17 @@ internal fun resolveIncomingProcessingServiceCommand(action: String?): IncomingP
     else -> IncomingProcessingServiceCommand.RECOVER_ONLY
 }
 
+internal fun shouldStopForIdleSnapshots(
+    observedSnapshots: List<ProcessingTaskSnapshot>,
+    latestSnapshots: List<ProcessingTaskSnapshot>
+): Boolean {
+    fun List<ProcessingTaskSnapshot>.hasActiveWork(): Boolean = any {
+        it.task.state == ProcessingTaskState.RUNNING ||
+            it.task.state == ProcessingTaskState.QUEUED
+    }
+    return !observedSnapshots.hasActiveWork() && !latestSnapshots.hasActiveWork()
+}
+
 class SuperResolutionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lifecycleGate = ProcessingServiceLifecycleGate()
@@ -189,9 +200,12 @@ class SuperResolutionService : Service() {
     }
 
     private fun stopIfIdle(snapshots: List<ProcessingTaskSnapshot>) {
-        val isIdle = snapshots.none {
-            it.task.state == ProcessingTaskState.RUNNING || it.task.state == ProcessingTaskState.QUEUED
-        }
+        // collectLatest can still finish a non-suspending callback for an obsolete empty value
+        // after resume has already published queued work. Never let that stale value stop the FGS.
+        val isIdle = shouldStopForIdleSnapshots(
+            observedSnapshots = snapshots,
+            latestSnapshots = coordinator.snapshots.value
+        )
         val candidate = lifecycleGate.idleStopCandidate(isIdle) ?: return
         if (lifecycleGate.isStopStillValid(candidate)) {
             stopSelfResult(candidate.startId)

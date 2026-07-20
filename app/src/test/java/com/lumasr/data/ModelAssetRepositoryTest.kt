@@ -3,6 +3,7 @@ package com.lumasr.data
 import com.lumasr.domain.ModelPack
 import com.lumasr.domain.SuperResEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -80,6 +81,73 @@ class ModelAssetRepositoryTest {
         assertEquals("bin-data", File(preparedDir, "scale2.0x_model.bin").readText())
     }
 
+    @Test
+    fun preparesOnlyRequestedVariantAndReportsActualByteProgress() {
+        val cacheRoot = Files.createTempDirectory("lumasr-model-cache").toFile()
+        val requestedParam = "noise0_scale2.0x_model.param"
+        val requestedBin = "noise0_scale2.0x_model.bin"
+        val unusedParam = "noise3_scale2.0x_model.param"
+        val unusedBin = "noise3_scale2.0x_model.bin"
+        val source = FakeModelAssetSource(
+            mapOf(
+                "models/waifu2x/models-photo/$requestedParam" to "param-data".toByteArray(),
+                "models/waifu2x/models-photo/$requestedBin" to ByteArray(600_000) { 7 },
+                "models/waifu2x/models-photo/$unusedParam" to "unused-param".toByteArray(),
+                "models/waifu2x/models-photo/$unusedBin" to "unused-bin".toByteArray()
+            )
+        )
+        val repository = ModelAssetRepository(source, cacheRoot)
+        val progress = mutableListOf<ModelPreparationProgress>()
+
+        val preparedDir = repository.prepareModel(
+            model = photoModel(
+                listOf(requestedParam, requestedBin, unusedParam, unusedBin)
+            ),
+            requiredFiles = listOf(requestedParam, requestedBin),
+            onProgress = progress::add
+        )
+
+        assertTrue(File(preparedDir, requestedParam).isFile)
+        assertTrue(File(preparedDir, requestedBin).isFile)
+        assertFalse(File(preparedDir, unusedParam).exists())
+        assertFalse(File(preparedDir, unusedBin).exists())
+        assertEquals(0, source.openCount("models/waifu2x/models-photo/$unusedParam"))
+        assertEquals(0, source.openCount("models/waifu2x/models-photo/$unusedBin"))
+        assertTrue(progress.size > 2)
+        assertEquals(0L, progress.first().completedBytes)
+        assertEquals(600_010L, progress.last().completedBytes)
+        assertEquals(600_010L, progress.last().totalBytes)
+        assertEquals(1f, progress.last().fraction)
+    }
+
+    @Test
+    fun cancellationDuringCopyLeavesNoPartialModelFile() {
+        val cacheRoot = Files.createTempDirectory("lumasr-model-cache").toFile()
+        val requestedBin = "noise0_scale2.0x_model.bin"
+        val source = FakeModelAssetSource(
+            mapOf(
+                "models/waifu2x/models-photo/$requestedBin" to ByteArray(600_000) { 7 }
+            )
+        )
+        val repository = ModelAssetRepository(source, cacheRoot)
+        var checks = 0
+
+        val result = runCatching {
+            repository.prepareModel(
+                model = photoModel(listOf(requestedBin)),
+                requiredFiles = listOf(requestedBin),
+                cancellationCheck = {
+                    checks += 1
+                    if (checks >= 3) error("cancelled")
+                }
+            )
+        }
+
+        assertEquals("cancelled", result.exceptionOrNull()?.message)
+        assertFalse(File(cacheRoot, "models/waifu2x-photo/$requestedBin").exists())
+        assertTrue(checks >= 3)
+    }
+
     private fun cunetModel() = ModelPack(
         id = "waifu2x-cunet",
         displayName = "CUnet",
@@ -98,6 +166,26 @@ class ModelAssetRepositoryTest {
         defaultNoise = 1,
         speedLevel = "slow",
         qualityLevel = "high"
+    )
+
+    private fun photoModel(requiredFiles: List<String>) = ModelPack(
+        id = "waifu2x-photo",
+        displayName = "Photo",
+        engine = SuperResEngine.WAIFU2X,
+        modelDir = "models-photo",
+        assetPath = "models/waifu2x/models-photo",
+        isBuiltIn = true,
+        requiredFiles = requiredFiles,
+        assetBytes = null,
+        description = "Photo cleanup.",
+        scenes = listOf("photo"),
+        scales = listOf(2),
+        denoise = listOf(0, 3),
+        supportsTta = true,
+        defaultScale = 2,
+        defaultNoise = 0,
+        speedLevel = "medium",
+        qualityLevel = "medium"
     )
 }
 

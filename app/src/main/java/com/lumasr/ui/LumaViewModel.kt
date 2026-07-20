@@ -9,6 +9,7 @@ import android.app.ActivityManager
 import android.os.Build
 import android.os.SystemClock
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -17,6 +18,7 @@ import com.lumasr.data.GalleryRepository
 import com.lumasr.data.FileCalibrationReportRepository
 import com.lumasr.data.ImageCacheRepository
 import com.lumasr.data.ModelAssetRepository
+import com.lumasr.data.ModelPreparationProgress
 import com.lumasr.data.ModelManifestRepository
 import com.lumasr.data.ProcessingTaskSubmission
 import com.lumasr.data.UserPreferencesRepository
@@ -54,6 +56,7 @@ import com.lumasr.domain.UpscaleProgress
 import com.lumasr.domain.UpscaleStage
 import com.lumasr.domain.availableDenoiseForScale
 import com.lumasr.domain.realEsrganDenoisePreprocessor
+import com.lumasr.domain.requiredFilesFor
 import com.lumasr.domain.sanitizeTargetScale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -61,6 +64,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -71,6 +76,16 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 import kotlin.math.abs
+
+private const val MODEL_PREPARATION_START = 0.01f
+private const val MODEL_PREPARATION_END = 0.03f
+private const val MODEL_PREPARATION_SPAN = MODEL_PREPARATION_END - MODEL_PREPARATION_START
+private const val MODEL_PREPARATION_LOG_TAG = "LumaSRModelPrep"
+
+private data class ModelPreparationRequest(
+    val model: ModelPack,
+    val requiredFiles: List<String>
+)
 
 class LumaViewModel(
     application: Application,
@@ -297,6 +312,14 @@ class LumaViewModel(
         val model = state.selectedModel ?: return
         val denoiseModel = state.models.realEsrganDenoisePreprocessor()
             .takeIf { model.engine == SuperResEngine.REAL_ESRGAN && state.noise > 0 }
+        val modelRequiredFiles = model.requiredFilesFor(
+            targetScale = state.scale,
+            noise = if (model.engine == SuperResEngine.REAL_ESRGAN) 0 else state.noise
+        )
+        val denoiseRequiredFiles = denoiseModel?.requiredFilesFor(
+            targetScale = 1,
+            noise = state.noise
+        )
         val rejectedImage = images.firstNotNullOfOrNull { image ->
             val profile = processingResourceProfile(image)
             val requestedTileSize = state.tileSizeFor(image, model, state.scale, profile)
@@ -345,11 +368,41 @@ class LumaViewModel(
                 )
             }
             try {
+                val preparationContext = currentCoroutineContext()
                 val preparedModelDirs = withContext(ioDispatcher) {
+                    val preparations = buildList {
+                        add(ModelPreparationRequest(model, modelRequiredFiles))
+                        if (denoiseModel != null && denoiseRequiredFiles != null) {
+                            add(ModelPreparationRequest(denoiseModel, denoiseRequiredFiles))
+                        }
+                    }
                     buildMap {
-                        put(model.id, modelAssetRepository.prepareModel(model).absolutePath)
-                        denoiseModel?.let { denoiser ->
-                            put(denoiser.id, modelAssetRepository.prepareModel(denoiser).absolutePath)
+                        preparations.forEachIndexed { index, request ->
+                            put(
+                                request.model.id,
+                                modelAssetRepository.prepareModel(
+                                    model = request.model,
+                                    requiredFiles = request.requiredFiles,
+                                    onProgress = { progress ->
+                                        val uiProgress = preparingModelProgress(
+                                            taskId = taskIds.first(),
+                                            modelName = request.model.displayName,
+                                            modelIndex = index,
+                                            modelCount = preparations.size,
+                                            preparation = progress
+                                        )
+                                        Log.i(
+                                            MODEL_PREPARATION_LOG_TAG,
+                                            "ui task=${taskIds.first()} model=${request.model.id} " +
+                                                "progress=${uiProgress.progress}"
+                                        )
+                                        _uiState.update {
+                                            it.copy(progress = uiProgress)
+                                        }
+                                    },
+                                    cancellationCheck = preparationContext::ensureActive
+                                ).absolutePath
+                            )
                         }
                     }
                 }
@@ -446,7 +499,8 @@ class LumaViewModel(
                             modelId = model.id,
                             params = params,
                             outputPixels = profile.outputPixelsFor(budgetDecision.scale)
-                        )
+                        ),
+                        initialProgress = modelReadyProgress(taskId)
                     )
                 }
                 persistentController.submitBatch(submissions)
@@ -904,6 +958,39 @@ class LumaViewModel(
         totalTiles = 1,
         completedTiles = 0,
         message = "Preparing processing files",
+        estimatedRemainingMs = null
+    )
+
+    private fun preparingModelProgress(
+        taskId: String,
+        modelName: String,
+        modelIndex: Int,
+        modelCount: Int,
+        preparation: ModelPreparationProgress
+    ): UpscaleProgress {
+        val overallFraction = (modelIndex + preparation.fraction) / modelCount.coerceAtLeast(1)
+        return UpscaleProgress(
+            taskId = taskId,
+            stage = UpscaleStage.LOADING_MODEL,
+            progress = (MODEL_PREPARATION_START + overallFraction * MODEL_PREPARATION_SPAN)
+                .coerceIn(MODEL_PREPARATION_START, MODEL_PREPARATION_END),
+            currentTile = 0,
+            totalTiles = 1,
+            completedTiles = 0,
+            message = "Preparing $modelName model files " +
+                "${preparation.completedFiles}/${preparation.totalFiles}",
+            estimatedRemainingMs = null
+        )
+    }
+
+    private fun modelReadyProgress(taskId: String) = UpscaleProgress(
+        taskId = taskId,
+        stage = UpscaleStage.LOADING_MODEL,
+        progress = MODEL_PREPARATION_END,
+        currentTile = 0,
+        totalTiles = 1,
+        completedTiles = 0,
+        message = "Preparing local inference",
         estimatedRemainingMs = null
     )
 

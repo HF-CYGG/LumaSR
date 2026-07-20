@@ -44,6 +44,58 @@ class PersistentProcessingControllerTest {
     }
 
     @Test
+    fun submittedPreparationProgressSurvivesQueuedSnapshotWithoutProgress() = runBlocking {
+        val fixture = Fixture(submitResult = ProcessingServiceStartResult.Started)
+        val initial = progress("prepared", fraction = 0.03f, completedTiles = 0).copy(
+            stage = UpscaleStage.LOADING_MODEL,
+            message = "Model files ready"
+        )
+        val submitted = submission("prepared").copy(initialProgress = initial)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            fixture.controller.startObserving(scope)
+            withTimeout(2_000L) {
+                while (fixture.snapshots.subscriptionCount.value == 0) yield()
+            }
+
+            fixture.controller.submitBatch(listOf(submitted))
+            assertEquals(initial, fixture.controller.state.value.records.single().progress)
+
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = submitted.task.copy(), progress = null)
+            )
+            yield()
+
+            assertEquals(initial, fixture.controller.state.value.records.single().progress)
+
+            val running = submitted.task.copy(
+                state = ProcessingTaskState.RUNNING,
+                updatedAtEpochMs = submitted.task.updatedAtEpochMs + 1L
+            )
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = running, progress = null)
+            )
+            yield()
+            assertEquals(initial, fixture.controller.state.value.records.single().progress)
+
+            val analysis = initial.copy(
+                stage = UpscaleStage.ANALYZING,
+                progress = 0.04f,
+                message = "Reading image"
+            )
+            fixture.snapshots.value = listOf(
+                ProcessingTaskSnapshot(task = running, progress = analysis)
+            )
+            withTimeout(2_000L) {
+                while (fixture.controller.state.value.records.single().progress != analysis) yield()
+            }
+            assertEquals(analysis, fixture.controller.state.value.records.single().progress)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun repeatedForegroundServiceRejectionRefreshesTheReusableFallbackAndExposesReason() = runBlocking {
         val fixture = Fixture(
             submitResult = ProcessingServiceStartResult.ForegroundOnlyFallback(

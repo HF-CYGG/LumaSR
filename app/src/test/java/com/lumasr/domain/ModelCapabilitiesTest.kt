@@ -81,6 +81,7 @@ class ModelCapabilitiesTest {
             val model = manifest.models.first { it.id == id }
 
             assertEquals(listOf(2, 4, 8), model.availableTargetScales())
+            assertEquals(listOf(-1, 0, 1, 2, 3), model.availableDenoiseForScale(2))
             assertFalse(1 in model.availableTargetScales())
         }
     }
@@ -102,6 +103,30 @@ class ModelCapabilitiesTest {
 
         assertEquals(listOf(0, 1, 2, 3), model.availableDenoiseForScale(4, manifest.models))
         assertEquals(listOf(0), model.availableDenoiseForScale(4, listOf(model)))
+    }
+
+    @Test
+    fun processingPreparationSelectsOnlyFilesUsedByCurrentInferencePlan() {
+        val manifest = bundledManifest()
+
+        assertEquals(
+            listOf("noise0_scale2.0x_model.bin", "noise0_scale2.0x_model.param"),
+            manifest.models
+                .first { it.id == "waifu2x-photo" }
+                .requiredFilesFor(targetScale = 2, noise = 0)
+        )
+        assertEquals(
+            listOf("up2x-denoise3x.bin", "up2x-denoise3x.param"),
+            manifest.models
+                .first { it.id == "realcugan-pro" }
+                .requiredFilesFor(targetScale = 2, noise = 3)
+        )
+        assertEquals(
+            listOf("realesrgan-x4plus.bin", "realesrgan-x4plus.param"),
+            manifest.models
+                .first { it.id == "realesrgan-general-x4" }
+                .requiredFilesFor(targetScale = 16, noise = 0)
+        )
     }
 
     private fun realCuganStandard() = ModelPack(

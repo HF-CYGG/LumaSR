@@ -5,6 +5,7 @@ import com.lumasr.domain.ProcessingTaskRepository
 import com.lumasr.domain.ProcessingTaskState
 import com.lumasr.domain.ProcessingWorkSpec
 import com.lumasr.domain.ProcessingWorkSpecRepository
+import com.lumasr.domain.UpscaleProgress
 import com.lumasr.service.ProcessingServiceClient
 import com.lumasr.service.ProcessingServiceStartResult
 import kotlinx.coroutines.NonCancellable
@@ -14,7 +15,8 @@ import kotlinx.coroutines.withContext
 
 data class ProcessingTaskSubmission(
     val task: ProcessingTask,
-    val workSpec: ProcessingWorkSpec
+    val workSpec: ProcessingWorkSpec,
+    val initialProgress: UpscaleProgress? = null
 )
 
 class ProcessingTaskSubmissionStore(

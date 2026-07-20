@@ -120,7 +120,7 @@ class PersistentProcessingController(
                 PersistentTaskRecord(
                     task = submission.task,
                     workSpec = submission.workSpec,
-                    progress = null
+                    progress = submission.initialProgress
                 )
             }
             stateMutex.withLock {
@@ -286,7 +286,16 @@ class PersistentProcessingController(
                     workSpec = previous.workSpec ?: candidate.workSpec
                 )
 
-                else -> candidate.copy(workSpec = candidate.workSpec ?: previous?.workSpec)
+                else -> candidate.copy(
+                    workSpec = candidate.workSpec ?: previous?.workSpec,
+                    progress = when {
+                        candidate.progress != null -> candidate.progress
+                        previous != null &&
+                            !previous.task.state.isTerminal &&
+                            !candidate.task.state.isTerminal -> previous.progress
+                        else -> null
+                    }
+                )
             }
         }
         return merged.values.toList()

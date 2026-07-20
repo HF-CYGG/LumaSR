@@ -19,6 +19,58 @@ fun ModelPack.availableNativePassScales(): List<Int> =
 fun ModelPack.nativeScalePlanFor(targetScale: Int): List<Int> =
     nativeScalePlanFor(targetScale, availableNativePassScales())
 
+fun ModelPack.requiredFilesFor(targetScale: Int, noise: Int): List<String> {
+    val resolvedScale = sanitizeTargetScale(targetScale)
+    val resolvedNoise = if (engine == SuperResEngine.REAL_ESRGAN) {
+        0
+    } else {
+        sanitizeDenoiseForScale(resolvedScale, noise)
+    }
+    val requiredBaseNames = nativeScalePlanFor(resolvedScale)
+        .map { passScale ->
+            nativeModelBaseName(
+                engine = engine,
+                scale = passScale,
+                noise = resolvedNoise,
+                modelFileBase = modelFileBase
+            )
+        }
+        .toSet()
+    val selected = requiredFiles.filter { fileName ->
+        fileName.substringBeforeLast('.') in requiredBaseNames
+    }
+    val expectedFiles = requiredBaseNames.flatMap { baseName ->
+        listOf("$baseName.param", "$baseName.bin")
+    }.toSet()
+    require(selected.toSet() == expectedFiles) {
+        "Model $id is missing files for ${resolvedScale}x noise=$resolvedNoise: " +
+            (expectedFiles - selected.toSet()).sorted().joinToString()
+    }
+    return selected
+}
+
+fun nativeModelBaseName(
+    engine: SuperResEngine,
+    scale: Int,
+    noise: Int,
+    modelFileBase: String? = null
+): String = when (engine) {
+    SuperResEngine.WAIFU2X -> when {
+        noise < 0 -> "scale${scale}.0x_model"
+        scale <= 1 -> "noise${noise}_model"
+        else -> "noise${noise}_scale${scale}.0x_model"
+    }
+    SuperResEngine.REAL_CUGAN -> when {
+        noise < 0 -> "up${scale}x-conservative"
+        noise == 0 -> "up${scale}x-no-denoise"
+        noise in 1..2 && scale > 2 -> "up${scale}x-denoise3x"
+        else -> "up${scale}x-denoise${noise}x"
+    }
+    SuperResEngine.REAL_ESRGAN -> requireNotNull(modelFileBase?.takeIf { it.isNotBlank() }) {
+        "Real-ESRGAN models require modelFileBase."
+    }
+}
+
 fun ModelPack.availableDenoiseForScale(targetScale: Int): List<Int> {
     val passScales = nativeScalePlanFor(targetScale)
     val nativeCapabilities = nativeCapabilities()
@@ -131,14 +183,14 @@ private fun parseWaifu2xCapability(baseName: String): NativeModelCapability? {
         val scale = baseName.removePrefix("scale").removeSuffix(".0x_model").toIntOrNull() ?: return null
         return NativeModelCapability(scale = scale, noise = -1)
     }
-    if (baseName.startsWith("noise") && baseName.endsWith("_model")) {
-        val noise = baseName.removePrefix("noise").removeSuffix("_model").toIntOrNull() ?: return null
-        return NativeModelCapability(scale = 1, noise = noise)
-    }
     if (baseName.startsWith("noise") && "_scale" in baseName && baseName.endsWith(".0x_model")) {
         val noise = baseName.removePrefix("noise").substringBefore("_scale").toIntOrNull() ?: return null
         val scale = baseName.substringAfter("_scale").removeSuffix(".0x_model").toIntOrNull() ?: return null
         return NativeModelCapability(scale = scale, noise = noise)
+    }
+    if (baseName.startsWith("noise") && baseName.endsWith("_model")) {
+        val noise = baseName.removePrefix("noise").removeSuffix("_model").toIntOrNull() ?: return null
+        return NativeModelCapability(scale = 1, noise = noise)
     }
     return null
 }
