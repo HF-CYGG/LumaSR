@@ -5,7 +5,7 @@
 ## 当前发布契约
 
 - GitHub 仓库为 `HF-CYGG/LumaSR`，正式 Release 的固定标签为 `release`。
-- Release 标题必须严格为 `LumaSR v<version>`，例如 `LumaSR v0.3.3`。
+- Release 标题必须严格为 `LumaSR v<version>`，例如 `LumaSR v0.3.4`。
 - `app/build.gradle.kts` 的 `versionCode` 必须递增，`versionName` 使用 2 至 4 段数字。
 - Release 只保留一个 APK，命名为 `LumaSR-v<version>.apk`；校验文件使用同名 `.sha256`。
 - APK 必须使用固定证书签名，证书 SHA-256 为 `43648398DD74C72B1CBA185D3832E558C72D9BB58AE46BB9C09EF32818988D2F`。
@@ -22,7 +22,7 @@
 3. 运行不可变版本元数据与滚动标签元数据检查：
 
 ```powershell
-.\scripts\validate-release-metadata.ps1 -TagName v0.3.3
+.\scripts\validate-release-metadata.ps1 -TagName v0.3.4
 .\scripts\validate-rolling-release-metadata.ps1 -TagName release
 .\scripts\test-release-workflow.ps1
 ```
@@ -33,15 +33,15 @@
 
 ```powershell
 .\scripts\prepare-rolling-release.ps1 `
-  -ReleaseVersion 0.3.3 `
+  -ReleaseVersion 0.3.4 `
   -GradleUserHome F:\Development\gradle
 ```
 
 脚本先调用固定签名构建，执行 JVM 测试、Android Lint、Release 构建、证书校验、包版本校验和 ZIP 对齐校验；然后把已验证 APK 复制为滚动发布文件，并再次验证。最终生成：
 
 ```text
-artifacts/releases/release/LumaSR-v0.3.3.apk
-artifacts/releases/release/LumaSR-v0.3.3.apk.sha256
+artifacts/releases/release/LumaSR-v0.3.4.apk
+artifacts/releases/release/LumaSR-v0.3.4.apk.sha256
 artifacts/releases/release/release-manifest.json
 ```
 
@@ -55,7 +55,7 @@ artifacts/releases/release/release-manifest.json
 git switch main
 git merge --ff-only <已验证分支>
 .\scripts\prepare-rolling-release.ps1 `
-  -ReleaseVersion 0.3.3 `
+  -ReleaseVersion 0.3.4 `
   -GradleUserHome F:\Development\gradle
 ```
 
@@ -80,14 +80,14 @@ git push `
 
 不能用同一个 `release` 标签创建第二个 GitHub Release。打开现有 Release，选择 **Edit release**，按以下顺序操作：
 
-1. 把标题改为 `LumaSR v0.3.3`，不要只写版本号，也不要追加日期或 `hotfix` 等文字。
-2. 把 `docs/releases/v0.3.3.md` 的完整内容粘贴到 Release notes。
+1. 把标题改为 `LumaSR v0.3.4`，不要只写版本号，也不要追加日期或 `hotfix` 等文字。
+2. 把 `docs/releases/v0.3.4.md` 的完整内容粘贴到 Release notes。
 3. 删除旧 `app-release.apk`、旧版 APK、旧 `.sha256` 和旧 `release-manifest.json`。
 4. 上传以下三个本地文件：
 
    ```text
-   artifacts/releases/release/LumaSR-v0.3.3.apk
-   artifacts/releases/release/LumaSR-v0.3.3.apk.sha256
+   artifacts/releases/release/LumaSR-v0.3.4.apk
+   artifacts/releases/release/LumaSR-v0.3.4.apk.sha256
    artifacts/releases/release/release-manifest.json
    ```
 
@@ -108,19 +108,19 @@ $release.name
 $release.assets | Select-Object name, size, browser_download_url, digest
 ```
 
-v0.3.3 的原始与国内加速下载地址应分别为：
+v0.3.4 的原始与国内加速下载地址应分别为：
 
 ```text
-https://github.com/HF-CYGG/LumaSR/releases/download/release/LumaSR-v0.3.3.apk
-https://gh.jasonzeng.dev/https://github.com/HF-CYGG/LumaSR/releases/download/release/LumaSR-v0.3.3.apk
+https://github.com/HF-CYGG/LumaSR/releases/download/release/LumaSR-v0.3.4.apk
+https://gh.jasonzeng.dev/https://github.com/HF-CYGG/LumaSR/releases/download/release/LumaSR-v0.3.4.apk
 ```
 
 还需在已安装旧版的 Android 设备上验证：
 
-- 自动或手动检查显示 `0.3.3`；
+- 自动或手动检查显示 `0.3.4`；
 - 两个下载入口均能交给系统浏览器；
 - APK 可覆盖安装且保留数据；
-- 安装后的版本名为 `0.3.3`。
+- 安装后的版本名为 `0.3.4`。
 
 没有真实设备证据时，不得声称覆盖安装、厂商兼容性或下载加速已经完成真机验证。
 

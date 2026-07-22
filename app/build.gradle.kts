@@ -14,15 +14,15 @@ plugins {
 
 android {
     namespace = "com.lumasr"
-    compileSdk = 35
+    compileSdk = 36
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.lumasr"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.3"
+        targetSdk = 36
+        versionCode = 5
+        versionName = "0.3.4"
         buildConfigField("boolean", "LUMASR_QNN_ENABLED", qnnEnabled.get().toString())
 
         externalNativeBuild {
@@ -58,12 +58,25 @@ android {
     val uploadStorePassword = providers.environmentVariable("LUMASR_UPLOAD_STORE_PASSWORD")
     val uploadKeyAlias = providers.environmentVariable("LUMASR_UPLOAD_KEY_ALIAS")
     val uploadKeyPassword = providers.environmentVariable("LUMASR_UPLOAD_KEY_PASSWORD")
+    val playUploadStoreFile = providers.environmentVariable("LUMASR_PLAY_UPLOAD_STORE_FILE")
+    val playUploadStorePassword = providers.environmentVariable("LUMASR_PLAY_UPLOAD_STORE_PASSWORD")
+    val playUploadKeyAlias = providers.environmentVariable("LUMASR_PLAY_UPLOAD_KEY_ALIAS")
+    val playUploadKeyPassword = providers.environmentVariable("LUMASR_PLAY_UPLOAD_KEY_PASSWORD")
+    val playUploadCertificateSha256 =
+        providers.environmentVariable("LUMASR_PLAY_UPLOAD_CERT_SHA256")
     val debugCrashOnProcessingFailure = providers.gradleProperty("lumasr.crashOnProcessingFailure").orElse("true")
     val hasUploadSigningConfig = listOf(
         uploadStoreFile,
         uploadStorePassword,
         uploadKeyAlias,
         uploadKeyPassword
+    ).all { it.isPresent }
+    val hasPlayUploadSigningConfig = listOf(
+        playUploadStoreFile,
+        playUploadStorePassword,
+        playUploadKeyAlias,
+        playUploadKeyPassword,
+        playUploadCertificateSha256
     ).all { it.isPresent }
     val fixedReleaseCertificateSha256 =
         "43648398DD74C72B1CBA185D3832E558C72D9BB58AE46BB9C09EF32818988D2F"
@@ -108,6 +121,57 @@ android {
         dependsOn(verifyReleaseSigningCertificate)
     }
 
+    val verifyPlayUploadSigningCertificate = tasks.register("verifyPlayUploadSigningCertificate") {
+        group = "verification"
+        description = "Rejects Play builds that do not use the dedicated Play upload certificate."
+
+        doLast {
+            if (!hasPlayUploadSigningConfig) {
+                throw GradleException(
+                    "Play upload signing is required. Use scripts/build-google-play-release.ps1."
+                )
+            }
+
+            val expectedCertificateSha256 = playUploadCertificateSha256.get()
+                .replace(Regex("[^0-9A-Fa-f]"), "")
+                .uppercase()
+            if (!Regex("[0-9A-F]{64}").matches(expectedCertificateSha256)) {
+                throw GradleException("LUMASR_PLAY_UPLOAD_CERT_SHA256 must be a SHA-256 digest.")
+            }
+            if (expectedCertificateSha256 == fixedReleaseCertificateSha256) {
+                throw GradleException(
+                    "The Play upload key must be distinct from the fixed app signing key."
+                )
+            }
+
+            val keystoreFile = file(playUploadStoreFile.get())
+            val keystoreType = when (keystoreFile.extension.lowercase()) {
+                "p12", "pfx" -> "PKCS12"
+                else -> "JKS"
+            }
+            val keystore = KeyStore.getInstance(keystoreType)
+            keystoreFile.inputStream().use { input ->
+                keystore.load(input, playUploadStorePassword.get().toCharArray())
+            }
+            val certificate = keystore.getCertificate(playUploadKeyAlias.get())
+                ?: throw GradleException("Play upload signing alias was not found.")
+            val actualCertificateSha256 = MessageDigest.getInstance("SHA-256")
+                .digest(certificate.encoded)
+                .joinToString("") { byte -> "%02X".format(byte.toInt() and 0xFF) }
+
+            if (actualCertificateSha256 != expectedCertificateSha256) {
+                throw GradleException(
+                    "Play upload certificate mismatch. Expected " +
+                        "$expectedCertificateSha256 but found $actualCertificateSha256."
+                )
+            }
+        }
+    }
+
+    tasks.matching { it.name == "prePlayBuild" }.configureEach {
+        dependsOn(verifyPlayUploadSigningCertificate)
+    }
+
     signingConfigs {
         if (hasUploadSigningConfig) {
             create("upload") {
@@ -115,6 +179,14 @@ android {
                 storePassword = uploadStorePassword.get()
                 keyAlias = uploadKeyAlias.get()
                 keyPassword = uploadKeyPassword.get()
+            }
+        }
+        if (hasPlayUploadSigningConfig) {
+            create("playUpload") {
+                storeFile = file(playUploadStoreFile.get())
+                storePassword = playUploadStorePassword.get()
+                keyAlias = playUploadKeyAlias.get()
+                keyPassword = playUploadKeyPassword.get()
             }
         }
     }
@@ -139,6 +211,15 @@ android {
             }
             ndk {
                 abiFilters += "arm64-v8a"
+            }
+        }
+        create("play") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+            signingConfig = if (hasPlayUploadSigningConfig) {
+                signingConfigs.getByName("playUpload")
+            } else {
+                null
             }
         }
         create("benchmark") {

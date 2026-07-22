@@ -102,6 +102,10 @@ add_library(localsr SHARED
 )
 
 target_compile_features(localsr PRIVATE cxx_std_17)
+target_link_options(localsr PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)
 target_include_directories(localsr PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../../.deps/sources/waifu2x-ncnn-vulkan/src

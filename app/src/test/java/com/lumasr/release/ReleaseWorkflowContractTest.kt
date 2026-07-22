@@ -6,11 +6,18 @@ import org.junit.Test
 
 class ReleaseWorkflowContractTest {
     @Test
-    fun declaresV033AsAnInstallableUpgrade() {
+    fun releaseWorkflowSelfTestRestoresSuccessfulExitCode() {
+        val testScript = File("../scripts/test-release-workflow.ps1").readText()
+
+        assertTrue(testScript.contains("\$global:LASTEXITCODE = 0"))
+    }
+
+    @Test
+    fun declaresV034AsAnInstallableUpgrade() {
         val buildScript = File("build.gradle.kts").readText()
 
-        assertTrue(buildScript.contains("versionCode = 4"))
-        assertTrue(buildScript.contains("versionName = \"0.3.3\""))
+        assertTrue(buildScript.contains("versionCode = 5"))
+        assertTrue(buildScript.contains("versionName = \"0.3.4\""))
     }
 
     @Test
@@ -81,8 +88,8 @@ class ReleaseWorkflowContractTest {
         assertTrue(workflow.contains("validate-release-metadata.ps1"))
 
         val releaseGuide = releaseGuideFile.readText()
-        assertTrue(releaseGuide.contains("LumaSR-v0.3.3.apk"))
-        assertTrue(releaseGuide.contains("v0.3.3"))
+        assertTrue(releaseGuide.contains("LumaSR-v0.3.4.apk"))
+        assertTrue(releaseGuide.contains("v0.3.4"))
         assertTrue(releaseGuide.contains("不可变"))
     }
 }
