@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="LumaSR 隐私政策 / LumaSR Privacy Policy" />
+  <title>LumaSR 隐私政策 / Privacy Policy</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+      line-height: 1.7;
+      color: #1f2937;
+      background: #f5f7fb;
+    }
+
+    body {
+      margin: 0;
+      padding: 32px 16px 64px;
+    }
+
+    main {
+      width: min(880px, 100%);
+      margin: 0 auto;
+      padding: 40px clamp(20px, 5vw, 56px);
+      box-sizing: border-box;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 20px;
+      box-shadow: 0 16px 48px rgba(15, 23, 42, 0.08);
+    }
+
+    h1,
+    h2 {
+      line-height: 1.3;
+      color: #111827;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 5vw, 3rem);
+    }
+
+    h2 {
+      margin-top: 32px;
+      font-size: 1.35rem;
+    }
+
+    p,
+    li {
+      overflow-wrap: anywhere;
+    }
+
+    a {
+      color: #2563eb;
+    }
+
+    .meta,
+    .note {
+      color: #4b5563;
+    }
+
+    .language-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 24px 0 36px;
+    }
+
+    .language-nav a {
+      display: inline-block;
+      padding: 8px 14px;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      text-decoration: none;
+    }
+
+    .summary {
+      padding: 18px 20px;
+      background: #eff6ff;
+      border-left: 4px solid #2563eb;
+      border-radius: 10px;
+    }
+
+    .language-section + .language-section {
+      margin-top: 64px;
+      padding-top: 48px;
+      border-top: 1px solid #d1d5db;
+    }
+
+    footer {
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid #e5e7eb;
+      color: #4b5563;
+      font-size: 0.95rem;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color: #e5e7eb;
+        background: #111827;
+      }
+
+      main {
+        background: #1f2937;
+        border-color: #374151;
+        box-shadow: none;
+      }
+
+      h1,
+      h2 {
+        color: #f9fafb;
+      }
+
+      a {
+        color: #93c5fd;
+      }
+
+      .meta,
+      .note,
+      footer {
+        color: #d1d5db;
+      }
+
+      .summary {
+        background: #172554;
+        border-left-color: #60a5fa;
+      }
+
+      .language-nav a,
+      .language-section + .language-section,
+      footer {
+        border-color: #4b5563;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>LumaSR 隐私政策</h1>
+    <p class="meta">Privacy Policy · 最后更新 / Last updated: 2026-07-24</p>
+
+    <nav class="language-nav" aria-label="Language navigation">
+      <a href="#zh-cn">简体中文</a>
+      <a href="#en">English</a>
+    </nav>
+
+    <section id="zh-cn" class="language-section" lang="zh-CN">
+      <h2>1. 适用范围与开发者信息</h2>
+      <p>
+        本隐私政策适用于 Android 应用 LumaSR（以下简称“本应用”）。本应用由
+        <strong>夜喵cats</strong> 开发和维护。如对本政策或隐私实践有任何疑问，请发送邮件至
+        <a href="mailto:yyh1677696627@gmail.com">yyh1677696627@gmail.com</a>。
+      </p>
+
+      <p class="summary">
+        <strong>概要：</strong>本应用不运营用于接收用户图片或应用数据的开发者服务器。图片超分、模型推理和结果生成均在设备本地完成；应用不会自动把图片上传到云端。
+      </p>
+
+      <h2>2. 本应用访问和处理的数据</h2>
+      <ul>
+        <li><strong>用户选择的图片：</strong>只有在您主动使用 Android 系统 Photo Picker 选择图片后，本应用才能读取所选内容。本应用不会扫描或读取您未选择的媒体文件。</li>
+        <li><strong>本地工作副本与结果：</strong>为了完成超分处理，本应用会在应用私有目录中创建输入图片工作副本、预览、临时文件和处理结果。只有在您主动保存或分享时，结果才会写入系统相册、您选择的位置或交给您选择的其他应用。</li>
+        <li><strong>本地设置与任务数据：</strong>模型、缩放、降噪、更新检查开关、处理任务状态等设置会保存在设备上，以保持应用功能和恢复处理中任务。</li>
+        <li><strong>本地诊断与性能数据：</strong>本应用可在设备上保存有限的处理事件、耗时区间、错误代码、回退原因、校准报告和性能结果，用于稳定性和本机性能选择。这些记录不包含图片内容，并且不会自动发送给开发者。</li>
+      </ul>
+
+      <h2>3. 网络访问与第三方服务</h2>
+      <p>图片处理不需要联网。本应用仅在以下功能中使用网络：</p>
+      <ul>
+        <li>
+          <strong>更新检查：</strong>自动更新检查默认开启，前台启动时每天最多请求一次 GitHub Release 元数据；您也可以关闭自动检查或手动检查。请求发送至
+          <a href="https://api.github.com/repos/HF-CYGG/LumaSR/releases/latest">GitHub API</a>，内容包括正常 HTTPS 请求所需的网络信息、LumaSR User-Agent 和 GitHub API 版本请求头，不包含图片。
+        </li>
+        <li>
+          <strong>更新下载：</strong>只有在您点击下载入口后，应用才会把 GitHub 原始下载地址或
+          <a href="https://gh.jasonzeng.dev/">gh.jasonzeng.dev</a> 加速地址交给系统浏览器。浏览器及相应服务可能按照各自政策处理 IP 地址、请求时间和其他常规连接信息。
+        </li>
+        <li><strong>Google Play 与 Android 系统服务：</strong>通过 Google Play 安装、系统 Photo Picker、系统分享、通知和设备备份等功能由 Google 或设备系统提供，并受相应服务条款和隐私政策约束。</li>
+      </ul>
+      <p>
+        本应用不集成广告、用户行为分析、第三方崩溃上报或云端 AI 推理 SDK。开发者不会出售用户数据，也不会通过开发者服务器接收或共享您的图片。
+      </p>
+
+      <h2>4. 权限使用</h2>
+      <ul>
+        <li><strong>网络访问：</strong>用于上述更新检查功能。</li>
+        <li><strong>通知：</strong>用于在后台处理图片时显示进度和状态；您可以在系统设置中拒绝或关闭通知。</li>
+        <li><strong>前台服务：</strong>用于在长时间图片处理期间保持用户可见的处理任务。</li>
+        <li><strong>图片访问：</strong>通过 Android Photo Picker 获得您明确选择的图片，不申请广泛存储、位置、联系人、相机或麦克风权限。</li>
+      </ul>
+
+      <h2>5. 数据保留与删除</h2>
+      <ul>
+        <li>处理中任务的本地工作文件会保存在应用私有目录。已完成、失败或取消任务的记录和文件按当前清理策略保留最多约 7 天，并限制最多保留 100 个终态任务；实际删除会在应用下次执行维护时完成。</li>
+        <li>本地校准报告最多保留 5 份；隐私安全诊断环形记录最多约 100 KiB，新记录会覆盖较旧记录。</li>
+        <li>应用设置和更新偏好会保留到您清除应用数据或卸载应用。Android 可能根据您的设备和账号备份设置备份符合条件的应用设置；开发者无法访问这些系统备份。</li>
+        <li>保存到相册、文件夹或分享给其他应用的图片不属于应用私有数据，卸载 LumaSR 不会删除这些文件；请在相册、文件管理器或目标应用中自行删除。</li>
+      </ul>
+      <p>您可以通过 Android“设置 → 应用 → LumaSR → 存储”清除本应用的缓存或全部本地应用数据，也可以卸载本应用。</p>
+
+      <h2>6. 数据安全</h2>
+      <p>
+        本应用使用 Android 应用沙箱保存私有数据，使用用户主动选择的系统界面访问图片，并通过 HTTPS 请求更新信息。尽管我们采取合理措施减少数据暴露，任何设备、软件或网络传输方式都无法保证绝对安全。
+      </p>
+
+      <h2>7. 儿童隐私</h2>
+      <p>本应用不专门面向儿童，不提供账号系统，也不会通过开发者服务器故意收集儿童的个人信息。</p>
+
+      <h2>8. 政策变更</h2>
+      <p>当应用功能、数据实践或适用要求发生变化时，我们可能更新本政策。更新后的版本会发布在本页面，并修改页面顶部的“最后更新”日期。</p>
+    </section>
+
+    <section id="en" class="language-section" lang="en">
+      <h1>LumaSR Privacy Policy</h1>
+
+      <h2>1. Scope and developer information</h2>
+      <p>
+        This Privacy Policy applies to the LumaSR Android application (the “App”). The App is developed and maintained by
+        <strong>夜喵cats</strong>. For privacy questions or requests, contact
+        <a href="mailto:yyh1677696627@gmail.com">yyh1677696627@gmail.com</a>.
+      </p>
+
+      <p class="summary">
+        <strong>Summary:</strong> The developer does not operate a backend that receives users’ images or App data. Image upscaling, model inference, and output generation take place on the device. The App does not automatically upload images to the cloud.
+      </p>
+
+      <h2>2. Data accessed and processed by the App</h2>
+      <ul>
+        <li><strong>Images you select:</strong> The App can read an image only after you select it through the Android system Photo Picker. It does not scan or read media that you did not select.</li>
+        <li><strong>Local working copies and outputs:</strong> To perform upscaling, the App creates working copies, previews, temporary files, and outputs in app-private storage. An output leaves app-private storage only when you choose to save it, select another destination, or share it with another app.</li>
+        <li><strong>Local settings and task data:</strong> Model, scale, denoising, update preference, and processing task information are stored on the device to provide App functionality and recover in-progress tasks.</li>
+        <li><strong>Local diagnostic and performance data:</strong> The App may store a limited set of processing events, duration buckets, error codes, fallback reasons, calibration reports, and benchmark results on the device. These records do not contain image content and are not automatically sent to the developer.</li>
+      </ul>
+
+      <h2>3. Network access and third-party services</h2>
+      <p>Image processing does not require a network connection. The App uses the network only for the following features:</p>
+      <ul>
+        <li>
+          <strong>Update checks:</strong> Automatic update checks are enabled by default and request GitHub Release metadata at most once per day when the App enters the foreground. You can disable automatic checks or run a manual check. Requests are sent to the
+          <a href="https://api.github.com/repos/HF-CYGG/LumaSR/releases/latest">GitHub API</a> and contain ordinary HTTPS connection information, a LumaSR User-Agent, and a GitHub API version header. They do not contain images.
+        </li>
+        <li>
+          <strong>Update downloads:</strong> Only after you choose a download option does the App pass either the original GitHub download URL or a
+          <a href="https://gh.jasonzeng.dev/">gh.jasonzeng.dev</a> accelerated URL to the system browser. The browser and relevant service may process the IP address, request time, and other standard connection information under their own policies.
+        </li>
+        <li><strong>Google Play and Android system services:</strong> Google Play distribution, the system Photo Picker, system sharing, notifications, and device backup are provided by Google or the device platform and are governed by their respective terms and privacy policies.</li>
+      </ul>
+      <p>
+        The App does not integrate advertising, user analytics, third-party crash reporting, or cloud AI inference SDKs. The developer does not sell user data and does not receive or share your images through a developer-operated server.
+      </p>
+
+      <h2>4. Permissions</h2>
+      <ul>
+        <li><strong>Internet access:</strong> Used for the update-check feature described above.</li>
+        <li><strong>Notifications:</strong> Used to display progress and status while an image is processed in the background. You may deny or disable notifications in Android settings.</li>
+        <li><strong>Foreground service:</strong> Used to keep a user-visible task active during long-running image processing.</li>
+        <li><strong>Image access:</strong> Granted through the Android Photo Picker for images you explicitly select. The App does not request broad storage, location, contacts, camera, or microphone permissions.</li>
+      </ul>
+
+      <h2>5. Retention and deletion</h2>
+      <ul>
+        <li>Working files for active tasks are stored in app-private storage. Records and files for completed, failed, or cancelled tasks are scheduled for removal after approximately 7 days and are capped at 100 terminal tasks. Removal may occur the next time App maintenance runs.</li>
+        <li>The App retains up to 5 local calibration reports. Its privacy-safe diagnostic ring buffer is limited to approximately 100 KiB and overwrites older records.</li>
+        <li>App settings and update preferences remain until you clear App data or uninstall the App. Android may back up eligible settings according to your device and account backup configuration; the developer cannot access those system backups.</li>
+        <li>Images saved to a gallery or folder, or shared with another app, are outside app-private storage and are not removed when LumaSR is uninstalled. Delete those files through the gallery, file manager, or receiving app.</li>
+      </ul>
+      <p>You can clear the App cache or all local App data through “Android Settings → Apps → LumaSR → Storage,” or uninstall the App.</p>
+
+      <h2>6. Security</h2>
+      <p>
+        The App uses the Android application sandbox for private data, user-controlled system interfaces for image selection, and HTTPS for update requests. While reasonable safeguards are used to reduce exposure, no device, software, or network transmission method can be guaranteed to be absolutely secure.
+      </p>
+
+      <h2>7. Children’s privacy</h2>
+      <p>The App is not specifically directed to children, does not provide user accounts, and does not knowingly collect children’s personal information through developer-operated servers.</p>
+
+      <h2>8. Changes to this policy</h2>
+      <p>We may update this policy when App features, data practices, or applicable requirements change. The updated policy will be posted on this page with a revised “Last updated” date.</p>
+    </section>
+
+    <footer>
+      <p>
+        LumaSR · Developer: 夜喵cats ·
+        <a href="mailto:yyh1677696627@gmail.com">yyh1677696627@gmail.com</a>
+      </p>
+    </footer>
+  </main>
+</body>
+</html>
