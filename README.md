@@ -1,11 +1,26 @@
-# LumaSR 本地 AI 图像超分工具
+<div align="center">
 
+<img src="docs/images/lumasr-icon.png" alt="LumaSR 图标" width="120">
+
+# LumaSR · 本地 AI 图像超分
+
+**基于 ncnn 与 Vulkan/CPU 的 Android 离线图像超分工具**
+
+[![Release contract](https://img.shields.io/github/actions/workflow/status/HF-CYGG/LumaSR/release-contract.yml?label=Release%20contract&logo=github)](https://github.com/HF-CYGG/LumaSR/actions/workflows/release-contract.yml)
+[![Release](https://img.shields.io/github/v/release/HF-CYGG/LumaSR?label=Release&logo=github)](https://github.com/HF-CYGG/LumaSR/releases/latest)
+[![License](https://img.shields.io/badge/License-Noncommercial-blue)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-29%2B-3DDC84?logo=android&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-1.9.24-7F52FF?logo=kotlin&logoColor=white)
+![Kotlin](https://img.shields.io/badge/Kotlin-1.9.x-7F52FF?logo=kotlin&logoColor=white)
 ![Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285F4?logo=jetpackcompose&logoColor=white)
 ![ncnn](https://img.shields.io/badge/ncnn-20260526-black)
 ![Vulkan](https://img.shields.io/badge/Vulkan%2FCPU-Ready-A41E22?logo=vulkan&logoColor=white)
 ![Offline](https://img.shields.io/badge/Offline-Inference-2EA44F)
+[![Stars](https://img.shields.io/github/stars/HF-CYGG/LumaSR?style=flat&logo=github&label=Stars)](https://github.com/HF-CYGG/LumaSR/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/HF-CYGG/LumaSR?label=last%20commit)](https://github.com/HF-CYGG/LumaSR/commits)
+
+</div>
+
+---
 
 LumaSR 是一款面向 Android 的本地 AI 图像超分工具，基于 ncnn 与 Vulkan/CPU 加速实现离线推理，支持 Waifu2x、RealCUGAN、Real-ESRGAN 等模型，提供极简参数控制、实时分块处理预览与处理后结果预览体验。
 
