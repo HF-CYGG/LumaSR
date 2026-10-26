@@ -2,7 +2,7 @@
 
 <img src="docs/images/lumasr-icon.png" alt="LumaSR 图标" width="120">
 
-# LumaSR · 本地 AI 图像超分
+# LumaSR
 
 **基于 ncnn 与 Vulkan/CPU 的 Android 离线图像超分工具**
 
